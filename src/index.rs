@@ -32,7 +32,6 @@ pub struct Hit { pub chunk: StoredChunk, pub score: f32 }
 struct Meta { embedder_id: String, dim: usize }
 
 pub struct Index {
-    embedder_id: String,
     dim: usize,
     table: Table,
     rebuilt: bool,
@@ -86,7 +85,7 @@ impl Index {
         std::fs::write(&meta_path,
             serde_json::to_string(&Meta { embedder_id: embedder_id.into(), dim }).unwrap())?;
 
-        Ok(Index { embedder_id: embedder_id.into(), dim, table, rebuilt })
+        Ok(Index { dim, table, rebuilt })
     }
 
     pub fn rebuilt(&self) -> bool { self.rebuilt }
