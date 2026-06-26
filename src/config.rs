@@ -54,7 +54,8 @@ impl Config {
         let candidate = path.map(PathBuf::from).unwrap_or_else(|| repo_root.join("omniscient.toml"));
         match std::fs::read_to_string(&candidate) {
             Ok(s) => Config::from_toml_str(&s, repo_root),
-            Err(_) => Ok(Config::default_for(repo_root)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default_for(repo_root)),
+            Err(e) => Err(Error::Config(format!("reading {}: {e}", candidate.display()))),
         }
     }
 }
@@ -94,5 +95,14 @@ mod tests {
     fn missing_file_yields_defaults() {
         let c = Config::load(Some(Path::new("/nonexistent.toml")), PathBuf::from("/repo")).unwrap();
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+    }
+
+    #[test]
+    fn unreadable_config_surfaces_error_not_defaults() {
+        // Pointing the config path at a directory makes read_to_string fail with a
+        // non-NotFound error; that must surface, not silently fall back to defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let res = Config::load(Some(dir.path()), PathBuf::from("/repo"));
+        assert!(res.is_err(), "a non-NotFound IO error must not yield defaults");
     }
 }

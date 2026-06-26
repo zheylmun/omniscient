@@ -3,7 +3,7 @@ use crate::chunk::chunk_file;
 use crate::config::Config;
 use crate::distill::{distill_context, ContextEntry};
 use crate::embed::{build_embedder, Embedder};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::freshness::{diff, scan};
 use crate::index::{Index, StoredChunk};
 use std::path::Path;
@@ -48,6 +48,12 @@ impl Engine {
             if chunks.is_empty() { continue; }
             let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
             let vectors = self.embedder.embed(&texts).await?;
+            if vectors.len() != texts.len() {
+                return Err(Error::Embed(format!(
+                    "embedder returned {} vectors for {} inputs (file {path})",
+                    vectors.len(), texts.len()
+                )));
+            }
             let file_hash = hash_of.get(path.as_str()).copied().unwrap_or("").to_string();
             let stored_chunks: Vec<StoredChunk> = chunks.into_iter().zip(vectors).map(|(c, v)| StoredChunk {
                 path: path.clone(), start_line: c.start_line, end_line: c.end_line,
@@ -77,6 +83,7 @@ impl Engine {
                 path: path.to_string(), start_line: c.start_line, end_line: c.end_line,
                 language: c.language, symbol: c.symbol,
                 code: c.text.lines().next().unwrap_or("").to_string(),
+                score: 0.0,
                 why_matched: "outline".into(),
             }).collect()),
             Some(f) => {
@@ -84,13 +91,18 @@ impl Engine {
                 let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
                 let fv = self.embedder.embed(&[f.to_string()]).await?.remove(0);
                 let cvs = self.embedder.embed(&texts).await?;
+                if cvs.len() != texts.len() {
+                    return Err(Error::Embed(format!(
+                        "embedder returned {} vectors for {} inputs", cvs.len(), texts.len()
+                    )));
+                }
                 let mut scored: Vec<(f32, &crate::chunk::Chunk)> =
                     chunks.iter().enumerate().map(|(i, c)| (dot(&fv, &cvs[i]), c)).collect();
                 scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 Ok(scored.into_iter().take(5).map(|(score, c)| ContextEntry {
                     path: path.to_string(), start_line: c.start_line, end_line: c.end_line,
                     language: c.language.clone(), symbol: c.symbol.clone(),
-                    code: c.text.clone(), why_matched: format!("focus similarity {score:.3}"),
+                    code: c.text.clone(), score, why_matched: format!("focus similarity {score:.3}"),
                 }).collect())
             }
         }
@@ -135,5 +147,44 @@ mod tests {
         let entries = engine.search("b", Some(5)).await.unwrap();
         assert!(entries.iter().any(|e| e.path == "b.rs"));
         assert!(!entries.iter().any(|e| e.path == "a.rs"));
+    }
+
+    #[tokio::test]
+    async fn read_file_outline_and_focus() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+
+        // Outline (no focus): one entry per chunk, why_matched == "outline".
+        let outline = engine.read_file("lib.rs", None).await.unwrap();
+        assert!(!outline.is_empty());
+        assert!(outline.iter().all(|e| e.why_matched == "outline"));
+        assert!(outline.iter().any(|e| e.symbol.as_deref() == Some("alpha")));
+
+        // Focus: ranked by similarity, why_matched mentions the focus.
+        let focus = engine.read_file("lib.rs", Some("alpha")).await.unwrap();
+        assert!(!focus.is_empty());
+        assert!(focus.iter().all(|e| e.why_matched.contains("focus similarity")));
+    }
+
+    #[tokio::test]
+    async fn index_persists_across_engine_reopen() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let (files, chunks) = {
+            let engine = engine_for(repo.path().to_path_buf()).await;
+            engine.refresh().await.unwrap();
+            engine.stats().await.unwrap()
+        };
+        assert!(files >= 1 && chunks >= 1);
+
+        // Reopen a fresh Engine over the same repo dir (same embedder id) — the
+        // LanceDB index must persist, and re-refreshing unchanged files must not
+        // duplicate rows.
+        let engine2 = engine_for(repo.path().to_path_buf()).await;
+        assert_eq!(engine2.stats().await.unwrap(), (files, chunks), "index persisted");
+        engine2.refresh().await.unwrap();
+        assert_eq!(engine2.stats().await.unwrap(), (files, chunks), "unchanged files not re-indexed");
     }
 }
