@@ -1,7 +1,35 @@
 //! Freshness: walk repo (gitignore-aware), hash files, compute delta vs stored hashes.
-use crate::error::Result;
+use crate::error::{Error, Result};
+use ignore::overrides::OverrideBuilder;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Built-in glob patterns for test/fixture files that are skipped during
+/// indexing unless `index_tests` is set. `**/` prefixes so they match in
+/// workspace members and nested packages, not just the repo root. `examples/`
+/// is deliberately absent — examples are real, runnable code worth searching.
+pub const DEFAULT_TEST_EXCLUDES: &[&str] = &[
+    "**/tests/**",      // Rust integration tests + fixtures live here
+    "**/benches/**",    // Rust benchmarks
+    "**/__tests__/**",  // JS/TS
+    "**/*.test.*",      // JS/TS
+    "**/*.spec.*",      // JS/TS
+    "**/*_test.*",      // Python *_test.py, Go *_test.go, ...
+    "**/test_*.py",     // pytest
+    "**/conftest.py",   // pytest fixtures
+];
+
+/// Resolve the effective exclude patterns: the built-in test excludes (unless
+/// `index_tests`) followed by the user's extra patterns.
+pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<String> {
+    let mut out: Vec<String> = if index_tests {
+        Vec::new()
+    } else {
+        DEFAULT_TEST_EXCLUDES.iter().map(|s| s.to_string()).collect()
+    };
+    out.extend(user_exclude.iter().cloned());
+    out
+}
 
 #[derive(Debug, Clone)]
 pub struct FileState { pub path: String, pub hash: String }
@@ -13,9 +41,19 @@ fn rel(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
 }
 
-pub fn scan(repo_root: &Path) -> Result<Vec<FileState>> {
+pub fn scan(repo_root: &Path, excludes: &[String]) -> Result<Vec<FileState>> {
+    // Apply excludes as ignore-style overrides (each as a `!glob`), so the
+    // walker skips matching files in the same pass as .gitignore. With only
+    // negated globs and no whitelist globs, every non-matching file is kept.
+    let mut ob = OverrideBuilder::new(repo_root);
+    for pat in excludes {
+        ob.add(&format!("!{pat}"))
+            .map_err(|e| Error::Config(format!("invalid exclude pattern {pat:?}: {e}")))?;
+    }
+    let overrides = ob.build().map_err(|e| Error::Config(format!("building excludes: {e}")))?;
+
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(repo_root).build() {
+    for entry in ignore::WalkBuilder::new(repo_root).overrides(overrides).build() {
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
         let path = entry.path();
@@ -59,7 +97,7 @@ mod tests {
         fs::write(d.path().join("keep.rs"), "fn a(){}").unwrap();
         fs::write(d.path().join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(d.path().join("ignored.rs"), "fn b(){}").unwrap();
-        let states = scan(d.path()).unwrap();
+        let states = scan(d.path(), &[]).unwrap();
         let paths: Vec<_> = states.iter().map(|s| s.path.clone()).collect();
         assert!(paths.contains(&"keep.rs".to_string()));
         assert!(!paths.iter().any(|p| p == "ignored.rs"));
@@ -70,6 +108,66 @@ mod tests {
             "scan must not emit git-internal files; found: {:?}",
             paths.iter().filter(|p| p.starts_with(".git/")).collect::<Vec<_>>()
         );
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    fn paths_in(root: &Path, excludes: &[String]) -> Vec<String> {
+        scan(root, excludes).unwrap().into_iter().map(|s| s.path).collect()
+    }
+
+    #[test]
+    fn scan_excludes_known_test_files_by_default() {
+        let d = tempdir().unwrap();
+        write(d.path(), "src/lib.rs", "fn a(){}");
+        write(d.path(), "tests/integration.rs", "fn t(){}");
+        write(d.path(), "benches/bench.rs", "fn b(){}");
+        write(d.path(), "pkg/test_foo.py", "def t(): pass");
+        write(d.path(), "web/app.test.ts", "test('x',()=>{})");
+        write(d.path(), "web/app.spec.ts", "test('y',()=>{})");
+        write(d.path(), "web/__tests__/helper.ts", "export {}");
+        write(d.path(), "examples/demo.rs", "fn main(){}"); // real code: kept
+
+        let excludes = resolve_excludes(&[], false);
+        let paths = paths_in(d.path(), &excludes);
+
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+        assert!(paths.contains(&"examples/demo.rs".to_string()), "examples are real code, kept");
+        for excluded in [
+            "tests/integration.rs", "benches/bench.rs", "pkg/test_foo.py",
+            "web/app.test.ts", "web/app.spec.ts", "web/__tests__/helper.ts",
+        ] {
+            assert!(!paths.iter().any(|p| p == excluded), "{excluded} should be excluded; got {paths:?}");
+        }
+    }
+
+    #[test]
+    fn user_exclude_extends_builtins() {
+        let d = tempdir().unwrap();
+        write(d.path(), "src/lib.rs", "fn a(){}");
+        write(d.path(), "vendor/dep.rs", "fn v(){}");
+
+        let excludes = resolve_excludes(&["vendor/**".to_string()], false);
+        let paths = paths_in(d.path(), &excludes);
+
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+        assert!(!paths.iter().any(|p| p == "vendor/dep.rs"), "user exclude must apply");
+    }
+
+    #[test]
+    fn index_tests_true_keeps_test_files() {
+        let d = tempdir().unwrap();
+        write(d.path(), "src/lib.rs", "fn a(){}");
+        write(d.path(), "tests/integration.rs", "fn t(){}");
+
+        let excludes = resolve_excludes(&[], true);
+        let paths = paths_in(d.path(), &excludes);
+
+        assert!(paths.contains(&"tests/integration.rs".to_string()), "index_tests=true re-includes tests");
     }
 
     #[test]

@@ -55,4 +55,6 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 
 ## Configuration
 
-`omniscient.toml` at the repo root (see `omniscient.example.toml`): `[embedder] base_url/model`, `[search] default_k/token_budget`, `languages`, `strip_comments`. Defaults apply if the file is absent.
+`omniscient.toml` at the repo root (see `omniscient.example.toml`): `[embedder] base_url/model`, `[search] default_k/token_budget`, `languages`, `strip_comments`, `index_tests`, `exclude`. Defaults apply if the file is absent.
+
+- **Test/fixture files are excluded from indexing** by built-in globs (`tests/`, `benches/`, `**/*.test.*`, `**/*.spec.*`, `**/*_test.*`, `**/test_*.py`, `**/conftest.py`, `**/__tests__/`; `examples/` is kept). `index_tests = true` disables the built-ins; `exclude = [...]` adds more globs. Applied in `freshness::scan` via `ignore`'s `OverrideBuilder`. Exclusion changes need NO reindex — they shift file *membership*, which the always-fresh `diff` already reconciles (unlike `CHUNKER_VERSION`, which changes chunk *content*).
