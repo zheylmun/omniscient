@@ -1,39 +1,58 @@
-//! CLI entrypoint.
+//! CLI: serve (MCP) + status/reindex (human debugging).
 use crate::config::Config;
-use crate::mcp;
+use crate::engine::Engine;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "omniscient", about = "Semantic code search")]
+#[command(name = "omniscient")]
 struct Cli {
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
     #[command(subcommand)]
-    command: Commands,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Start the MCP stdio server
-    Serve {
-        /// Path to the repository root
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        /// Path to config file (defaults to <repo>/omniscient.toml)
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+enum Cmd { Serve, Status, Reindex }
+
+fn load(cli: &Cli) -> anyhow::Result<Config> {
+    let repo = cli.repo.clone().map(Ok).unwrap_or_else(std::env::current_dir)?;
+    Ok(Config::load(cli.config.as_deref(), repo)?)
 }
 
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Serve { repo, config } => {
-            let repo_root = repo.canonicalize().unwrap_or(repo);
-            let cfg = Config::load(config.as_deref(), repo_root)?;
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(mcp::serve(cfg))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    match cli.cmd {
+        Cmd::Serve => {
+            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            rt.block_on(crate::mcp::serve(load(&cli)?))?;
+        }
+        Cmd::Status => {
+            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            rt.block_on(async {
+                let engine = Engine::new(load(&cli)?).await?;
+                engine.refresh().await?;
+                let (files, chunks) = engine.stats().await?;
+                println!("embedder: {}", engine.embedder_id());
+                println!("files indexed: {files}");
+                println!("chunks indexed: {chunks}");
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Cmd::Reindex => {
+            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            let cfg = load(&cli)?;
+            let _ = std::fs::remove_dir_all(cfg.repo_root.join(".omniscient"));
+            rt.block_on(async {
+                let engine = Engine::new(cfg).await?;
+                engine.refresh().await?;
+                println!("reindex complete");
+                Ok::<_, anyhow::Error>(())
+            })?;
         }
     }
     Ok(())
