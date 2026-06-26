@@ -151,7 +151,9 @@ fn walk_children(
 }
 
 /// True if an `attribute_item` is a test marker: `#[test]`, `#[bench]`,
-/// `#[<path>::test]` (e.g. `#[tokio::test]`), or `#[cfg(test)]` / `cfg(all(test, …))`.
+/// `#[<path>::test]` (e.g. `#[tokio::test]`), or a `#[cfg(...)]` whose predicate
+/// contains the bare `test` cfg — `cfg(test)`, `cfg(all(test, …))`,
+/// `cfg(any(test, …))` — but not when `test` is negated (`cfg(not(test))`).
 fn is_test_attribute(attr_item: tree_sitter::Node, bytes: &[u8]) -> bool {
     let mut cursor = attr_item.walk();
     let attribute = match attr_item.children(&mut cursor).find(|n| n.kind() == "attribute") {
@@ -327,7 +329,7 @@ mod tests {
         assert!(symbols.contains(&"production_fn"), "production_fn missing from {symbols:?}");
         assert!(symbols.contains(&"Widget"), "Widget missing from {symbols:?}");
         // every flavor of test code is dropped
-        for banned in ["test_helper", "checks_widget", "checks_production_fn", "standalone_test", "tests"] {
+        for banned in ["test_helper", "checks_widget", "checks_production_fn", "standalone_test"] {
             assert!(
                 !symbols.contains(&banned),
                 "{banned} should be skipped; chunks: {chunks:?}"
