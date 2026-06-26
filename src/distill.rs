@@ -10,6 +10,9 @@ pub struct ContextEntry {
     pub language: String,
     pub symbol: Option<String>,
     pub code: String,
+    /// Raw relevance score (cosine similarity). Authoritative for ordering;
+    /// `why_matched` is a human-facing rendering of it.
+    pub score: f32,
     pub why_matched: String,
 }
 
@@ -57,7 +60,11 @@ pub fn distill_context(hits: Vec<Hit>, strip_comments: bool, token_budget: usize
         if let Some(m) = cur.take() { entries.push(finish(&path, m, strip_comments)); }
     }
 
-    entries.sort_by(|a, b| score_of(b).partial_cmp(&score_of(a)).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+    });
 
     let mut out = Vec::new();
     let mut used = 0usize;
@@ -73,12 +80,9 @@ fn finish(path: &str, m: Merged, strip_comments: bool) -> ContextEntry {
         path: path.to_string(), start_line: m.s, end_line: m.e,
         language: m.language, symbol: m.symbol,
         code: strip_noise(&m.text, strip_comments),
+        score: m.score,
         why_matched: format!("similarity {:.3}", m.score),
     }
-}
-
-fn score_of(e: &ContextEntry) -> f32 {
-    e.why_matched.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -124,5 +128,20 @@ mod tests {
     fn why_matched_reports_score() {
         let out = distill_context(vec![hit("a.rs",1,1,0.876,"fn a(){}")], false, 100_000);
         assert!(out[0].why_matched.contains("0.87") || out[0].why_matched.contains("0.876"));
+        assert!((out[0].score - 0.876).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equal_scores_order_deterministically_by_path() {
+        // Equal scores across files must produce a stable, path-then-line ordering
+        // (not the nondeterministic HashMap iteration order). Inputs are deliberately
+        // out of order to prove the tiebreak, not insertion order, decides it.
+        let order = || distill_context(vec![
+            hit("z.rs", 1, 1, 0.5, "fn z(){}"),
+            hit("a.rs", 1, 1, 0.5, "fn a(){}"),
+            hit("m.rs", 1, 1, 0.5, "fn m(){}"),
+        ], false, 100_000).into_iter().map(|e| e.path).collect::<Vec<_>>();
+        assert_eq!(order(), vec!["a.rs", "m.rs", "z.rs"]);
+        assert_eq!(order(), order()); // stable run-to-run
     }
 }

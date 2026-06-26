@@ -15,15 +15,17 @@ Before every `search` call, omniscient computes a delta between the on-disk file
 
 omniscient does **not** do in-process inference. Embeddings are served by a local [llama.cpp](https://github.com/ggml-org/llama.cpp) instance via its `/v1/embeddings` endpoint. You point omniscient at it with `base_url` in your config.
 
-To start llama.cpp serving an embedding model (for example Qwen3-Embedding-4B):
+To start llama.cpp serving an embedding model (for example Qwen3-Embedding-4B), letting it download the GGUF from Hugging Face:
 
 ```bash
 llama-server \
-  --model qwen3-embedding-4b-q4_k_m.gguf \
+  -hf Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M \
   --port 8080 \
   --embedding \
-  --pooling mean
+  --pooling last
 ```
+
+> **Pooling:** Qwen3-Embedding is a decoder/LLM-based embedder and uses **last-token** pooling (`--pooling last`), not mean pooling. BERT-family embedders (BGE, jina, nomic) use `--pooling mean`. If you omit `--pooling`, llama.cpp falls back to the model's metadata default. Wrong pooling produces degenerate embeddings, so it's the first thing to check if search quality looks off.
 
 The `Embedder` trait in `src/embed.rs` is the seam for adding in-process embedding support in a future version.
 

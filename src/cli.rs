@@ -20,6 +20,15 @@ enum Cmd { Serve, Status, Reindex }
 
 fn load(cli: &Cli) -> anyhow::Result<Config> {
     let repo = cli.repo.clone().map(Ok).unwrap_or_else(std::env::current_dir)?;
+    // Normalize to an absolute path so the index dir and scan are stable regardless
+    // of the invocation cwd; keep the original if the path doesn't exist yet, but
+    // surface any other error (permission denied, symlink loop, …) instead of
+    // silently using a non-canonical path.
+    let repo = match repo.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => repo,
+        Err(e) => return Err(anyhow::anyhow!("failed to canonicalize repo path {}: {e}", repo.display())),
+    };
     Ok(Config::load(cli.config.as_deref(), repo)?)
 }
 
