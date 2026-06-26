@@ -1,3 +1,7 @@
 /target
+/docs/superpowers
+
 .omniscient/
+.DS_Store
+
 omniscient.toml

@@ -85,43 +85,144 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
         Some(t) => t,
         None => return Ok(vec![]), // non-fatal: caller falls through to line_windows
     };
-    let root = tree.root_node();
     let kinds = def_kinds(lang);
     let bytes = source.as_bytes();
 
     let mut chunks = Vec::new();
-    let mut cursor = root.walk();
+    walk_children(tree.root_node(), kinds, bytes, &mut chunks, lang);
+    Ok(chunks)
+}
 
-    fn walk_tree(node: tree_sitter::Node, kinds: &[&str], bytes: &[u8], chunks: &mut Vec<Chunk>, lang: &str) {
-        if kinds.contains(&node.kind()) {
-            let text = node.utf8_text(bytes).unwrap_or("").to_string();
-            let symbol = node.child_by_field_name("name")
+/// Walk a parent node's children, emitting one chunk per top-level def-kind node.
+///
+/// Items gated by a test attribute (`#[cfg(test)]`, `#[test]`, `#[bench]`,
+/// `#[<path>::test]`) are skipped entirely — neither emitted nor recursed into — so
+/// inline test code never enters the index. Non-test code keeps the original behavior:
+/// a def-kind node emits one chunk and is not recursed into (nested defs are part of
+/// it); any other node is recursed into so real modules still contribute their defs.
+fn walk_children(
+    parent: tree_sitter::Node,
+    kinds: &[&str],
+    bytes: &[u8],
+    chunks: &mut Vec<Chunk>,
+    lang: &str,
+) {
+    let mut cursor = parent.walk();
+    let mut test_gated = false;
+    for child in parent.children(&mut cursor) {
+        match child.kind() {
+            "attribute_item" => {
+                // Attributes stack; any test attribute gates the item that follows.
+                if is_test_attribute(child, bytes) {
+                    test_gated = true;
+                }
+                continue;
+            }
+            // Comments between an attribute and its item must not consume the gate.
+            "line_comment" | "block_comment" => continue,
+            _ => {}
+        }
+
+        let gated = test_gated;
+        test_gated = false;
+        if gated {
+            continue; // skip the gated item entirely: no chunk, no recursion
+        }
+
+        if kinds.contains(&child.kind()) {
+            let text = child.utf8_text(bytes).unwrap_or("").to_string();
+            let symbol = child
+                .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(bytes).ok())
                 .map(|s| s.to_string());
             chunks.push(Chunk {
                 text,
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
+                start_line: child.start_position().row + 1,
+                end_line: child.end_position().row + 1,
                 language: lang.to_string(),
                 symbol,
             });
-            // Do NOT recurse into children of a matched node — nested definitions
-            // (e.g. methods inside impl/class) are part of this chunk and must not
-            // be emitted again as standalone chunks.
-            return;
-        }
-
-        let mut child_cursor = node.walk();
-        for child in node.children(&mut child_cursor) {
-            walk_tree(child, kinds, bytes, chunks, lang);
+            // Do NOT recurse into a matched def — nested definitions (methods inside
+            // impl/class) are part of this chunk and must not be emitted again.
+        } else {
+            walk_children(child, kinds, bytes, chunks, lang);
         }
     }
+}
 
-    for node in root.children(&mut cursor) {
-        walk_tree(node, kinds, bytes, &mut chunks, lang);
+/// True if an `attribute_item` is a test marker: `#[test]`, `#[bench]`,
+/// `#[<path>::test]` (e.g. `#[tokio::test]`), or a `#[cfg(...)]` whose predicate
+/// contains the bare `test` cfg — `cfg(test)`, `cfg(all(test, …))`,
+/// `cfg(any(test, …))` — but not when `test` is negated (`cfg(not(test))`).
+fn is_test_attribute(attr_item: tree_sitter::Node, bytes: &[u8]) -> bool {
+    let mut cursor = attr_item.walk();
+    let attribute = match attr_item.children(&mut cursor).find(|n| n.kind() == "attribute") {
+        Some(a) => a,
+        None => return false,
+    };
+    match attribute_name_last_segment(attribute, bytes).as_deref() {
+        Some("test") | Some("bench") => true,
+        Some("cfg") => attribute_has_cfg_test(attribute, bytes),
+        _ => false,
     }
+}
 
-    Ok(chunks)
+/// Last path segment of an attribute's name: `test` for `#[test]`, `cfg` for
+/// `#[cfg(...)]`, `test` for `#[tokio::test]` (a `scoped_identifier`).
+fn attribute_name_last_segment(attribute: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let mut cursor = attribute.walk();
+    let name = attribute
+        .children(&mut cursor)
+        .find(|n| matches!(n.kind(), "identifier" | "scoped_identifier"))?;
+    match name.kind() {
+        "identifier" => name.utf8_text(bytes).ok().map(|s| s.to_string()),
+        "scoped_identifier" => name
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// True if a `cfg(...)` attribute's argument list contains the bare `test` cfg
+/// identifier (handles `cfg(test)`, `cfg(all(test, …))`, `cfg(any(test, …))`).
+/// Matches the `identifier` AST node, so `cfg(feature = "test-utils")` (a string
+/// literal) is not a false positive. A `test` nested under `not(...)` is ignored,
+/// so `#[cfg(not(test))]` (production-only code) is not treated as a test gate.
+fn attribute_has_cfg_test(attribute: tree_sitter::Node, bytes: &[u8]) -> bool {
+    let mut cursor = attribute.walk();
+    match attribute.children(&mut cursor).find(|n| n.kind() == "token_tree") {
+        Some(tt) => token_tree_has_test(tt, bytes),
+        None => false,
+    }
+}
+
+/// Search a cfg `token_tree` for a bare `test` predicate identifier, descending
+/// into nested groups but skipping any group that is the argument of `not(...)`
+/// (a negated `test` means the item is compiled when *not* testing).
+fn token_tree_has_test(tt: tree_sitter::Node, bytes: &[u8]) -> bool {
+    let mut cursor = tt.walk();
+    let mut prev_was_not = false;
+    for child in tt.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let text = child.utf8_text(bytes).ok();
+                if text == Some("test") {
+                    return true;
+                }
+                prev_was_not = text == Some("not");
+            }
+            "token_tree" => {
+                // Descend unless this group is the argument of `not(...)`.
+                if !prev_was_not && token_tree_has_test(child, bytes) {
+                    return true;
+                }
+                prev_was_not = false;
+            }
+            _ => prev_was_not = false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -217,5 +318,75 @@ mod tests {
         assert!(symbols.contains(&"alpha"), "alpha (exported fn) missing from {symbols:?}");
         assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
         assert_eq!(chunks.len(), 2, "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}", chunks.len());
+    }
+
+    #[test]
+    fn rust_skips_test_code() {
+        let src = read("tests/fixtures/sample_tests.rs");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample_tests.rs"), &src, 100).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        // production code is kept
+        assert!(symbols.contains(&"production_fn"), "production_fn missing from {symbols:?}");
+        assert!(symbols.contains(&"Widget"), "Widget missing from {symbols:?}");
+        // every flavor of test code is dropped
+        for banned in ["test_helper", "checks_widget", "checks_production_fn", "standalone_test"] {
+            assert!(
+                !symbols.contains(&banned),
+                "{banned} should be skipped; chunks: {chunks:?}"
+            );
+        }
+        // exactly the two production defs survive
+        assert_eq!(chunks.len(), 2, "expected exactly 2 production chunks, got {}: {chunks:?}", chunks.len());
+    }
+
+    #[test]
+    fn cfg_feature_with_test_substring_not_skipped() {
+        // `cfg(feature = "test-utils")` must NOT be treated as a test gate:
+        // "test-utils" is a string literal, not the `test` cfg identifier.
+        let src = r#"
+#[cfg(feature = "test-utils")]
+pub fn util_fn() -> i32 { 1 }
+
+pub fn always() -> i32 { 2 }
+"#;
+        let chunks = chunk_source(Some("rust"), src, 100).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"util_fn"), "util_fn wrongly skipped: {symbols:?}");
+        assert!(symbols.contains(&"always"), "always missing: {symbols:?}");
+    }
+
+    #[test]
+    fn cfg_not_test_is_kept() {
+        // `#[cfg(not(test))]` is production-only code (compiled when NOT testing):
+        // a `test` nested under `not(...)` must NOT be treated as a test gate.
+        let src = r#"
+#[cfg(not(test))]
+pub fn only_in_prod() -> i32 { 1 }
+
+#[cfg(all(unix, not(test)))]
+pub fn unix_prod() -> i32 { 2 }
+
+pub fn always() -> i32 { 3 }
+"#;
+        let chunks = chunk_source(Some("rust"), src, 100).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"only_in_prod"), "only_in_prod wrongly skipped: {symbols:?}");
+        assert!(symbols.contains(&"unix_prod"), "unix_prod wrongly skipped: {symbols:?}");
+        assert!(symbols.contains(&"always"), "always missing: {symbols:?}");
+    }
+
+    #[test]
+    fn tokio_test_attribute_is_skipped() {
+        // `#[tokio::test]` (scoped path ending in `test`) is also a test marker.
+        let src = r#"
+pub fn keep_me() -> i32 { 1 }
+
+#[tokio::test]
+async fn async_test() {}
+"#;
+        let chunks = chunk_source(Some("rust"), src, 100).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"keep_me"), "keep_me missing: {symbols:?}");
+        assert!(!symbols.contains(&"async_test"), "async_test should be skipped: {symbols:?}");
     }
 }
