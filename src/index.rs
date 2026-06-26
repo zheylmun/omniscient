@@ -29,7 +29,14 @@ pub struct StoredChunk {
 pub struct Hit { pub chunk: StoredChunk, pub score: f32 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Meta { embedder_id: String, dim: usize }
+struct Meta {
+    embedder_id: String,
+    dim: usize,
+    // Defaults to 0 for indexes written before chunker versioning existed, so
+    // they mismatch the current CHUNKER_VERSION (>= 1) and rebuild once.
+    #[serde(default)]
+    chunker_version: u32,
+}
 
 pub struct Index {
     dim: usize,
@@ -53,13 +60,13 @@ fn schema_for(dim: usize) -> Arc<Schema> {
 }
 
 impl Index {
-    pub async fn open(dir: &Path, embedder_id: &str, dim: usize) -> Result<Index> {
+    pub async fn open(dir: &Path, embedder_id: &str, dim: usize, chunker_version: u32) -> Result<Index> {
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join("meta.json");
         let existing: Option<Meta> = std::fs::read_to_string(&meta_path).ok()
             .and_then(|s| serde_json::from_str(&s).ok());
         let mismatch = existing.as_ref()
-            .map(|m| m.embedder_id != embedder_id || m.dim != dim)
+            .map(|m| m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version)
             .unwrap_or(false);
 
         let conn: Connection = lancedb::connect(dir.join("lance").to_string_lossy().as_ref())
@@ -83,7 +90,7 @@ impl Index {
         };
 
         std::fs::write(&meta_path,
-            serde_json::to_string(&Meta { embedder_id: embedder_id.into(), dim }).unwrap())?;
+            serde_json::to_string(&Meta { embedder_id: embedder_id.into(), dim, chunker_version }).unwrap())?;
 
         Ok(Index { dim, table, rebuilt })
     }
@@ -210,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_search_roundtrip() {
         let dir = tempdir().unwrap();
-        let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         idx.upsert_file("a.rs", vec![
             chunk("a.rs","h1",1,vec![1.0,0.0,0.0]),
             chunk("a.rs","h1",5,vec![0.0,1.0,0.0]),
@@ -223,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_old_rows_for_file() {
         let dir = tempdir().unwrap();
-        let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
         idx.upsert_file("a.rs", vec![chunk("a.rs","h2",9,vec![1.0,0.0,0.0])]).await.unwrap();
         let hashes = idx.file_hashes().await.unwrap();
@@ -237,10 +244,23 @@ mod tests {
     async fn model_id_mismatch_triggers_rebuild() {
         let dir = tempdir().unwrap();
         {
-            let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+            let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
             idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
         }
-        let idx = Index::open(dir.path(), "different-model", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "different-model", 3, 1).await.unwrap();
+        assert!(idx.rebuilt());
+        assert!(idx.file_hashes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunker_version_mismatch_triggers_rebuild() {
+        let dir = tempdir().unwrap();
+        {
+            let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+            idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
+        }
+        // Same embedder, bumped chunker version: stale chunks must be dropped.
+        let idx = Index::open(dir.path(), "mock-v1", 3, 2).await.unwrap();
         assert!(idx.rebuilt());
         assert!(idx.file_hashes().await.unwrap().is_empty());
     }

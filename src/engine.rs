@@ -24,7 +24,7 @@ impl Engine {
 
     pub async fn new_with_embedder(config: Config, embedder: Box<dyn Embedder>) -> Result<Engine> {
         let dir = config.repo_root.join(".omniscient");
-        let index = Index::open(&dir, embedder.id(), embedder.dim().max(1)).await?;
+        let index = Index::open(&dir, embedder.id(), embedder.dim().max(1), crate::chunk::CHUNKER_VERSION).await?;
         Ok(Engine { config, embedder, index })
     }
 
