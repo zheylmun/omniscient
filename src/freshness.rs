@@ -15,7 +15,7 @@ fn rel(root: &Path, p: &Path) -> String {
 
 pub fn scan(repo_root: &Path) -> Result<Vec<FileState>> {
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(repo_root).hidden(false).build() {
+    for entry in ignore::WalkBuilder::new(repo_root).build() {
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
         let path = entry.path();
@@ -52,7 +52,10 @@ mod tests {
     #[test]
     fn scan_respects_gitignore_and_hashes() {
         let d = tempdir().unwrap();
-        fs::create_dir(d.path().join(".git")).unwrap();
+        let git_dir = d.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("config"), "[core]\n\trepositoryformatversion = 0\n").unwrap();
         fs::write(d.path().join("keep.rs"), "fn a(){}").unwrap();
         fs::write(d.path().join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(d.path().join("ignored.rs"), "fn b(){}").unwrap();
@@ -61,6 +64,12 @@ mod tests {
         assert!(paths.contains(&"keep.rs".to_string()));
         assert!(!paths.iter().any(|p| p == "ignored.rs"));
         assert!(states.iter().all(|s| !s.hash.is_empty()));
+        // Regression guard: .git/ internals must never appear in the scan results.
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".git/")),
+            "scan must not emit git-internal files; found: {:?}",
+            paths.iter().filter(|p| p.starts_with(".git/")).collect::<Vec<_>>()
+        );
     }
 
     #[test]
