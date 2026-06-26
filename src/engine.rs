@@ -66,10 +66,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Embed a single string, enforcing the embedder contract that exactly one
+    /// vector comes back (so a misbehaving endpoint errors instead of panicking).
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        let mut vs = self.embedder.embed(&[text.to_string()]).await?;
+        if vs.len() != 1 {
+            return Err(Error::Embed(format!(
+                "embedder returned {} vectors for 1 input", vs.len()
+            )));
+        }
+        Ok(vs.remove(0))
+    }
+
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
         self.refresh().await?;
         let k = k.unwrap_or(self.config.search.default_k);
-        let qv = self.embedder.embed(&[query.to_string()]).await?.remove(0);
+        let qv = self.embed_one(query).await?;
         let hits = self.index.search(&qv, k).await?;
         Ok(distill_context(hits, self.config.strip_comments, self.config.search.token_budget))
     }
@@ -89,7 +101,7 @@ impl Engine {
             Some(f) => {
                 if chunks.is_empty() { return Ok(vec![]); }
                 let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-                let fv = self.embedder.embed(&[f.to_string()]).await?.remove(0);
+                let fv = self.embed_one(f).await?;
                 let cvs = self.embedder.embed(&texts).await?;
                 if cvs.len() != texts.len() {
                     return Err(Error::Embed(format!(
@@ -116,12 +128,32 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::embed::MockEmbedder;
+    use async_trait::async_trait;
     use std::fs;
     use tempfile::tempdir;
 
     async fn engine_for(root: std::path::PathBuf) -> Engine {
         let cfg = Config::default_for(root);
         Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64))).await.unwrap()
+    }
+
+    /// Misbehaving embedder that returns no vectors — exercises the embed_one guard.
+    struct ZeroEmbedder;
+    #[async_trait]
+    impl Embedder for ZeroEmbedder {
+        fn id(&self) -> &str { "zero" }
+        fn dim(&self) -> usize { 64 }
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> { Ok(vec![]) }
+    }
+
+    #[tokio::test]
+    async fn search_errors_when_embedder_returns_no_vectors() {
+        // Empty repo: refresh embeds nothing, so this isolates embed_one(query).
+        let repo = tempdir().unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, Box::new(ZeroEmbedder)).await.unwrap();
+        let err = engine.search("anything", Some(3)).await.unwrap_err();
+        assert!(matches!(err, Error::Embed(_)), "expected Error::Embed, got {err:?}");
     }
 
     #[tokio::test]
