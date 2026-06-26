@@ -81,7 +81,10 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
     let language = ts_language(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).map_err(|e| Error::Chunk(e.to_string()))?;
-    let tree = parser.parse(source, None).ok_or_else(|| Error::Chunk("parse returned None".into()))?;
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Ok(vec![]), // non-fatal: caller falls through to line_windows
+    };
     let root = tree.root_node();
     let kinds = def_kinds(lang);
     let bytes = source.as_bytes();
@@ -102,6 +105,10 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
                 language: lang.to_string(),
                 symbol,
             });
+            // Do NOT recurse into children of a matched node — nested definitions
+            // (e.g. methods inside impl/class) are part of this chunk and must not
+            // be emitted again as standalone chunks.
+            return;
         }
 
         let mut child_cursor = node.walk();
@@ -161,5 +168,54 @@ mod tests {
         let c = chunk_source(None, &src, 4).unwrap();
         assert_eq!(c.first().unwrap().start_line, 1);
         assert_eq!(c.last().unwrap().end_line, 10);
+    }
+
+    // Regression: nested definitions must not appear as standalone chunks (over-chunking).
+
+    #[test]
+    fn rust_no_over_chunking() {
+        let src = read("tests/fixtures/sample.rs");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample.rs"), &src, 100).unwrap();
+        // beta is a method inside `impl Point` — it must NOT appear as a standalone chunk
+        assert!(
+            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
+            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        );
+        // Exactly 3 top-level definitions: alpha (fn), Point (struct), impl Point (symbol=None)
+        assert_eq!(chunks.len(), 3, "expected exactly 3 chunks, got {}: {chunks:?}", chunks.len());
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
+        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+    }
+
+    #[test]
+    fn python_no_over_chunking() {
+        let src = read("tests/fixtures/sample.py");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample.py"), &src, 100).unwrap();
+        // beta is a method inside class Point — must NOT be a standalone chunk
+        assert!(
+            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
+            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        );
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
+        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(chunks.len(), 2, "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}", chunks.len());
+    }
+
+    #[test]
+    fn typescript_no_over_chunking() {
+        let src = read("tests/fixtures/sample.ts");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample.ts"), &src, 100).unwrap();
+        // beta is a method inside class Point — must NOT be a standalone chunk
+        assert!(
+            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
+            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        );
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        // alpha is exported (wrapped in export_statement) — must still be captured
+        assert!(symbols.contains(&"alpha"), "alpha (exported fn) missing from {symbols:?}");
+        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(chunks.len(), 2, "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}", chunks.len());
     }
 }
