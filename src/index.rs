@@ -69,7 +69,13 @@ impl Index {
             .map(|m| m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version)
             .unwrap_or(false);
 
+        // Zero read-consistency interval: re-resolve the on-disk manifest before
+        // every read. Without this, a long-lived handle (e.g. the `serve` process)
+        // keeps pointing at fragment files that a separate `reindex` has deleted,
+        // failing every query with "Object ... not found" until the process is
+        // restarted. See `handle_survives_external_index_rebuild`.
         let conn: Connection = lancedb::connect(dir.join("lance").to_string_lossy().as_ref())
+            .read_consistency_interval(std::time::Duration::ZERO)
             .execute().await.map_err(|e| Error::Index(e.to_string()))?;
 
         let has_table = |names: &[String]| names.iter().any(|t| t == "chunks");
@@ -238,6 +244,31 @@ mod tests {
         let hits = idx.search(&[1.0,0.0,0.0], 5).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.start_line, 9);
+    }
+
+    #[tokio::test]
+    async fn handle_survives_external_index_rebuild() {
+        // Reproduces the footgun where a long-lived server (e.g. the MCP `serve`
+        // process) holds an Index handle while a *separate* process runs `reindex`,
+        // which wipes `.omniscient/` and rebuilds from scratch. The stale handle
+        // must not keep pointing at deleted fragment files.
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])]).await.unwrap();
+
+        // Simulate `reindex`: blow away the dataset dir and rebuild it via a fresh
+        // handle with different contents.
+        std::fs::remove_dir_all(dir.path().join("lance")).unwrap();
+        {
+            let rebuilt = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+            rebuilt.upsert_file("b.rs", vec![chunk("b.rs", "h2", 7, vec![1.0, 0.0, 0.0])]).await.unwrap();
+        }
+
+        // The original handle must reload to the rebuilt dataset, not error out on
+        // the now-deleted fragment files.
+        let hits = idx.search(&[1.0, 0.0, 0.0], 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk.path, "b.rs");
     }
 
     #[tokio::test]
