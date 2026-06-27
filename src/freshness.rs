@@ -1,5 +1,6 @@
 //! Freshness: walk repo (gitignore-aware), hash files, compute delta vs stored hashes.
 use crate::error::{Error, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,6 +60,26 @@ pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<Strin
     }
     out.extend(user_exclude.iter().cloned());
     out
+}
+
+/// Build a matcher over `excludes` so the same patterns `scan` applies at index
+/// time can also be enforced at read time (search). Keeping both paths driven by
+/// one `resolve_excludes` list means they cannot drift apart. Patterns use
+/// gitignore glob semantics, matching how `scan` interprets them.
+pub fn exclude_matcher(repo_root: &Path, excludes: &[String]) -> Result<Gitignore> {
+    let mut b = GitignoreBuilder::new(repo_root);
+    for pat in excludes {
+        b.add_line(None, pat)
+            .map_err(|e| Error::Config(format!("invalid exclude pattern {pat:?}: {e}")))?;
+    }
+    b.build()
+        .map_err(|e| Error::Config(format!("building exclude matcher: {e}")))
+}
+
+/// True if `rel_path` (repo-relative, forward-slashed — as stored on `Hit`s) is
+/// excluded by `matcher`. Paths are always files here, never directories.
+pub fn is_excluded(matcher: &Gitignore, rel_path: &str) -> bool {
+    matcher.matched(rel_path, false).is_ignore()
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +306,28 @@ mod tests {
                     "{locked} must be excluded (index_tests={index_tests}); got {paths:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn exclude_matcher_agrees_with_scan_patterns() {
+        // The read-time matcher must exclude exactly what scan excludes, or search
+        // and indexing would disagree. Drive both from the same resolve_excludes set.
+        let excludes = resolve_excludes(&["vendor/**".to_string()], false);
+        let m = exclude_matcher(Path::new("/repo"), &excludes).unwrap();
+        for excluded in [
+            "Cargo.lock",
+            "web/package-lock.json",
+            "go.sum",
+            "tests/it.rs",
+            "a/__tests__/x.ts",
+            "web/app.test.ts",
+            "vendor/dep.rs",
+        ] {
+            assert!(is_excluded(&m, excluded), "{excluded} should be excluded");
+        }
+        for kept in ["src/lib.rs", "go.mod", "examples/demo.rs"] {
+            assert!(!is_excluded(&m, kept), "{kept} should be kept");
         }
     }
 
