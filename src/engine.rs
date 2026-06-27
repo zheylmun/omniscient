@@ -88,7 +88,9 @@ impl Engine {
             let chunks = chunk_file(Path::new(path), &source, MAX_WINDOW_LINES)?;
             if chunks.is_empty() { continue; }
             let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-            let vectors = self.embedder.embed(&texts).await?;
+            let vectors = self.embedder
+                .embed_batched(&texts, self.config.embedder.batch_limits())
+                .await?;
             if vectors.len() != texts.len() {
                 return Err(Error::Embed(format!(
                     "embedder returned {} vectors for {} inputs (file {path})",
@@ -143,7 +145,9 @@ impl Engine {
                 if chunks.is_empty() { return Ok(vec![]); }
                 let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
                 let fv = self.embed_one(f).await?;
-                let cvs = self.embedder.embed(&texts).await?;
+                let cvs = self.embedder
+                    .embed_batched(&texts, self.config.embedder.batch_limits())
+                    .await?;
                 if cvs.len() != texts.len() {
                     return Err(Error::Embed(format!(
                         "embedder returned {} vectors for {} inputs", cvs.len(), texts.len()
@@ -362,6 +366,56 @@ mod tests {
         let lazy = LazyEngine::from_engine(cfg, state.clone(), engine.clone());
         let got = lazy.get().await.unwrap();
         assert!(Arc::ptr_eq(&got, &engine), "from_engine yields the pre-built engine");
+    }
+
+    /// Records every embed() batch length, delegating vectors to a MockEmbedder, so we
+    /// can assert the engine honored the batch cap on a real reconcile.
+    struct CountingEmbedder {
+        inner: MockEmbedder,
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+    impl CountingEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { inner: MockEmbedder::new("mock-v1", dim), calls: std::sync::Mutex::new(vec![]) }
+        }
+    }
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        fn id(&self) -> &str { self.inner.id() }
+        fn dim(&self) -> usize { self.inner.dim() }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            self.inner.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_respects_batch_cap() {
+        let repo = tempdir().unwrap();
+        // One file with 5 top-level fns -> 5 chunks.
+        fs::write(repo.path().join("many.rs"),
+            "pub fn a() {}\npub fn b() {}\npub fn c() {}\npub fn d() {}\npub fn e() {}\n").unwrap();
+
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.embedder.max_batch_chunks = 2;       // force splitting
+        cfg.embedder.max_batch_chars = 1_000_000;
+
+        let embedder = std::sync::Arc::new(CountingEmbedder::new(64));
+        // Engine takes Box<dyn Embedder>; wrap the Arc so we keep a handle to the spy.
+        struct Shared(std::sync::Arc<CountingEmbedder>);
+        #[async_trait]
+        impl Embedder for Shared {
+            fn id(&self) -> &str { self.0.id() }
+            fn dim(&self) -> usize { self.0.dim() }
+            async fn embed(&self, t: &[String]) -> Result<Vec<Vec<f32>>> { self.0.embed(t).await }
+        }
+        let engine = Engine::new_with_embedder(cfg, Box::new(Shared(embedder.clone()))).await.unwrap();
+        engine.refresh().await.unwrap();
+
+        let calls = embedder.calls.lock().unwrap().clone();
+        assert!(!calls.is_empty(), "reconcile should have embedded the file");
+        assert!(calls.iter().all(|&n| n <= 2), "no batch may exceed max_batch_chunks=2; got {calls:?}");
+        assert!(calls.iter().any(|&n| n < 5), "5 chunks must be split, not sent as one batch; got {calls:?}");
     }
 
     #[tokio::test]
