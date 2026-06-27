@@ -1,0 +1,42 @@
+# Managed by prek (https://github.com/j178/prek) — a fast, Rust-native drop-in
+# for the pre-commit framework that reads this same config. Install the git
+# hooks with `prek install` (./install.sh does this for you).
+#
+# Stages mirror .github/workflows/ci.yml so failures surface locally, not at PR
+# time: rustfmt is cheap enough to run on every commit; clippy and the test
+# suite run on push. RUSTFLAGS=-Dwarnings matches CI, which promotes every
+# warning (and the pedantic clippy lints in Cargo.toml) to a hard error.
+# (No space in -Dwarnings: prek splits entry on whitespace, so the value must
+# be a single token.)
+default_install_hook_types: [pre-commit, pre-push]
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: dprint
+        name: dprint (markdown)
+        entry: dprint fmt
+        language: system
+        types: [markdown]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: clippy
+        name: cargo clippy
+        entry: env RUSTFLAGS=-Dwarnings cargo clippy --all-targets --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: test
+        name: cargo test
+        entry: env RUSTFLAGS=-Dwarnings cargo test --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
