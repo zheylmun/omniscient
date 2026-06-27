@@ -6,12 +6,30 @@ use crate::error::{Error, Result};
 use crate::refresh::RefreshState;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use notify_debouncer_full::notify::RecursiveMode;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// What the debouncer's (sync, off-runtime) handler sends to the async reconcile task.
+/// The tick is only a wakeup — the freshness flags are updated synchronously in the
+/// handler — so a single queued tick suffices to coalesce a burst of events.
 enum Tick { Events, Error }
+
+/// Mark the index dirty iff any event touches a path outside `.omniscient/`, and
+/// report whether it did. Called from the (sync) debouncer handler so `dirty` flips
+/// the instant a relevant event is observed — even while a long reconcile is still
+/// in flight — which is what keeps `search` from skipping the scan past that event.
+/// Events confined to `.omniscient/` are our own index writes and must be ignored to
+/// avoid a write -> event -> reconcile feedback loop.
+fn mark_if_relevant<'a>(
+    mut paths: impl Iterator<Item = &'a Path>,
+    omni: &Path,
+    state: &RefreshState,
+) -> bool {
+    let relevant = paths.any(|p| !p.starts_with(omni));
+    if relevant { state.mark_dirty(); }
+    relevant
+}
 
 /// Keeps the OS watcher alive and aborts the reconcile task when dropped.
 pub struct WatchGuard {
@@ -30,17 +48,28 @@ pub fn spawn(
     lazy: LazyEngine,
     state: Arc<RefreshState>,
 ) -> Result<WatchGuard> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Tick>();
+    // Capacity-1: the tick is just a wakeup and the freshness flags are set in this
+    // handler, so a full channel already has a pending wakeup. `try_send` then drops
+    // the redundant tick instead of letting a burst queue up behind a long reconcile.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Tick>(1);
     let omni = repo_root.join(".omniscient");
+    let handler_state = state.clone();
 
     let handler = move |res: DebounceEventResult| match res {
         Ok(events) => {
-            let relevant = events
-                .iter()
-                .any(|ev| ev.paths.iter().any(|p| !p.starts_with(&omni)));
-            if relevant { let _ = tx.send(Tick::Events); }
+            let paths = events.iter().flat_map(|ev| ev.paths.iter().map(|p| p.as_path()));
+            if mark_if_relevant(paths, &omni, &handler_state) {
+                let _ = tx.try_send(Tick::Events);
+            }
         }
-        Err(_errors) => { let _ = tx.send(Tick::Error); }
+        Err(_errors) => {
+            // The OS watch may be dead: drop to fallback (search resumes scanning)
+            // and mark dirty so the next reconcile re-absorbs anything missed — both
+            // synchronously here, so dropping the tick below never loses the signal.
+            handler_state.set_watch_active(false);
+            handler_state.mark_dirty();
+            let _ = tx.try_send(Tick::Error);
+        }
     };
 
     let mut debouncer = new_debouncer(Duration::from_millis(cfg.debounce_ms), None, handler)
@@ -57,18 +86,16 @@ pub fn spawn(
         while let Some(tick) = rx.recv().await {
             match tick {
                 Tick::Events => {
-                    state.mark_dirty();
-                    // A real event proves the watch is live; enable skip-scan on success.
+                    // `dirty` was already set by the handler. Reconcile and, on
+                    // success, (re)confirm the watch is live so search can skip-scan.
                     if reconcile_once(&lazy).await {
                         state.set_watch_active(true);
                     }
                 }
                 Tick::Error => {
-                    // OS watch may be dead — stay in fallback (search keeps scanning)
-                    // until a real Tick::Events proves liveness. Reconcile best-effort
-                    // but do NOT re-enable watch_active.
-                    state.set_watch_active(false);
-                    state.mark_dirty();
+                    // `watch_active` is already false + `dirty` set by the handler, so
+                    // search keeps scanning. Reconcile best-effort but do NOT re-enable
+                    // watch_active until a real Tick::Events proves liveness again.
                     let _ = reconcile_once(&lazy).await;
                 }
             }
@@ -98,9 +125,46 @@ mod tests {
     use crate::embed::MockEmbedder;
     use crate::engine::{Engine, LazyEngine};
     use crate::refresh::RefreshState;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn relevant_event_marks_dirty_synchronously() {
+        // The debouncer handler must mark dirty the instant a relevant event is
+        // seen — not when the async task later pops the tick — so a long in-flight
+        // reconcile can't leave search on the skip-scan path past the event.
+        let state = RefreshState::standalone();
+        state.clear_dirty(); // simulate a caught-up watcher
+        let omni = PathBuf::from("/repo/.omniscient");
+        let touched = PathBuf::from("/repo/src/main.rs");
+        assert!(mark_if_relevant([touched.as_path()].into_iter(), &omni, &state));
+        assert!(state.is_dirty(), "a relevant event must mark dirty immediately");
+    }
+
+    #[test]
+    fn omniscient_only_events_do_not_mark_dirty() {
+        // Our own index writes under .omniscient/ must not mark dirty, or the
+        // watcher would chase its own tail (write -> event -> reconcile -> write).
+        let state = RefreshState::standalone();
+        state.clear_dirty();
+        let omni = PathBuf::from("/repo/.omniscient");
+        let ours = PathBuf::from("/repo/.omniscient/lance/data.lance");
+        assert!(!mark_if_relevant([ours.as_path()].into_iter(), &omni, &state));
+        assert!(!state.is_dirty(), "our own index writes must not mark dirty");
+    }
+
+    #[test]
+    fn mixed_events_are_relevant_when_any_path_is_outside_omniscient() {
+        let state = RefreshState::standalone();
+        state.clear_dirty();
+        let omni = PathBuf::from("/repo/.omniscient");
+        let ours = PathBuf::from("/repo/.omniscient/lance/data.lance");
+        let touched = PathBuf::from("/repo/src/main.rs");
+        assert!(mark_if_relevant([ours.as_path(), touched.as_path()].into_iter(), &omni, &state));
+        assert!(state.is_dirty());
+    }
 
     async fn search_finds(engine: &Engine, query: &str, path: &str) -> bool {
         engine.search(query, Some(5)).await.unwrap().iter().any(|e| e.path == path)
