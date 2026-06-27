@@ -32,3 +32,11 @@ walkdir = "2.5.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Release binary is dominated by LanceDB's embedded DataFusion query engine.
+# strip + thin LTO + a single codegen unit trim dead code across crates without
+# the multi-minute rebuilds that "fat" LTO costs.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
