@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "chore/**", "fix/**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a fresh push doesn't queue behind a stale one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (pedantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Pedantic lints are configured in Cargo.toml ([lints.clippy]); RUSTFLAGS
+      # promotes every warning to a hard error.
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The suite is fully offline (MockEmbedder); the one network test is #[ignore]d.
+      # No --all-targets: that would skip doctests, which we want to run.
+      - run: cargo test --all-features
+
+  build-release:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Exercises the thin-LTO / codegen-units=1 release profile so packaging
+      # issues surface in CI, not at release time.
+      - run: cargo build --release
