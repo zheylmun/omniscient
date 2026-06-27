@@ -2,6 +2,13 @@
 name = "omniscient"
 version = "0.1.0"
 edition = "2024"
+description = "Local MCP server for semantic, distilled code search over a repository, backed by a LanceDB vector store and an external llama.cpp embeddings endpoint."
+authors = ["Zach Heylmun <zheylmun@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zheylmun/omniscient"
+readme = "README.md"
+keywords = ["mcp", "embeddings", "code-search", "semantic-search", "lancedb"]
+categories = ["development-tools", "command-line-utilities"]
 
 [lints.clippy]
 # Pragmatic pedantic: the full pedantic group as warnings, minus a few
