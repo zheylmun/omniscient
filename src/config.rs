@@ -21,11 +21,19 @@ impl Default for SearchConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct WatchConfig { pub enabled: bool, pub debounce_ms: u64 }
+impl Default for WatchConfig {
+    fn default() -> Self { Self { enabled: true, debounce_ms: 200 } }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     #[serde(skip)]
     pub repo_root: PathBuf,
     pub embedder: EmbedderConfig,
     pub search: SearchConfig,
+    pub watch: WatchConfig,
     pub languages: Vec<String>,
     pub strip_comments: bool,
     /// Extra glob patterns to skip when indexing, unioned with the built-in
@@ -41,6 +49,7 @@ impl Default for Config {
             repo_root: PathBuf::new(),
             embedder: EmbedderConfig::default(),
             search: SearchConfig::default(),
+            watch: WatchConfig::default(),
             languages: vec!["rust".into(), "python".into(), "typescript".into()],
             strip_comments: true,
             exclude: Vec::new(),
@@ -127,5 +136,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res = Config::load(Some(dir.path()), PathBuf::from("/repo"));
         assert!(res.is_err(), "a non-NotFound IO error must not yield defaults");
+    }
+
+    #[test]
+    fn watch_config_defaults_and_parse() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert!(c.watch.enabled, "watching defaults to on");
+        assert_eq!(c.watch.debounce_ms, 200);
+
+        let toml = r#"
+            [watch]
+            enabled = false
+            debounce_ms = 500
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert!(!c.watch.enabled);
+        assert_eq!(c.watch.debounce_ms, 500);
     }
 }

@@ -11,6 +11,13 @@ A local semantic and distilled code search MCP server for Claude Code and other 
 
 Before every `search` call, omniscient computes a delta between the on-disk file hashes and the stored hashes, re-embeds only changed or new files, and deletes stale entries. You never see results from deleted or overwritten code.
 
+With the file watcher enabled (the default), omniscient also reconciles the index
+proactively as files change, and `search` skips its filesystem scan when the watcher
+guarantees the index already reflects the tree. This trades strict per-search rescan
+for a sub-second freshness window on the happy path; whenever the watcher is disabled,
+not yet started, or unhealthy, `search` falls back to a full scan — so results are
+never stale outside that narrow window.
+
 ## Embeddings
 
 omniscient does **not** do in-process inference. Embeddings are served by a local [llama.cpp](https://github.com/ggml-org/llama.cpp) instance via its `/v1/embeddings` endpoint. You point omniscient at it with `base_url` in your config.
@@ -53,6 +60,10 @@ model = "qwen3-embedding-4b"
 [search]
 default_k = 8
 token_budget = 4000
+
+[watch]
+enabled = true      # set false to disable the filesystem watcher
+debounce_ms = 200   # coalesce bursts of FS events into one reconcile
 ```
 
 Changing the `model` field triggers an automatic full reindex on the next run — the index records the embedder id and rebuilds when it detects a mismatch.

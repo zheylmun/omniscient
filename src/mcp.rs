@@ -1,7 +1,7 @@
 //! MCP server over stdio: exposes `search` and `read_file`.
 use crate::config::Config;
 use crate::distill::ContextEntry;
-use crate::engine::Engine;
+use crate::engine::LazyEngine;
 use crate::error::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -13,8 +13,6 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_router, RoleServer, ServerHandler, ServiceExt};
 use rmcp::transport::stdio;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SearchParams {
@@ -30,33 +28,6 @@ struct ReadFileParams {
     focus: Option<String>,
 }
 
-/// Lazily initialized engine — constructed on first tool call, not at server startup.
-/// This lets `tools/list` respond even if the embedder server is not yet reachable.
-#[derive(Clone)]
-struct LazyEngine {
-    config: Config,
-    inner: Arc<OnceCell<Arc<Engine>>>,
-}
-
-impl LazyEngine {
-    fn new(config: Config) -> Self {
-        Self { config, inner: Arc::new(OnceCell::new()) }
-    }
-
-    async fn get(&self) -> std::result::Result<Arc<Engine>, String> {
-        self.inner
-            .get_or_try_init(|| async {
-                Engine::new(self.config.clone())
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map(|e| Arc::clone(e))
-            .map_err(|e| e.clone())
-    }
-}
-
 #[derive(Clone)]
 struct Server {
     engine: LazyEngine,
@@ -65,11 +36,8 @@ struct Server {
 
 #[tool_router]
 impl Server {
-    fn new(config: Config) -> Self {
-        Self {
-            engine: LazyEngine::new(config),
-            tool_router: Self::tool_router(),
-        }
+    fn new(engine: LazyEngine) -> Self {
+        Self { engine, tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Semantic code search. Returns distilled, relevant code context (file:line + code) for a natural-language or code query.")]
@@ -139,7 +107,20 @@ fn render(entries: &[ContextEntry]) -> String {
 }
 
 pub async fn serve(config: Config) -> Result<()> {
-    let server = Server::new(config);
+    let state = std::sync::Arc::new(crate::refresh::RefreshState::standalone());
+    let lazy = LazyEngine::new(config.clone(), state.clone());
+
+    // Held until shutdown; dropping it stops watching and aborts the reconcile task.
+    let _watch_guard = if config.watch.enabled {
+        match crate::watcher::spawn(config.repo_root.clone(), &config.watch, lazy.clone(), state.clone()) {
+            Ok(guard) => Some(guard),
+            Err(e) => { tracing::warn!("file watcher disabled: {e}"); None }
+        }
+    } else {
+        None
+    };
+
+    let server = Server::new(lazy);
     let running = server
         .serve(stdio())
         .await

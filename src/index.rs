@@ -109,12 +109,29 @@ impl Index {
         Ok(())
     }
 
+    /// Replace all rows for `path` with `chunks`. Adds the new rows FIRST, then
+    /// deletes the stale ones (scoped by `file_hash`), so a concurrent `search`
+    /// observes at worst a transient superset (old + new) for this path, never a
+    /// gap. `distill` merges overlapping hits, so the brief duplicates are benign.
+    ///
+    /// Precondition: callers upsert a file only when its content — and thus its
+    /// `file_hash` — has changed (this is what `Engine::reconcile_inner` does). The
+    /// hash-scoped delete then removes exactly the old rows and never the rows just
+    /// added. Upserting unchanged content (same hash) would leave duplicates.
     pub async fn upsert_file(&self, path: &str, chunks: Vec<StoredChunk>) -> Result<()> {
-        self.delete_file(path).await?;
-        if chunks.is_empty() { return Ok(()); }
+        if chunks.is_empty() {
+            // File now yields no chunks (e.g. deleted/emptied): just drop its rows.
+            return self.delete_file(path).await;
+        }
+        let new_hash = chunks[0].file_hash.clone();
         let schema = schema_for(self.dim);
         let batch = build_batch(&schema, &chunks, self.dim)?;
         self.table.add(vec![batch]).execute().await.map_err(|e| Error::Index(e.to_string()))?;
+        let pred = format!(
+            "path = '{}' AND file_hash <> '{}'",
+            path.replace('\'', "''"), new_hash.replace('\'', "''"),
+        );
+        self.table.delete(&pred).await.map_err(|e| Error::Index(e.to_string()))?;
         Ok(())
     }
 
@@ -244,6 +261,34 @@ mod tests {
         let hits = idx.search(&[1.0,0.0,0.0], 5).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.start_line, 9);
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_with_new_chunk_shape_and_keeps_new_rows() {
+        // Re-chunking a changed file can produce a different number of chunks.
+        // add-then-delete-by-hash must end with exactly the new rows: no stale
+        // old-hash rows, and none of the just-added new rows wrongly deleted.
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])]).await.unwrap();
+        idx.upsert_file("a.rs", vec![
+            chunk("a.rs", "h2", 10, vec![1.0, 0.0, 0.0]),
+            chunk("a.rs", "h2", 20, vec![0.0, 1.0, 0.0]),
+        ]).await.unwrap();
+
+        assert_eq!(idx.chunk_count().await.unwrap(), 2, "exactly the new rows remain");
+        assert_eq!(idx.file_hashes().await.unwrap().get("a.rs"), Some(&"h2".to_string()));
+        let hits = idx.search(&[0.0, 1.0, 0.0], 5).await.unwrap();
+        assert!(hits.iter().any(|h| h.chunk.start_line == 20), "new rows are queryable");
+    }
+
+    #[tokio::test]
+    async fn upsert_empty_chunks_removes_file() {
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])]).await.unwrap();
+        idx.upsert_file("a.rs", vec![]).await.unwrap();
+        assert_eq!(idx.chunk_count().await.unwrap(), 0, "empty upsert drops the file's rows");
     }
 
     #[tokio::test]

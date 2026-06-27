@@ -6,7 +6,10 @@ use crate::embed::{build_embedder, Embedder};
 use crate::error::{Error, Result};
 use crate::freshness::{diff, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
+use crate::refresh::RefreshState;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 const MAX_WINDOW_LINES: usize = 80;
 
@@ -14,6 +17,7 @@ pub struct Engine {
     config: Config,
     embedder: Box<dyn Embedder>,
     index: Index,
+    refresh: Arc<RefreshState>,
 }
 
 impl Engine {
@@ -23,18 +27,54 @@ impl Engine {
     }
 
     pub async fn new_with_embedder(config: Config, embedder: Box<dyn Embedder>) -> Result<Engine> {
+        Self::with_refresh_state(config, embedder, Arc::new(RefreshState::standalone())).await
+    }
+
+    pub async fn with_refresh_state(
+        config: Config,
+        embedder: Box<dyn Embedder>,
+        refresh: Arc<RefreshState>,
+    ) -> Result<Engine> {
         let dir = config.repo_root.join(".omniscient");
         let index = Index::open(&dir, embedder.id(), embedder.dim().max(1), crate::chunk::CHUNKER_VERSION).await?;
-        Ok(Engine { config, embedder, index })
+        Ok(Engine { config, embedder, index, refresh })
     }
 
     pub fn embedder_id(&self) -> &str { self.embedder.id() }
+
+    pub fn refresh_state(&self) -> &Arc<RefreshState> { &self.refresh }
 
     pub async fn stats(&self) -> Result<(usize, usize)> {
         Ok((self.index.file_hashes().await?.len(), self.index.chunk_count().await?))
     }
 
+    /// Skip the scan entirely when a healthy watcher guarantees freshness;
+    /// otherwise reconcile. This is the only search-path change vs. always-scan.
+    pub async fn ensure_fresh(&self) -> Result<()> {
+        // pre-lock fast path; re-checked under the lock in reconcile()
+        if self.refresh.can_skip_scan() { return Ok(()); }
+        self.reconcile().await
+    }
+
+    /// Single-flight reconcile. Clears `dirty` BEFORE scanning so an event arriving
+    /// mid-scan re-sets it (costing at most one redundant reconcile, never a lost update).
+    /// If `reconcile_inner` fails, `dirty` is restored — otherwise a failed reconcile
+    /// would leave the state clean+active and let `search` skip the scan and serve stale.
+    pub async fn reconcile(&self) -> Result<()> {
+        let _guard = self.refresh.lock.lock().await;
+        if self.refresh.can_skip_scan() { return Ok(()); } // another reconcile beat us
+        self.refresh.clear_dirty();
+        self.reconcile_inner().await.inspect_err(|_| self.refresh.mark_dirty())
+    }
+
+    /// Force a full reconcile regardless of flags (used by `reindex` and tests).
     pub async fn refresh(&self) -> Result<()> {
+        let _guard = self.refresh.lock.lock().await;
+        self.refresh.clear_dirty();
+        self.reconcile_inner().await.inspect_err(|_| self.refresh.mark_dirty())
+    }
+
+    async fn reconcile_inner(&self) -> Result<()> {
         let excludes = resolve_excludes(&self.config.exclude, self.config.index_tests);
         let current = scan(&self.config.repo_root, &excludes)?;
         let stored = self.index.file_hashes().await?;
@@ -80,7 +120,7 @@ impl Engine {
     }
 
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
-        self.refresh().await?;
+        self.ensure_fresh().await?;
         let k = k.unwrap_or(self.config.search.default_k);
         let qv = self.embed_one(query).await?;
         let hits = self.index.search(&qv, k).await?;
@@ -123,6 +163,44 @@ impl Engine {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
+
+/// Lazily initialized engine — constructed on first `get()`, not at server startup,
+/// so `tools/list` works even when the embedder endpoint is down and a failed init
+/// is retryable. Shares one `RefreshState` with the watcher.
+#[derive(Clone)]
+pub struct LazyEngine {
+    config: Config,
+    state: Arc<RefreshState>,
+    inner: Arc<OnceCell<Arc<Engine>>>,
+}
+
+impl LazyEngine {
+    pub fn new(config: Config, state: Arc<RefreshState>) -> Self {
+        Self { config, state, inner: Arc::new(OnceCell::new()) }
+    }
+
+    /// Test/seam constructor: a `LazyEngine` whose cell is already filled, so `get()`
+    /// never builds a real embedder.
+    pub fn from_engine(config: Config, state: Arc<RefreshState>, engine: Arc<Engine>) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(engine);
+        Self { config, state, inner: Arc::new(cell) }
+    }
+
+    pub async fn get(&self) -> std::result::Result<Arc<Engine>, String> {
+        self.inner
+            .get_or_try_init(|| async {
+                let embedder = build_embedder(&self.config.embedder).await.map_err(|e| e.to_string())?;
+                Engine::with_refresh_state(self.config.clone(), embedder, self.state.clone())
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map(Arc::clone)
+            .map_err(|e| e.clone())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -216,6 +294,74 @@ mod tests {
         let focus = engine.read_file("lib.rs", Some("alpha")).await.unwrap();
         assert!(!focus.is_empty());
         assert!(focus.iter().all(|e| e.why_matched.contains("focus similarity")));
+    }
+
+    #[tokio::test]
+    async fn search_skips_scan_when_watch_active_and_clean() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        // Prime the index, then simulate a healthy, caught-up watcher.
+        engine.refresh().await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().clear_dirty();
+
+        // Change the tree WITHOUT marking dirty: a skipped scan must not see it.
+        fs::write(repo.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let entries = engine.search("beta", Some(5)).await.unwrap();
+        assert!(!entries.iter().any(|e| e.path == "b.rs"),
+            "active+clean must skip the scan; got {:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn failed_reconcile_keeps_state_dirty_for_retry() {
+        // A watcher marks dirty then triggers a reconcile that fails to embed.
+        // The failure must NOT leave the state clean+active, or the next search
+        // takes the skip-scan path and serves stale results forever.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, Box::new(ZeroEmbedder)).await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().mark_dirty(); // watcher would do this before reconciling
+
+        let err = engine.reconcile().await.unwrap_err();
+        assert!(matches!(err, Error::Embed(_)), "expected embed failure, got {err:?}");
+
+        assert!(engine.refresh_state().is_dirty(),
+            "a failed reconcile must re-mark dirty");
+        assert!(!engine.refresh_state().can_skip_scan(),
+            "a failed reconcile must keep search on the scanning path");
+    }
+
+    #[tokio::test]
+    async fn search_reconciles_when_dirty() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        engine.refresh().await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().clear_dirty();
+
+        fs::write(repo.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        engine.refresh_state().mark_dirty(); // watcher would do this
+        let entries = engine.search("beta", Some(5)).await.unwrap();
+        assert!(entries.iter().any(|e| e.path == "b.rs"), "dirty => reconcile picks up b.rs");
+    }
+
+    #[tokio::test]
+    async fn lazy_engine_from_engine_returns_ready_instance() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let engine = Arc::new(
+            Engine::with_refresh_state(cfg.clone(), Box::new(MockEmbedder::new("mock-v1", 64)), state.clone())
+                .await.unwrap(),
+        );
+        let lazy = LazyEngine::from_engine(cfg, state.clone(), engine.clone());
+        let got = lazy.get().await.unwrap();
+        assert!(Arc::ptr_eq(&got, &engine), "from_engine yields the pre-built engine");
     }
 
     #[tokio::test]
