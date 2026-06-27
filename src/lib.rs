@@ -8,5 +8,6 @@ pub mod error;
 pub mod freshness;
 pub mod index;
 pub mod mcp;
+pub mod refresh;
 
 pub use error::{Error, Result};
