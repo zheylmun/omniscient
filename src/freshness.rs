@@ -25,7 +25,7 @@ pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<Strin
     let mut out: Vec<String> = if index_tests {
         Vec::new()
     } else {
-        DEFAULT_TEST_EXCLUDES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_TEST_EXCLUDES.iter().map(std::string::ToString::to_string).collect()
     };
     out.extend(user_exclude.iter().cloned());
     out
@@ -54,16 +54,16 @@ pub fn scan(repo_root: &Path, excludes: &[String]) -> Result<Vec<FileState>> {
 
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(repo_root).overrides(overrides).build() {
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
         let path = entry.path();
-        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => continue };
+        let Ok(bytes) = std::fs::read(path) else { continue };
         out.push(FileState { path: rel(repo_root, path), hash: blake3::hash(&bytes).to_hex().to_string() });
     }
     Ok(out)
 }
 
-pub fn diff(current: &[FileState], stored: &HashMap<String, String>) -> Delta {
+pub fn diff<S: std::hash::BuildHasher>(current: &[FileState], stored: &HashMap<String, String, S>) -> Delta {
     let mut delta = Delta::default();
     let current_paths: std::collections::HashSet<&str> = current.iter().map(|s| s.path.as_str()).collect();
     for s in current {

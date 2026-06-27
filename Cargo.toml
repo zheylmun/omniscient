@@ -3,6 +3,15 @@ name = "omniscient"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+# Pragmatic pedantic: the full pedantic group as warnings, minus a few
+# library-API doc/usability lints that are noise for an application binary.
+# CI promotes warnings to errors via `-D warnings`.
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
 [dependencies]
 anyhow = "1.0.103"
 arrow-array = "58"

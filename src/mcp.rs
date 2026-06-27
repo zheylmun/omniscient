@@ -92,16 +92,18 @@ impl ServerHandler for Server {
 }
 
 fn render(entries: &[ContextEntry]) -> String {
+    use std::fmt::Write;
     if entries.is_empty() {
         return "No matches.".into();
     }
     let mut out = String::new();
     for e in entries {
         let sym = e.symbol.as_deref().map(|s| format!(" [{s}]")).unwrap_or_default();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "{}:{}-{}{} ({})\n```{}\n{}\n```\n\n",
             e.path, e.start_line, e.end_line, sym, e.why_matched, e.language, e.code
-        ));
+        );
     }
     out
 }
@@ -112,7 +114,7 @@ pub async fn serve(config: Config) -> Result<()> {
 
     // Held until shutdown; dropping it stops watching and aborts the reconcile task.
     let _watch_guard = if config.watch.enabled {
-        match crate::watcher::spawn(config.repo_root.clone(), &config.watch, lazy.clone(), state.clone()) {
+        match crate::watcher::spawn(&config.repo_root, &config.watch, lazy.clone(), state.clone()) {
             Ok(guard) => Some(guard),
             Err(e) => { tracing::warn!("file watcher disabled: {e}"); None }
         }

@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::refresh::RefreshState;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use notify_debouncer_full::notify::RecursiveMode;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ impl Drop for WatchGuard {
 /// Spawn a debounced recursive watcher over `repo_root`. Events under `.omniscient/`
 /// (our own index writes) are filtered out to avoid a write→event→reconcile loop.
 pub fn spawn(
-    repo_root: PathBuf,
+    repo_root: &Path,
     cfg: &WatchConfig,
     lazy: LazyEngine,
     state: Arc<RefreshState>,
@@ -57,7 +57,7 @@ pub fn spawn(
 
     let handler = move |res: DebounceEventResult| match res {
         Ok(events) => {
-            let paths = events.iter().flat_map(|ev| ev.paths.iter().map(|p| p.as_path()));
+            let paths = events.iter().flat_map(|ev| ev.paths.iter().map(std::path::PathBuf::as_path));
             if mark_if_relevant(paths, &omni, &handler_state) {
                 let _ = tx.try_send(Tick::Events);
             }
@@ -75,7 +75,7 @@ pub fn spawn(
     let mut debouncer = new_debouncer(Duration::from_millis(cfg.debounce_ms), None, handler)
         .map_err(|e| Error::Other(anyhow::anyhow!("watcher init: {e}")))?;
     debouncer
-        .watch(&repo_root, RecursiveMode::Recursive)
+        .watch(repo_root, RecursiveMode::Recursive)
         .map_err(|e| Error::Other(anyhow::anyhow!("watcher watch: {e}")))?;
 
     let task = tokio::spawn(async move {
@@ -106,7 +106,7 @@ pub fn spawn(
 }
 
 /// Best-effort reconcile through the lazy engine. Returns true iff the reconcile
-/// succeeded. Does NOT touch watch_active — the caller decides, because a successful
+/// succeeded. Does NOT touch `watch_active` — the caller decides, because a successful
 /// reconcile does not prove the OS watch is still live.
 async fn reconcile_once(lazy: &LazyEngine) -> bool {
     match lazy.get().await {
@@ -182,7 +182,7 @@ mod tests {
         );
         let lazy = LazyEngine::from_engine(cfg.clone(), state.clone(), engine.clone());
         let wcfg = WatchConfig { enabled: true, debounce_ms: 50 };
-        let _guard = spawn(repo.path().to_path_buf(), &wcfg, lazy, state.clone()).unwrap();
+        let _guard = spawn(repo.path(), &wcfg, lazy, state.clone()).unwrap();
 
         // New file appears; the watcher must reconcile it in within a bounded wait.
         std::fs::write(repo.path().join("b.rs"), "pub fn beta() {}\n").unwrap();

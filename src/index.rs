@@ -1,4 +1,4 @@
-//! Vector index over LanceDB, guarded by embedder id/dim.
+//! Vector index over `LanceDB`, guarded by embedder id/dim.
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,7 +54,8 @@ fn schema_for(dim: usize) -> Arc<Schema> {
         Field::new("text", DataType::Utf8, false),
         Field::new("file_hash", DataType::Utf8, false),
         Field::new("vector",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim as i32),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)),
+                i32::try_from(dim).expect("embedding dimension fits in i32")),
             false),
     ]))
 }
@@ -66,8 +67,7 @@ impl Index {
         let existing: Option<Meta> = std::fs::read_to_string(&meta_path).ok()
             .and_then(|s| serde_json::from_str(&s).ok());
         let mismatch = existing.as_ref()
-            .map(|m| m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version)
-            .unwrap_or(false);
+            .is_some_and(|m| m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version);
 
         // Zero read-consistency interval: re-resolve the on-disk manifest before
         // every read. Without this, a long-lived handle (e.g. the `serve` process)
@@ -208,15 +208,17 @@ fn u32_col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
 
 fn build_batch(schema: &Arc<Schema>, chunks: &[StoredChunk], dim: usize) -> Result<RecordBatch> {
     let paths = StringArray::from(chunks.iter().map(|c| c.path.clone()).collect::<Vec<_>>());
-    let starts = UInt32Array::from(chunks.iter().map(|c| c.start_line as u32).collect::<Vec<_>>());
-    let ends = UInt32Array::from(chunks.iter().map(|c| c.end_line as u32).collect::<Vec<_>>());
+    // Line numbers are display metadata; clamp rather than panic on a pathological
+    // file with more than u32::MAX lines.
+    let starts = UInt32Array::from(chunks.iter().map(|c| u32::try_from(c.start_line).unwrap_or(u32::MAX)).collect::<Vec<_>>());
+    let ends = UInt32Array::from(chunks.iter().map(|c| u32::try_from(c.end_line).unwrap_or(u32::MAX)).collect::<Vec<_>>());
     let langs = StringArray::from(chunks.iter().map(|c| c.language.clone()).collect::<Vec<_>>());
     let syms = StringArray::from(chunks.iter().map(|c| c.symbol.clone()).collect::<Vec<Option<String>>>());
     let texts = StringArray::from(chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>());
     let hashes = StringArray::from(chunks.iter().map(|c| c.file_hash.clone()).collect::<Vec<_>>());
     let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
         chunks.iter().map(|c| Some(c.vector.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
-        dim as i32,
+        i32::try_from(dim).expect("embedding dimension fits in i32"),
     );
     RecordBatch::try_new(schema.clone(), vec![
         Arc::new(paths), Arc::new(starts), Arc::new(ends), Arc::new(langs),
