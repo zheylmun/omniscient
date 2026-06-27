@@ -3,11 +3,60 @@ use crate::config::EmbedderConfig;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 
+/// Bounds for splitting a list of texts into embed() batches. A batch is flushed
+/// before adding an item that would exceed either bound (a single item larger than
+/// `max_chars` is sent alone — we never split an item).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimits {
+    pub max_chunks: usize,
+    pub max_chars: usize,
+}
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn id(&self) -> &str;
     fn dim(&self) -> usize;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Embed `texts` in order, splitting into batches bounded by `limits`, calling
+    /// `embed()` once per batch. Returns exactly `texts.len()` vectors in input order.
+    /// Serial by design: batches run one after another.
+    async fn embed_batched(&self, texts: &[String], limits: BatchLimits) -> Result<Vec<Vec<f32>>> {
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut start = 0;
+        let mut cur_chars = 0usize;
+        let mut cur_len = 0usize;
+        for (i, t) in texts.iter().enumerate() {
+            let would_overflow = cur_len > 0
+                && (cur_len >= limits.max_chunks || cur_chars + t.len() > limits.max_chars);
+            if would_overflow {
+                let batch = &texts[start..i];
+                let vecs = self.embed(batch).await?;
+                if vecs.len() != batch.len() {
+                    return Err(Error::Embed(format!(
+                        "embedder returned {} vectors for a batch of {}", vecs.len(), batch.len()
+                    )));
+                }
+                out.extend(vecs);
+                start = i;
+                cur_chars = 0;
+                cur_len = 0;
+            }
+            cur_chars += t.len();
+            cur_len += 1;
+        }
+        if cur_len > 0 {
+            let batch = &texts[start..];
+            let vecs = self.embed(batch).await?;
+            if vecs.len() != batch.len() {
+                return Err(Error::Embed(format!(
+                    "embedder returned {} vectors for a batch of {}", vecs.len(), batch.len()
+                )));
+            }
+            out.extend(vecs);
+        }
+        Ok(out)
+    }
 }
 
 pub fn l2_normalize(v: &mut [f32]) {
@@ -116,6 +165,81 @@ mod tests {
         let e = MockEmbedder::new("mock-v1", 16);
         assert_eq!(e.id(), "mock-v1");
         assert_eq!(e.dim(), 16);
+    }
+
+    // A spy embedder that records the length of every embed() batch it receives,
+    // delegating the actual vectors to a MockEmbedder.
+    struct SpyEmbedder {
+        inner: MockEmbedder,
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+    impl SpyEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { inner: MockEmbedder::new("spy", dim), calls: std::sync::Mutex::new(vec![]) }
+        }
+    }
+    #[async_trait]
+    impl Embedder for SpyEmbedder {
+        fn id(&self) -> &str { self.inner.id() }
+        fn dim(&self) -> usize { self.inner.dim() }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            self.inner.embed(texts).await
+        }
+    }
+
+    fn texts(parts: &[&str]) -> Vec<String> { parts.iter().map(|s| s.to_string()).collect() }
+
+    #[tokio::test]
+    async fn batched_packs_by_count() {
+        let e = SpyEmbedder::new(16);
+        let t = texts(&["a", "b", "c", "d", "e"]);
+        let limits = BatchLimits { max_chunks: 2, max_chars: 1_000_000 };
+        let out = e.embed_batched(&t, limits).await.unwrap();
+        assert_eq!(out.len(), 5, "one vector per input, in order");
+        assert_eq!(*e.calls.lock().unwrap(), vec![2, 2, 1], "5 items, cap 2 -> 2+2+1");
+    }
+
+    #[tokio::test]
+    async fn batched_packs_by_chars() {
+        let e = SpyEmbedder::new(16);
+        // each item is 4 bytes; max_chars=8 -> 2 per batch
+        let t = texts(&["aaaa", "bbbb", "cccc"]);
+        let limits = BatchLimits { max_chunks: 1000, max_chars: 8 };
+        let out = e.embed_batched(&t, limits).await.unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(*e.calls.lock().unwrap(), vec![2, 1], "8-byte budget -> 4+4, then 4");
+    }
+
+    #[tokio::test]
+    async fn batched_oversized_single_chunk_goes_alone() {
+        let e = SpyEmbedder::new(16);
+        let t = texts(&["aa", "bbbbbbbbbb", "cc"]); // middle item is 10 bytes > budget 4
+        let limits = BatchLimits { max_chunks: 1000, max_chars: 4 };
+        let out = e.embed_batched(&t, limits).await.unwrap();
+        assert_eq!(out.len(), 3);
+        // "aa"(2) fits; adding "bbbbbbbbbb" would exceed -> flush [aa]; the big one is
+        // alone (it exceeds the budget by itself); "cc" follows in its own batch.
+        assert_eq!(*e.calls.lock().unwrap(), vec![1, 1, 1]);
+        // no batch ever exceeds the count limit
+        assert!(e.calls.lock().unwrap().iter().all(|&n| n <= 1000));
+    }
+
+    #[tokio::test]
+    async fn batched_empty_input_makes_no_calls() {
+        let e = SpyEmbedder::new(16);
+        let out = e.embed_batched(&[], BatchLimits { max_chunks: 4, max_chars: 100 }).await.unwrap();
+        assert!(out.is_empty());
+        assert!(e.calls.lock().unwrap().is_empty(), "no embed() calls for empty input");
+    }
+
+    #[tokio::test]
+    async fn batched_equals_unbatched_elementwise() {
+        let e = MockEmbedder::new("mock-v1", 16);
+        let t = texts(&["alpha", "beta", "gamma", "delta", "epsilon"]);
+        let whole = e.embed(&t).await.unwrap();
+        let batched = e.embed_batched(&t, BatchLimits { max_chunks: 2, max_chars: 7 }).await.unwrap();
+        assert_eq!(whole, batched, "batching must not change vectors or order");
     }
 }
 
