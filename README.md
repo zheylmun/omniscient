@@ -4,8 +4,8 @@ A local semantic and distilled code search MCP server for Claude Code and other 
 
 ## Tools
 
-- **`search(query, k?)`** — Semantic search over your codebase. Returns up to `k` distilled code snippets most relevant to `query`. Always refreshes the index before searching, so results are always up to date with your working tree.
-- **`read_file(path, focus?)`** — Return the outline (all chunks) of a file, or, if `focus` is given, the chunks of that file most relevant to `focus`.
+- **`search(query, k?)`** — Semantic search over your codebase by meaning, not literal tokens. Returns ranked, distilled snippets (`file:line` + code body + a relevance note), selected by the *shape* of the relevance scores rather than a fixed count: every hit within `relevance_ratio` of the top hit is returned, so a sharp query yields a few results and a broad one yields more. `k` is an optional ceiling on candidates (it overrides `max_results` for the call), not a target. The index is refreshed before each search (see below). The corpus is implementation source, docs, build scripts, and config — it **excludes** test code and dependency lock files by design (`examples/` is kept); use a grep/text tool for exhaustive "every occurrence" sweeps or known-symbol lookups.
+- **`read_file(path, focus?)`** — A noise-stripped view of one file, read live from disk (so it reflects uncommitted edits). Without `focus`, a structural outline: every definition's signature and line range with bodies elided. With `focus` (a natural-language description), only the chunks of that file most relevant to it.
 
 ## Always-Fresh Guarantee
 
@@ -72,6 +72,8 @@ exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
 [embedder]
 base_url = "http://localhost:8080"
 model = "qwen3-embedding-4b"
+max_batch_chunks = 64     # max chunks per embed request
+max_batch_bytes = 32000   # max total bytes per embed request (~8k tokens)
 
 # Optionally let omniscient launch llama.cpp itself when base_url is unreachable.
 auto_start = false                                  # opt-in; off by default

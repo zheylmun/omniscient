@@ -38,6 +38,8 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 - **`embed`** — `Embedder` trait. Real impl is `LlamaCppEmbedder` (HTTP); `MockEmbedder` is the test seam. `build_embedder` is `async` (it probes the embedding dimension at connect time).
 - **`index`** — LanceDB table + a `meta.json` sidecar recording the embedder id and dim.
 - **`distill`** — deterministic, NO LLM: merges overlapping hits, strips noise, trims to a token budget.
+- **`watcher`** — optional background filesystem watcher (`notify-debouncer-full`); debounced FS events outside `.omniscient/` mark the index dirty and wake an async reconcile task. A `WatchGuard` keeps the OS watcher alive and aborts the task on drop.
+- **`refresh`** — `RefreshState`: the `dirty`/`watch_active` atomics + reconcile mutex shared by the watcher and `Engine`. `can_skip_scan()` (watcher active AND not dirty) is the gate that lets `search` skip its scan.
 - **`mcp`** — rmcp stdio server. **`cli`** — clap (`serve`/`status`/`reindex`).
 
 ### Invariants you must not break
