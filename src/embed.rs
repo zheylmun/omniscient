@@ -84,6 +84,15 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
         Ok(e) => return Ok(Box::new(e)),
         Err(e) if !cfg.auto_start => return Err(e),
         Err(e) => {
+            // `connect()` failing doesn't always mean the port is free: a server
+            // could be bound but misconfigured (wrong model, not in embedding
+            // mode, bad response). Spawning then would just collide on the port,
+            // breaking the "never spawn over a running endpoint" invariant — so
+            // only spawn when nothing is actually listening; otherwise surface the
+            // real error.
+            if endpoint_listening(&cfg.base_url).await {
+                return Err(e);
+            }
             tracing::info!(
                 "embeddings endpoint unreachable ({e}); auto_start is on, launching llama.cpp"
             );
@@ -91,6 +100,24 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
     }
     let server = ManagedServer::spawn(cfg)?;
     Ok(Box::new(connect_managed(server, cfg).await?))
+}
+
+/// Whether something is accepting TCP connections at `base_url`'s host:port. Used
+/// to distinguish "nothing is bound here" (safe to spawn) from "a server is up but
+/// answered badly" (must not spawn over it). A malformed URL or DNS failure counts
+/// as not listening.
+async fn endpoint_listening(base_url: &str) -> bool {
+    let Ok((host, port)) = parse_host_port(base_url) else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Parse the `(host, port)` to bind/spawn on from a base URL. Uses the URL's
@@ -110,8 +137,10 @@ fn parse_host_port(base_url: &str) -> Result<(String, u16)> {
 
 /// Whether `host` names the local machine — the only place we can launch a
 /// process. Auto-starting a server for a remote `base_url` is nonsensical.
+/// `0.0.0.0` is excluded: it's a wildcard *bind* address, not a client-facing
+/// destination, so it has no business in a `base_url`.
 fn is_local_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The argument vector for `llama serve …`, mirroring the documented manual
@@ -401,6 +430,21 @@ mod tests {
         assert!(is_local_host("::1"));
         assert!(!is_local_host("example.com"));
         assert!(!is_local_host("10.0.0.5"));
+        // 0.0.0.0 is a wildcard bind address, not a client destination.
+        assert!(!is_local_host("0.0.0.0"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_listening_detects_open_and_closed_ports() {
+        // A bound listener: the probe must see it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(endpoint_listening(&format!("http://127.0.0.1:{port}")).await);
+        // Once it's closed, the same port reads as not listening.
+        drop(listener);
+        assert!(!endpoint_listening(&format!("http://127.0.0.1:{port}")).await);
+        // A malformed base_url counts as not listening (so auto_start can proceed).
+        assert!(!endpoint_listening("not a url").await);
     }
 
     #[test]
