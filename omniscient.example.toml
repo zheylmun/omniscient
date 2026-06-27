@@ -2,13 +2,17 @@
 languages = ["rust", "python", "typescript"]
 strip_comments = true
 
+# Dependency lock files (Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml,
+# poetry.lock, go.sum, ...) are ALWAYS skipped — large, generated, pure noise.
+# This is not affected by index_tests below.
+
 # Test/fixture files (tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*,
 # **/test_*.py, **/conftest.py, **/__tests__/) are skipped by default. Set true
 # to index them too.
 index_tests = false
 
-# Extra glob patterns to skip when indexing, in addition to the built-in test
-# excludes above. Matched against repo-relative paths. .gitignore is always honored.
+# Extra glob patterns to skip when indexing, in addition to the built-in lock-file
+# and test excludes above. Matched against repo-relative paths. .gitignore is always honored.
 exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
 
 [embedder]
