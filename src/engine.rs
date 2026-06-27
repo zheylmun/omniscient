@@ -398,6 +398,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newly_excluded_file_is_purged_on_reconcile() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(repo.path().join("data.txt"), "noise noise noise\n").unwrap();
+
+        // First engine: no excludes -> indexes both files.
+        {
+            let mut cfg = Config::default_for(repo.path().to_path_buf());
+            cfg.index_tests = true;
+            let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+                .await
+                .unwrap();
+            engine.refresh().await.unwrap();
+            let stored = engine.index.file_hashes().await.unwrap();
+            assert!(
+                stored.contains_key("data.txt"),
+                "precondition: data.txt must be indexed first"
+            );
+        }
+
+        // Second engine on the SAME index dir, now excluding data.txt. A reconcile
+        // must purge the previously-indexed file (this is what should happen when a
+        // new built-in/config exclusion ships and the daemon reconciles).
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.index_tests = true;
+        cfg.exclude = vec!["**/data.txt".to_string()];
+        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        engine.refresh().await.unwrap();
+        let stored = engine.index.file_hashes().await.unwrap();
+        assert!(
+            !stored.contains_key("data.txt"),
+            "newly-excluded file must be purged on reconcile; got {:?}",
+            stored.keys().collect::<Vec<_>>()
+        );
+        assert!(stored.contains_key("keep.rs"), "kept file stays indexed");
+        // And it must no longer surface in search results (the user-visible symptom).
+        let hits = engine.search("noise", Some(10)).await.unwrap();
+        assert!(
+            !hits.iter().any(|e| e.path == "data.txt"),
+            "excluded file must not be returned by search; got {:?}",
+            hits.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn read_file_outline_and_focus() {
         let repo = tempdir().unwrap();
         fs::write(
