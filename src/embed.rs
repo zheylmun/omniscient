@@ -2,6 +2,8 @@
 use crate::config::EmbedderConfig;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 /// Bounds for splitting a list of texts into `embed()` batches. A batch is flushed
 /// before adding an item that would exceed either bound (a single item larger than
@@ -75,9 +77,172 @@ pub fn l2_normalize(v: &mut [f32]) {
 }
 
 pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(
-        LlamaCppEmbedder::connect(cfg.base_url.clone(), cfg.model.clone()).await?,
-    ))
+    // Always prefer an already-running endpoint: connect first, and only fall
+    // through to spawning when that fails AND auto_start is enabled. This means a
+    // user-managed server is used as-is and never spawned over.
+    match LlamaCppEmbedder::connect(cfg.base_url.clone(), cfg.model.clone()).await {
+        Ok(e) => return Ok(Box::new(e)),
+        Err(e) if !cfg.auto_start => return Err(e),
+        Err(e) => {
+            // `connect()` failing doesn't always mean the port is free: a server
+            // could be bound but misconfigured (wrong model, not in embedding
+            // mode, bad response). Spawning then would just collide on the port,
+            // breaking the "never spawn over a running endpoint" invariant — so
+            // only spawn when nothing is actually listening; otherwise surface the
+            // real error.
+            if endpoint_listening(&cfg.base_url).await {
+                return Err(e);
+            }
+            tracing::info!(
+                "embeddings endpoint unreachable ({e}); auto_start is on, launching llama.cpp"
+            );
+        }
+    }
+    let server = ManagedServer::spawn(cfg)?;
+    Ok(Box::new(connect_managed(server, cfg).await?))
+}
+
+/// Whether something is accepting TCP connections at `base_url`'s host:port. Used
+/// to distinguish "nothing is bound here" (safe to spawn) from "a server is up but
+/// answered badly" (must not spawn over it). A malformed URL or DNS failure counts
+/// as not listening.
+async fn endpoint_listening(base_url: &str) -> bool {
+    let Ok((host, port)) = parse_host_port(base_url) else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Parse the `(host, port)` to bind/spawn on from a base URL. Uses the URL's
+/// known default port (80/443) when none is given.
+fn parse_host_port(base_url: &str) -> Result<(String, u16)> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|e| Error::Embed(format!("invalid base_url {base_url}: {e}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::Embed(format!("base_url has no host: {base_url}")))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| Error::Embed(format!("base_url has no port: {base_url}")))?;
+    Ok((host, port))
+}
+
+/// Whether `host` names the local machine — the only place we can launch a
+/// process. Auto-starting a server for a remote `base_url` is nonsensical.
+/// `0.0.0.0` is excluded: it's a wildcard *bind* address, not a client-facing
+/// destination, so it has no business in a `base_url`.
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// The argument vector for `llama serve …`, mirroring the documented manual
+/// command. Factored out so it can be unit-tested without spawning.
+fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
+    vec![
+        "serve".into(),
+        "-hf".into(),
+        cfg.hf_repo.clone(),
+        "--port".into(),
+        port.to_string(),
+        "--embedding".into(),
+        "--pooling".into(),
+        cfg.pooling.clone(),
+    ]
+}
+
+/// A llama.cpp server process owned by omniscient. Killed when dropped
+/// (`kill_on_drop`), so the child never outlives the server that spawned it.
+#[derive(Debug)]
+pub struct ManagedServer {
+    child: tokio::process::Child,
+    bin: String,
+}
+
+impl ManagedServer {
+    fn spawn(cfg: &EmbedderConfig) -> Result<Self> {
+        let (host, port) = parse_host_port(&cfg.base_url)?;
+        if !is_local_host(&host) {
+            return Err(Error::Embed(format!(
+                "[embedder] auto_start can only launch a local server, but base_url host is \
+                 {host:?}; start llama.cpp manually or point base_url at localhost"
+            )));
+        }
+        let mut cmd = tokio::process::Command::new(&cfg.llama_bin);
+        cmd.args(server_args(cfg, port))
+            .stdin(Stdio::null())
+            // Keep OUR stdout clean — it is reserved for the MCP protocol. The
+            // child's stderr is inherited so model download/load progress is
+            // visible to the user.
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Embed(format!(
+                    "[embedder] auto_start is enabled but `{}` was not found. Install \
+                     llama.cpp (https://github.com/ggml-org/llama.cpp) and ensure the `llama` \
+                     CLI is on PATH, or set [embedder] llama_bin to its full path.",
+                    cfg.llama_bin
+                ))
+            } else {
+                Error::Embed(format!("failed to spawn `{}`: {e}", cfg.llama_bin))
+            }
+        })?;
+        Ok(Self {
+            child,
+            bin: cfg.llama_bin.clone(),
+        })
+    }
+}
+
+/// Poll the endpoint until the spawned server answers (or `auto_start_timeout_secs`
+/// elapses), then hand the server's lifetime to the returned embedder. Bails early
+/// if the child exits before becoming ready (bad flags, missing model, …).
+async fn connect_managed(
+    mut server: ManagedServer,
+    cfg: &EmbedderConfig,
+) -> Result<LlamaCppEmbedder> {
+    let deadline = Instant::now() + Duration::from_secs(cfg.auto_start_timeout_secs);
+    let mut waited_secs = 0u64;
+    loop {
+        // If the process already died, looping until timeout would just hide the
+        // real failure — surface it now (details are on the inherited stderr).
+        if let Ok(Some(status)) = server.child.try_wait() {
+            return Err(Error::Embed(format!(
+                "`{}` exited before becoming ready ({status}); check the flags/model above",
+                server.bin
+            )));
+        }
+        match LlamaCppEmbedder::connect(cfg.base_url.clone(), cfg.model.clone()).await {
+            Ok(e) => {
+                tracing::info!("llama.cpp embeddings server is ready");
+                return Ok(e.with_server(server));
+            }
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::Embed(format!(
+                        "llama.cpp server did not become ready within {}s: {e}",
+                        cfg.auto_start_timeout_secs
+                    )));
+                }
+                if waited_secs.is_multiple_of(10) {
+                    tracing::info!(
+                        "waiting for llama.cpp to become ready (the model is downloaded on first run, which can take a while)…"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                waited_secs += 1;
+            }
+        }
+    }
 }
 
 // ---- Deterministic test embedder ----
@@ -121,6 +286,11 @@ pub struct LlamaCppEmbedder {
     model: String,
     dim: usize,
     client: reqwest::Client,
+    /// A llama.cpp server omniscient spawned itself (`auto_start`), kept alive for
+    /// the embedder's lifetime and killed on drop. `None` when connecting to a
+    /// user-managed endpoint. Held purely for its `Drop` side effect.
+    #[allow(dead_code)]
+    server: Option<ManagedServer>,
 }
 
 impl LlamaCppEmbedder {
@@ -130,6 +300,7 @@ impl LlamaCppEmbedder {
             model,
             dim: 0,
             client: reqwest::Client::new(),
+            server: None,
         };
         let probe = e.embed_raw(&["probe".to_string()]).await?;
         e.dim = probe.first().map_or(0, std::vec::Vec::len);
@@ -139,6 +310,12 @@ impl LlamaCppEmbedder {
             ));
         }
         Ok(e)
+    }
+
+    /// Attach a spawned server so its lifetime is tied to this embedder.
+    fn with_server(mut self, server: ManagedServer) -> Self {
+        self.server = Some(server);
+        self
     }
 
     async fn embed_raw(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -226,6 +403,81 @@ mod tests {
         let e = MockEmbedder::new("mock-v1", 16);
         assert_eq!(e.id(), "mock-v1");
         assert_eq!(e.dim(), 16);
+    }
+
+    #[test]
+    fn parses_host_and_port() {
+        assert_eq!(
+            parse_host_port("http://localhost:8080").unwrap(),
+            ("localhost".into(), 8080)
+        );
+        assert_eq!(
+            parse_host_port("http://127.0.0.1:11434").unwrap(),
+            ("127.0.0.1".into(), 11434)
+        );
+        // missing port falls back to the scheme's default
+        assert_eq!(
+            parse_host_port("https://example.com").unwrap(),
+            ("example.com".into(), 443)
+        );
+        assert!(parse_host_port("not a url").is_err());
+    }
+
+    #[test]
+    fn local_host_detection() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("::1"));
+        assert!(!is_local_host("example.com"));
+        assert!(!is_local_host("10.0.0.5"));
+        // 0.0.0.0 is a wildcard bind address, not a client destination.
+        assert!(!is_local_host("0.0.0.0"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_listening_detects_open_and_closed_ports() {
+        // A bound listener: the probe must see it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(endpoint_listening(&format!("http://127.0.0.1:{port}")).await);
+        // Once it's closed, the same port reads as not listening.
+        drop(listener);
+        assert!(!endpoint_listening(&format!("http://127.0.0.1:{port}")).await);
+        // A malformed base_url counts as not listening (so auto_start can proceed).
+        assert!(!endpoint_listening("not a url").await);
+    }
+
+    #[test]
+    fn server_args_mirror_documented_command() {
+        // The defaults already match the documented command.
+        let cfg = EmbedderConfig::default();
+        assert_eq!(
+            server_args(&cfg, 8080),
+            vec![
+                "serve",
+                "-hf",
+                "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M",
+                "--port",
+                "8080",
+                "--embedding",
+                "--pooling",
+                "last",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_start_refuses_remote_host() {
+        // The locality guard runs before any spawn, so this needs no binary.
+        let cfg = EmbedderConfig {
+            base_url: "http://embeddings.example.com:8080".into(),
+            ..Default::default()
+        };
+        let err = ManagedServer::spawn(&cfg).unwrap_err();
+        assert!(
+            matches!(&err, Error::Embed(m) if m.contains("local")),
+            "expected a 'local server only' error, got {err:?}"
+        );
     }
 
     // A spy embedder that records the length of every embed() batch it receives,

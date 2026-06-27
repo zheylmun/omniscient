@@ -4,8 +4,8 @@ A local semantic and distilled code search MCP server for Claude Code and other 
 
 ## Tools
 
-- **`search(query, k?)`** — Semantic search over your codebase. Returns up to `k` distilled code snippets most relevant to `query`. Always refreshes the index before searching, so results are always up to date with your working tree.
-- **`read_file(path, focus?)`** — Return the outline (all chunks) of a file, or, if `focus` is given, the chunks of that file most relevant to `focus`.
+- **`search(query, k?)`** — Semantic search over your codebase by meaning, not literal tokens. Returns ranked, distilled snippets (`file:line` + code body + a relevance note), selected by the *shape* of the relevance scores rather than a fixed count: every hit within `relevance_ratio` of the top hit is returned, so a sharp query yields a few results and a broad one yields more. `k` is an optional ceiling on candidates (it overrides `max_results` for the call), not a target. The index is refreshed before each search (see below). The corpus is implementation source, docs, build scripts, and config — it **excludes** test code and dependency lock files by design (`examples/` is kept); use a grep/text tool for exhaustive "every occurrence" sweeps or known-symbol lookups.
+- **`read_file(path, focus?)`** — A noise-stripped view of one file, read live from disk (so it reflects uncommitted edits). Without `focus`, a structural outline: every definition's signature and line range with bodies elided. With `focus` (a natural-language description), only the chunks of that file most relevant to it.
 
 ## Always-Fresh Guarantee
 
@@ -25,7 +25,7 @@ omniscient does **not** do in-process inference. Embeddings are served by a loca
 To start llama.cpp serving an embedding model (for example Qwen3-Embedding-4B), letting it download the GGUF from Hugging Face:
 
 ```bash
-llama-server \
+llama serve \
   -hf Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M \
   --port 8080 \
   --embedding \
@@ -33,6 +33,22 @@ llama-server \
 ```
 
 > **Pooling:** Qwen3-Embedding is a decoder/LLM-based embedder and uses **last-token** pooling (`--pooling last`), not mean pooling. BERT-family embedders (BGE, jina, nomic) use `--pooling mean`. If you omit `--pooling`, llama.cpp falls back to the model's metadata default. Wrong pooling produces degenerate embeddings, so it's the first thing to check if search quality looks off.
+
+### Let omniscient start the server for you
+
+Don't want to manage a separate process? Set `auto_start = true` under `[embedder]`
+and omniscient will launch llama.cpp itself whenever `base_url` is unreachable —
+running exactly the command above, derived from your config (`hf_repo`, `pooling`,
+and the port from `base_url`). It waits for the server to come up (the first run
+downloads the GGUF, which can take a while) and shuts it down when omniscient
+exits. An endpoint you started yourself is always reused as-is and never spawned
+over.
+
+This is opt-in and off by default. It requires the unified `llama` CLI on your
+`PATH` (set `llama_bin` to an absolute path otherwise); if the binary is missing
+omniscient fails with an install pointer rather than spawning. It only manages a
+**local** server — a remote `base_url` is an error, since omniscient can't start a
+process on another machine.
 
 The `Embedder` trait in `src/embed.rs` is the seam for adding in-process embedding support in a future version.
 
@@ -56,6 +72,15 @@ exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
 [embedder]
 base_url = "http://localhost:8080"
 model = "qwen3-embedding-4b"
+max_batch_chunks = 64     # max chunks per embed request
+max_batch_bytes = 32000   # max total bytes per embed request (~8k tokens)
+
+# Optionally let omniscient launch llama.cpp itself when base_url is unreachable.
+auto_start = false                                  # opt-in; off by default
+llama_bin = "llama"                                 # the unified llama.cpp CLI (PATH or absolute path)
+hf_repo = "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M"     # passed to `llama serve -hf`
+pooling = "last"                                    # last for Qwen3-Embedding, mean for BERT-family
+auto_start_timeout_secs = 600                       # max wait for readiness (first run downloads the model)
 
 [search]
 # Results track the shape of the relevance scores: every hit within
