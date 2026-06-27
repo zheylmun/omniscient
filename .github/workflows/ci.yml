@@ -34,6 +34,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Pedantic lints are configured in Cargo.toml ([lints.clippy]); RUSTFLAGS
       # promotes every warning to a hard error.
       - run: cargo clippy --all-targets --all-features
@@ -45,6 +48,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # The suite is fully offline (MockEmbedder); the one network test is #[ignore]d.
       # No --all-targets: that would skip doctests, which we want to run.
       - run: cargo test --all-features
@@ -56,6 +62,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Exercises the thin-LTO / codegen-units=1 release profile so packaging
       # issues surface in CI, not at release time.
       - run: cargo build --release
