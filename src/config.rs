@@ -11,6 +11,25 @@ pub struct EmbedderConfig {
     pub model: String,
     pub max_batch_chunks: usize,
     pub max_batch_bytes: usize,
+    /// When true and `base_url` is unreachable at startup, omniscient launches a
+    /// local llama.cpp server (`llama serve …`) itself and waits for it to come
+    /// up, instead of erroring. Off by default — an already-running endpoint is
+    /// always used as-is and never spawned over.
+    pub auto_start: bool,
+    /// The llama.cpp CLI binary to spawn for `auto_start` (the unified `llama`
+    /// command; omniscient always passes the `serve` subcommand). Resolved on
+    /// PATH unless an absolute path is given.
+    pub llama_bin: String,
+    /// The `-hf` argument passed to `llama serve`: a Hugging Face GGUF repo with
+    /// an optional `:QUANT` tag. The GGUF is downloaded on first run.
+    pub hf_repo: String,
+    /// The `--pooling` strategy for the spawned server. Qwen3-Embedding (a
+    /// decoder LLM) needs `last`; BERT-family embedders need `mean`.
+    pub pooling: String,
+    /// How long to wait (seconds) for an `auto_start`ed server to become ready
+    /// before giving up. Generous by default because the first run downloads the
+    /// model.
+    pub auto_start_timeout_secs: u64,
 }
 impl Default for EmbedderConfig {
     fn default() -> Self {
@@ -19,6 +38,11 @@ impl Default for EmbedderConfig {
             model: "qwen3-embedding-4b".into(),
             max_batch_chunks: 64,
             max_batch_bytes: 32000,
+            auto_start: false,
+            llama_bin: "llama".into(),
+            hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
+            pooling: "last".into(),
+            auto_start_timeout_secs: 600,
         }
     }
 }
@@ -242,6 +266,33 @@ mod tests {
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert_eq!(c.embedder.max_batch_chunks, 16);
         assert_eq!(c.embedder.max_batch_bytes, 8000);
+        // unspecified embedder fields keep their defaults
+        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+    }
+
+    #[test]
+    fn auto_start_defaults_and_parse() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert!(!c.embedder.auto_start, "auto_start defaults to off");
+        assert_eq!(c.embedder.llama_bin, "llama");
+        assert_eq!(c.embedder.hf_repo, "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M");
+        assert_eq!(c.embedder.pooling, "last");
+        assert_eq!(c.embedder.auto_start_timeout_secs, 600);
+
+        let toml = r#"
+            [embedder]
+            auto_start = true
+            llama_bin = "/opt/llama/llama"
+            hf_repo = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"
+            pooling = "mean"
+            auto_start_timeout_secs = 120
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert!(c.embedder.auto_start);
+        assert_eq!(c.embedder.llama_bin, "/opt/llama/llama");
+        assert_eq!(c.embedder.hf_repo, "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0");
+        assert_eq!(c.embedder.pooling, "mean");
+        assert_eq!(c.embedder.auto_start_timeout_secs, 120);
         // unspecified embedder fields keep their defaults
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
     }

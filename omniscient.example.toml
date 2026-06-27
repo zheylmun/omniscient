@@ -24,6 +24,17 @@ model = "qwen3-embedding-4b"
 max_batch_chunks = 64       # max chunks per embed request
 max_batch_bytes = 32000     # max total bytes per embed request (~8k tokens)
 
+# Auto-start: when true and base_url is unreachable, omniscient launches llama.cpp
+# itself (`llama serve -hf <hf_repo> --port <port> --embedding --pooling <pooling>`)
+# and kills it on exit. Off by default; an already-running endpoint is reused as-is.
+# Only manages a LOCAL server (a remote base_url is an error). Requires the unified
+# `llama` CLI on PATH (or set llama_bin to its absolute path).
+auto_start = false
+llama_bin = "llama"                                 # llama.cpp CLI binary
+hf_repo = "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M"     # GGUF repo[:quant], downloaded on first run
+pooling = "last"                                    # last = Qwen3-Embedding; mean = BERT-family
+auto_start_timeout_secs = 600                       # max seconds to wait for readiness
+
 [search]
 # Results are selected by the *shape* of the relevance scores, not a fixed count:
 # every hit scoring at least relevance_ratio of the top hit is returned (so a sharp
