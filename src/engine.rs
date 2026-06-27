@@ -84,7 +84,7 @@ impl Engine {
 
         for path in &delta.changed {
             let abs = self.config.repo_root.join(path);
-            let source = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(_) => continue };
+            let Ok(source) = std::fs::read_to_string(&abs) else { continue };
             let chunks = chunk_file(Path::new(path), &source, MAX_WINDOW_LINES)?;
             if chunks.is_empty() { continue; }
             let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
@@ -220,11 +220,11 @@ mod tests {
         Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64))).await.unwrap()
     }
 
-    /// Misbehaving embedder that returns no vectors — exercises the embed_one guard.
+    /// Misbehaving embedder that returns no vectors — exercises the `embed_one` guard.
     struct ZeroEmbedder;
     #[async_trait]
     impl Embedder for ZeroEmbedder {
-        fn id(&self) -> &str { "zero" }
+        fn id(&self) -> &'static str { "zero" }
         fn dim(&self) -> usize { 64 }
         async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> { Ok(vec![]) }
     }
@@ -368,7 +368,7 @@ mod tests {
         assert!(Arc::ptr_eq(&got, &engine), "from_engine yields the pre-built engine");
     }
 
-    /// Records every embed() batch length, delegating vectors to a MockEmbedder, so we
+    /// Records every `embed()` batch length, delegating vectors to a `MockEmbedder`, so we
     /// can assert the engine honored the batch cap on a real reconcile.
     struct CountingEmbedder {
         inner: MockEmbedder,
@@ -391,6 +391,15 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_respects_batch_cap() {
+        // Engine takes Box<dyn Embedder>; wrap the Arc so we keep a handle to the spy.
+        struct Shared(std::sync::Arc<CountingEmbedder>);
+        #[async_trait]
+        impl Embedder for Shared {
+            fn id(&self) -> &str { self.0.id() }
+            fn dim(&self) -> usize { self.0.dim() }
+            async fn embed(&self, t: &[String]) -> Result<Vec<Vec<f32>>> { self.0.embed(t).await }
+        }
+
         let repo = tempdir().unwrap();
         // One file with 5 top-level fns -> 5 chunks.
         fs::write(repo.path().join("many.rs"),
@@ -401,14 +410,6 @@ mod tests {
         cfg.embedder.max_batch_bytes = 1_000_000;
 
         let embedder = std::sync::Arc::new(CountingEmbedder::new(64));
-        // Engine takes Box<dyn Embedder>; wrap the Arc so we keep a handle to the spy.
-        struct Shared(std::sync::Arc<CountingEmbedder>);
-        #[async_trait]
-        impl Embedder for Shared {
-            fn id(&self) -> &str { self.0.id() }
-            fn dim(&self) -> usize { self.0.dim() }
-            async fn embed(&self, t: &[String]) -> Result<Vec<Vec<f32>>> { self.0.embed(t).await }
-        }
         let engine = Engine::new_with_embedder(cfg, Box::new(Shared(embedder.clone()))).await.unwrap();
         engine.refresh().await.unwrap();
 

@@ -3,7 +3,7 @@ use crate::config::EmbedderConfig;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 
-/// Bounds for splitting a list of texts into embed() batches. A batch is flushed
+/// Bounds for splitting a list of texts into `embed()` batches. A batch is flushed
 /// before adding an item that would exceed either bound (a single item larger than
 /// `max_bytes` is sent alone — we never split an item).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,9 @@ impl Embedder for MockEmbedder {
         Ok(texts.iter().map(|t| {
             let mut v = vec![0f32; self.dim];
             for (i, b) in t.bytes().enumerate() {
-                v[i % self.dim] += (b as f32 + 1.0) * ((i % 7 + 1) as f32);
+                // weight is in 1..=7, so the u8 conversion never truncates
+                let weight = f32::from(u8::try_from(i % 7 + 1).unwrap());
+                v[i % self.dim] += (f32::from(b) + 1.0) * weight;
             }
             l2_normalize(&mut v);
             v
@@ -103,7 +105,7 @@ impl LlamaCppEmbedder {
     pub async fn connect(base_url: String, model: String) -> Result<Self> {
         let mut e = Self { base_url, model, dim: 0, client: reqwest::Client::new() };
         let probe = e.embed_raw(&["probe".to_string()]).await?;
-        e.dim = probe.first().map(|r| r.len()).unwrap_or(0);
+        e.dim = probe.first().map_or(0, std::vec::Vec::len);
         if e.dim == 0 {
             return Err(Error::Embed("embeddings endpoint returned an empty vector (dim 0)".into()));
         }
@@ -190,7 +192,7 @@ mod tests {
         }
     }
 
-    fn texts(parts: &[&str]) -> Vec<String> { parts.iter().map(|s| s.to_string()).collect() }
+    fn texts(parts: &[&str]) -> Vec<String> { parts.iter().map(std::string::ToString::to_string).collect() }
 
     #[tokio::test]
     async fn batched_packs_by_count() {

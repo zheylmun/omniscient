@@ -23,7 +23,7 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some("rust"),
         Some("py") => Some("python"),
-        Some("ts") | Some("tsx") => Some("typescript"),
+        Some("ts" | "tsx") => Some("typescript"),
         _ => None,
     }
 }
@@ -89,10 +89,8 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
     let language = ts_language(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).map_err(|e| Error::Chunk(e.to_string()))?;
-    let tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return Ok(vec![]), // non-fatal: caller falls through to line_windows
-    };
+    // non-fatal: caller falls through to line_windows
+    let Some(tree) = parser.parse(source, None) else { return Ok(vec![]) };
     let kinds = def_kinds(lang);
     let bytes = source.as_bytes();
 
@@ -142,7 +140,7 @@ fn walk_children(
             let symbol = child
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(bytes).ok())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
             chunks.push(Chunk {
                 text,
                 start_line: child.start_position().row + 1,
@@ -164,12 +162,11 @@ fn walk_children(
 /// `cfg(any(test, …))` — but not when `test` is negated (`cfg(not(test))`).
 fn is_test_attribute(attr_item: tree_sitter::Node, bytes: &[u8]) -> bool {
     let mut cursor = attr_item.walk();
-    let attribute = match attr_item.children(&mut cursor).find(|n| n.kind() == "attribute") {
-        Some(a) => a,
-        None => return false,
+    let Some(attribute) = attr_item.children(&mut cursor).find(|n| n.kind() == "attribute") else {
+        return false;
     };
     match attribute_name_last_segment(attribute, bytes).as_deref() {
-        Some("test") | Some("bench") => true,
+        Some("test" | "bench") => true,
         Some("cfg") => attribute_has_cfg_test(attribute, bytes),
         _ => false,
     }
@@ -183,11 +180,11 @@ fn attribute_name_last_segment(attribute: tree_sitter::Node, bytes: &[u8]) -> Op
         .children(&mut cursor)
         .find(|n| matches!(n.kind(), "identifier" | "scoped_identifier"))?;
     match name.kind() {
-        "identifier" => name.utf8_text(bytes).ok().map(|s| s.to_string()),
+        "identifier" => name.utf8_text(bytes).ok().map(std::string::ToString::to_string),
         "scoped_identifier" => name
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(bytes).ok())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         _ => None,
     }
 }
@@ -268,7 +265,7 @@ mod tests {
         let c = chunk_file(Path::new("tests/fixtures/sample.md"), &md, 2).unwrap();
         assert!(!c.is_empty());
         assert!(c.iter().all(|c| c.language == "text" && c.symbol.is_none()));
-        assert!(c.iter().all(|c| c.end_line - c.start_line + 1 <= 2));
+        assert!(c.iter().all(|c| c.end_line - c.start_line < 2));
     }
 
     #[test]
@@ -367,7 +364,7 @@ pub fn always() -> i32 { 2 }
     fn cfg_not_test_is_kept() {
         // `#[cfg(not(test))]` is production-only code (compiled when NOT testing):
         // a `test` nested under `not(...)` must NOT be treated as a test gate.
-        let src = r#"
+        let src = r"
 #[cfg(not(test))]
 pub fn only_in_prod() -> i32 { 1 }
 
@@ -375,7 +372,7 @@ pub fn only_in_prod() -> i32 { 1 }
 pub fn unix_prod() -> i32 { 2 }
 
 pub fn always() -> i32 { 3 }
-"#;
+";
         let chunks = chunk_source(Some("rust"), src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&"only_in_prod"), "only_in_prod wrongly skipped: {symbols:?}");
@@ -386,12 +383,12 @@ pub fn always() -> i32 { 3 }
     #[test]
     fn tokio_test_attribute_is_skipped() {
         // `#[tokio::test]` (scoped path ending in `test`) is also a test marker.
-        let src = r#"
+        let src = r"
 pub fn keep_me() -> i32 { 1 }
 
 #[tokio::test]
 async fn async_test() {}
-"#;
+";
         let chunks = chunk_source(Some("rust"), src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&"keep_me"), "keep_me missing: {symbols:?}");
