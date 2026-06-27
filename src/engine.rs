@@ -58,18 +58,20 @@ impl Engine {
 
     /// Single-flight reconcile. Clears `dirty` BEFORE scanning so an event arriving
     /// mid-scan re-sets it (costing at most one redundant reconcile, never a lost update).
+    /// If `reconcile_inner` fails, `dirty` is restored — otherwise a failed reconcile
+    /// would leave the state clean+active and let `search` skip the scan and serve stale.
     pub async fn reconcile(&self) -> Result<()> {
         let _guard = self.refresh.lock.lock().await;
         if self.refresh.can_skip_scan() { return Ok(()); } // another reconcile beat us
         self.refresh.clear_dirty();
-        self.reconcile_inner().await
+        self.reconcile_inner().await.inspect_err(|_| self.refresh.mark_dirty())
     }
 
     /// Force a full reconcile regardless of flags (used by `reindex` and tests).
     pub async fn refresh(&self) -> Result<()> {
         let _guard = self.refresh.lock.lock().await;
         self.refresh.clear_dirty();
-        self.reconcile_inner().await
+        self.reconcile_inner().await.inspect_err(|_| self.refresh.mark_dirty())
     }
 
     async fn reconcile_inner(&self) -> Result<()> {
@@ -309,6 +311,27 @@ mod tests {
         let entries = engine.search("beta", Some(5)).await.unwrap();
         assert!(!entries.iter().any(|e| e.path == "b.rs"),
             "active+clean must skip the scan; got {:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn failed_reconcile_keeps_state_dirty_for_retry() {
+        // A watcher marks dirty then triggers a reconcile that fails to embed.
+        // The failure must NOT leave the state clean+active, or the next search
+        // takes the skip-scan path and serves stale results forever.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, Box::new(ZeroEmbedder)).await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().mark_dirty(); // watcher would do this before reconciling
+
+        let err = engine.reconcile().await.unwrap_err();
+        assert!(matches!(err, Error::Embed(_)), "expected embed failure, got {err:?}");
+
+        assert!(engine.refresh_state().is_dirty(),
+            "a failed reconcile must re-mark dirty");
+        assert!(!engine.refresh_state().can_skip_scan(),
+            "a failed reconcile must keep search on the scanning path");
     }
 
     #[tokio::test]
