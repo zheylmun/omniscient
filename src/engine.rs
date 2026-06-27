@@ -4,12 +4,12 @@ use crate::config::Config;
 use crate::distill::{distill_context, ContextEntry};
 use crate::embed::{build_embedder, Embedder};
 use crate::error::{Error, Result};
-use tokio::sync::OnceCell;
 use crate::freshness::{diff, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use crate::refresh::RefreshState;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 const MAX_WINDOW_LINES: usize = 80;
 
@@ -51,6 +51,7 @@ impl Engine {
     /// Skip the scan entirely when a healthy watcher guarantees freshness;
     /// otherwise reconcile. This is the only search-path change vs. always-scan.
     pub async fn ensure_fresh(&self) -> Result<()> {
+        // pre-lock fast path; re-checked under the lock in reconcile()
         if self.refresh.can_skip_scan() { return Ok(()); }
         self.reconcile().await
     }

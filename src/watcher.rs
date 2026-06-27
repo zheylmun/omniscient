@@ -50,33 +50,44 @@ pub fn spawn(
         .map_err(|e| Error::Other(anyhow::anyhow!("watcher watch: {e}")))?;
 
     let task = tokio::spawn(async move {
-        // Startup warm-up: best-effort reconcile; mark active on success.
-        reconcile_once(&lazy, &state).await;
+        // Startup warm-up: a successful reconcile means the watch is live.
+        if reconcile_once(&lazy).await {
+            state.set_watch_active(true);
+        }
         while let Some(tick) = rx.recv().await {
             match tick {
+                Tick::Events => {
+                    state.mark_dirty();
+                    // A real event proves the watch is live; enable skip-scan on success.
+                    if reconcile_once(&lazy).await {
+                        state.set_watch_active(true);
+                    }
+                }
                 Tick::Error => {
-                    // Safe fallback: searches resume scanning until we re-establish health.
+                    // OS watch may be dead — stay in fallback (search keeps scanning)
+                    // until a real Tick::Events proves liveness. Reconcile best-effort
+                    // but do NOT re-enable watch_active.
                     state.set_watch_active(false);
                     state.mark_dirty();
+                    let _ = reconcile_once(&lazy).await;
                 }
-                Tick::Events => state.mark_dirty(),
             }
-            reconcile_once(&lazy, &state).await;
         }
     });
 
     Ok(WatchGuard { _debouncer: Box::new(debouncer), task })
 }
 
-/// Best-effort reconcile through the lazy engine. On embedder-down init failure, log
-/// and leave the index dirty so the next search or tick retries.
-async fn reconcile_once(lazy: &LazyEngine, state: &Arc<RefreshState>) {
+/// Best-effort reconcile through the lazy engine. Returns true iff the reconcile
+/// succeeded. Does NOT touch watch_active — the caller decides, because a successful
+/// reconcile does not prove the OS watch is still live.
+async fn reconcile_once(lazy: &LazyEngine) -> bool {
     match lazy.get().await {
         Ok(engine) => match engine.reconcile().await {
-            Ok(()) => state.set_watch_active(true),
-            Err(e) => tracing::warn!("watcher reconcile failed: {e}"),
+            Ok(()) => true,
+            Err(e) => { tracing::warn!("watcher reconcile failed: {e}"); false }
         },
-        Err(e) => tracing::warn!("watcher: engine init deferred: {e}"),
+        Err(e) => { tracing::warn!("watcher: engine init deferred: {e}"); false }
     }
 }
 
