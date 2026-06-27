@@ -181,7 +181,9 @@ impl Engine {
 
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
         self.ensure_fresh().await?;
-        let k = k.unwrap_or(self.config.search.default_k);
+        // `k` is the candidate ceiling, not a target: relevance-shape selection in
+        // `distill_context` trims this pool down to results of similar relevance.
+        let k = k.unwrap_or(self.config.search.max_results).max(1);
         let qv = self.embed_one(query).await?;
         let hits = self.index.search(&qv, k).await?;
         // Enforce the exclude policy at read time too: even if the index hasn't
@@ -195,6 +197,7 @@ impl Engine {
             hits,
             self.config.strip_comments,
             self.config.search.token_budget,
+            self.config.search.relevance_ratio,
         ))
     }
 

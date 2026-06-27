@@ -25,7 +25,12 @@ max_batch_chunks = 64       # max chunks per embed request
 max_batch_bytes = 32000     # max total bytes per embed request (~8k tokens)
 
 [search]
-default_k = 8
+# Results are selected by the *shape* of the relevance scores, not a fixed count:
+# every hit scoring at least relevance_ratio of the top hit is returned (so a sharp
+# query yields few results, a broad one yields many). max_results is a safety ceiling
+# and token_budget a hard cap; the single best match is always returned.
+relevance_ratio = 0.75   # keep hits within 75% of the top hit's score
+max_results = 25         # ceiling on candidates fetched + results returned
 token_budget = 4000
 
 [watch]

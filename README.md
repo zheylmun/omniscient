@@ -58,7 +58,10 @@ base_url = "http://localhost:8080"
 model = "qwen3-embedding-4b"
 
 [search]
-default_k = 8
+# Results track the shape of the relevance scores: every hit within
+# relevance_ratio of the top hit is returned (max_results / token_budget cap it).
+relevance_ratio = 0.75
+max_results = 25
 token_budget = 4000
 
 [watch]

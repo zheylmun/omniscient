@@ -55,10 +55,16 @@ struct Merged {
     symbol: Option<String>,
 }
 
+/// Merge per-file hits into entries, then select by *shape*: keep every entry
+/// scoring at least `relevance_ratio` of the top entry's score, so a sharp query
+/// (one clear match) returns few results and a broad one returns many — rather
+/// than a fixed k that is too coarse for both. The token budget is a hard ceiling
+/// on top of that, and the single best match is always returned.
 pub fn distill_context(
     hits: Vec<Hit>,
     strip_comments: bool,
     token_budget: usize,
+    relevance_ratio: f32,
 ) -> Vec<ContextEntry> {
     let mut by_file: HashMap<String, Vec<Hit>> = HashMap::new();
     for h in hits {
@@ -110,9 +116,18 @@ pub fn distill_context(
             .then_with(|| a.start_line.cmp(&b.start_line))
     });
 
+    // Entries are sorted by score desc, so the relevance floor is a cut point:
+    // once one entry falls below it, every later one does too. A non-positive top
+    // score means even the best match is weak — the floor would reject everything,
+    // so the always-keep-the-first rule (out.is_empty()) carries it instead.
+    let floor = entries.first().map_or(0.0, |e| e.score) * relevance_ratio.clamp(0.0, 1.0);
+
     let mut out = Vec::new();
     let mut used = 0usize;
     for e in entries {
+        if !out.is_empty() && e.score < floor {
+            break;
+        }
         let cost = approx_tokens(&e.code);
         if out.is_empty() || used + cost <= token_budget {
             used += cost;
@@ -165,6 +180,7 @@ mod tests {
             ],
             false,
             100_000,
+            0.0,
         );
         let a: Vec<_> = out.iter().filter(|e| e.path == "a.rs").collect();
         assert_eq!(a.len(), 1);
@@ -184,6 +200,7 @@ mod tests {
             )],
             true,
             100_000,
+            0.0,
         );
         assert!(!out[0].code.contains("Copyright"));
         assert!(out[0].code.contains("pub fn a"));
@@ -196,6 +213,7 @@ mod tests {
             vec![hit("a.rs", 1, 1, 0.9, &big), hit("b.rs", 1, 1, 0.8, &big)],
             false,
             100,
+            0.0,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "a.rs");
@@ -203,7 +221,12 @@ mod tests {
 
     #[test]
     fn why_matched_reports_score() {
-        let out = distill_context(vec![hit("a.rs", 1, 1, 0.876, "fn a(){}")], false, 100_000);
+        let out = distill_context(
+            vec![hit("a.rs", 1, 1, 0.876, "fn a(){}")],
+            false,
+            100_000,
+            0.0,
+        );
         assert!(out[0].why_matched.contains("0.87") || out[0].why_matched.contains("0.876"));
         assert!((out[0].score - 0.876).abs() < 1e-6);
     }
@@ -222,6 +245,7 @@ mod tests {
                 ],
                 false,
                 100_000,
+                0.0,
             )
             .into_iter()
             .map(|e| e.path)
@@ -229,5 +253,62 @@ mod tests {
         };
         assert_eq!(order(), vec!["a.rs", "m.rs", "z.rs"]);
         assert_eq!(order(), order()); // stable run-to-run
+    }
+
+    #[test]
+    fn relevance_ratio_keeps_similar_drops_falloff() {
+        // Distinct files so nothing merges; only the shape filter decides inclusion.
+        // ratio 0.75, top 1.0 -> floor 0.75: keep 1.0/0.9/0.8, drop 0.5.
+        let out = distill_context(
+            vec![
+                hit("a.rs", 1, 1, 1.0, "fn a(){}"),
+                hit("b.rs", 1, 1, 0.9, "fn b(){}"),
+                hit("c.rs", 1, 1, 0.8, "fn c(){}"),
+                hit("d.rs", 1, 1, 0.5, "fn d(){}"),
+            ],
+            false,
+            100_000,
+            0.75,
+        );
+        let paths: Vec<_> = out.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a.rs", "b.rs", "c.rs"],
+            "0.5 is below the floor"
+        );
+    }
+
+    #[test]
+    fn relevance_ratio_one_match_returns_just_the_best() {
+        // A sharp query: one strong hit, the rest far below. floor 0.75*0.9=0.675.
+        let out = distill_context(
+            vec![
+                hit("a.rs", 1, 1, 0.9, "fn a(){}"),
+                hit("b.rs", 1, 1, 0.3, "fn b(){}"),
+                hit("c.rs", 1, 1, 0.2, "fn c(){}"),
+            ],
+            false,
+            100_000,
+            0.75,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "a.rs");
+    }
+
+    #[test]
+    fn relevance_ratio_always_keeps_best_even_when_weak() {
+        // Non-positive top score: the floor can't admit anything, but the best
+        // match is still returned rather than an empty result.
+        let out = distill_context(
+            vec![
+                hit("a.rs", 1, 1, -0.1, "fn a(){}"),
+                hit("b.rs", 1, 1, -0.4, "fn b(){}"),
+            ],
+            false,
+            100_000,
+            0.75,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "a.rs");
     }
 }
