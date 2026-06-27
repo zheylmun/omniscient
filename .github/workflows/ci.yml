@@ -6,7 +6,7 @@ name: CI
 # live in different concurrency groups, so they can't cancel each other).
 on:
   push:
-    branches: [feat/polish]
+    branches: [main]
     tags: ["v*"]
   pull_request:
 
