@@ -70,8 +70,9 @@ Changing the `model` field triggers an automatic full reindex on the next run �
 
 ## Install
 
-Install (or update to) the latest build into `~/.cargo/bin` — which is on your
-`PATH` — with the bundled script:
+Install (or update to) the latest build into Cargo's bin directory
+(`$CARGO_HOME/bin`, default `~/.cargo/bin`, which should be on your `PATH`) with
+the bundled script:
 
 ```bash
 ./install.sh
@@ -116,8 +117,8 @@ Either form maps to this entry in `.claude/settings.json` / `~/.claude/settings.
 }
 ```
 
-(Use an absolute `command` path if `~/.cargo/bin` isn't on the PATH seen by your
-MCP client.)
+(Use an absolute `command` path if Cargo's bin directory — often `$CARGO_HOME/bin`,
+default `~/.cargo/bin` — isn't on the PATH seen by your MCP client.)
 
 ## Debugging
 

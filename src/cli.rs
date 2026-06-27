@@ -20,12 +20,21 @@ enum Cmd { Serve, Status, Reindex }
 
 /// First ancestor of `start` (inclusive) that contains a `.git` entry. `.git` is
 /// a directory in a normal clone but a file in worktrees/submodules, so we only
-/// test for existence.
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .find(|a| a.join(".git").exists())
-        .map(Path::to_path_buf)
+/// test for existence. A genuine IO error while probing (e.g. permission denied)
+/// is surfaced rather than silently treated as "no repo here", which would
+/// produce a misleading "no git repository" message.
+fn find_git_root(start: &Path) -> anyhow::Result<Option<PathBuf>> {
+    for ancestor in start.ancestors() {
+        let dot_git = ancestor.join(".git");
+        match dot_git.try_exists() {
+            Ok(true) => return Ok(Some(ancestor.to_path_buf())),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to check {}: {e}", dot_git.display()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Normalize to an absolute path so the index dir and scan are stable regardless
@@ -41,8 +50,10 @@ fn canonicalize_repo(repo: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 fn resolve_repo(cli: &Cli) -> anyhow::Result<PathBuf> {
-    // An explicit --repo is taken verbatim: the caller has named the tree, so we
-    // don't second-guess it (and tests / non-git dirs stay usable).
+    // An explicit --repo is honored as given (only normalized to an absolute path
+    // by canonicalize_repo): the caller has named the tree, so we don't
+    // second-guess which repo they mean — no git-root walk, and tests / non-git
+    // dirs stay usable.
     if let Some(repo) = cli.repo.clone() {
         return canonicalize_repo(repo);
     }
@@ -52,7 +63,7 @@ fn resolve_repo(cli: &Cli) -> anyhow::Result<PathBuf> {
     // there's no enclosing repo rather than silently indexing (and writing
     // .omniscient/ into) a stray directory like $HOME.
     let cwd = canonicalize_repo(std::env::current_dir()?)?;
-    find_git_root(&cwd).ok_or_else(|| {
+    find_git_root(&cwd)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no git repository found at or above the current directory ({}); \
              run omniscient from inside a repository, or pass --repo <path>",
@@ -114,8 +125,20 @@ mod tests {
         fs::create_dir(root.join(".git")).unwrap();
         let nested = root.join("crates/core/src");
         fs::create_dir_all(&nested).unwrap();
-        assert_eq!(find_git_root(&nested).as_deref(), Some(root));
-        assert_eq!(find_git_root(root).as_deref(), Some(root));
+        assert_eq!(find_git_root(&nested).unwrap().as_deref(), Some(root));
+        assert_eq!(find_git_root(root).unwrap().as_deref(), Some(root));
+    }
+
+    #[test]
+    fn finds_root_when_dot_git_is_a_file() {
+        // Worktrees and submodules store `.git` as a file (a gitdir pointer)
+        // rather than a directory; existence-only probing must handle both.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_git_root(&nested).unwrap().as_deref(), Some(root));
     }
 
     #[test]
@@ -123,6 +146,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let nested = tmp.path().join("a/b");
         fs::create_dir_all(&nested).unwrap();
-        assert_eq!(find_git_root(&nested), None);
+        assert_eq!(find_git_root(&nested).unwrap(), None);
     }
 }
