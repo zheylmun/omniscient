@@ -16,7 +16,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Cmd { Serve, Status, Reindex }
+enum Cmd {
+    Serve,
+    Status,
+    Reindex,
+}
 
 /// First ancestor of `start` (inclusive) that contains a `.git` entry. `.git` is
 /// a directory in a normal clone but a file in worktrees/submodules, so we only
@@ -45,7 +49,10 @@ fn canonicalize_repo(repo: PathBuf) -> anyhow::Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => Ok(canonical),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(repo),
-        Err(e) => Err(anyhow::anyhow!("failed to canonicalize repo path {}: {e}", repo.display())),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to canonicalize repo path {}: {e}",
+            repo.display()
+        )),
     }
 }
 
@@ -82,11 +89,15 @@ pub fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd {
         Cmd::Serve => {
-            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
             rt.block_on(crate::mcp::serve(load(&cli)?))?;
         }
         Cmd::Status => {
-            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
             rt.block_on(async {
                 let engine = Engine::new(load(&cli)?).await?;
                 engine.refresh().await?;
@@ -98,7 +109,9 @@ pub fn run() -> anyhow::Result<()> {
             })?;
         }
         Cmd::Reindex => {
-            tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
             let cfg = load(&cli)?;
             let _ = std::fs::remove_dir_all(cfg.repo_root.join(".omniscient"));
             rt.block_on(async {
