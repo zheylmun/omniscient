@@ -28,6 +28,12 @@ pub struct Config {
     pub search: SearchConfig,
     pub languages: Vec<String>,
     pub strip_comments: bool,
+    /// Extra glob patterns to skip when indexing, unioned with the built-in
+    /// test/fixture excludes (see `freshness`). Matched against repo-relative paths.
+    pub exclude: Vec<String>,
+    /// When true, the built-in test/fixture excludes are not applied (so test
+    /// files are indexed). The `exclude` list still applies. Defaults to false.
+    pub index_tests: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -37,6 +43,8 @@ impl Default for Config {
             search: SearchConfig::default(),
             languages: vec!["rust".into(), "python".into(), "typescript".into()],
             strip_comments: true,
+            exclude: Vec::new(),
+            index_tests: false,
         }
     }
 }
@@ -89,6 +97,21 @@ mod tests {
         assert_eq!(c.embedder.base_url, "http://localhost:8080"); // defaulted
         assert_eq!(c.search.default_k, 5);
         assert_eq!(c.languages, vec!["rust".to_string()]);
+    }
+
+    #[test]
+    fn exclude_and_index_tests_default_and_parse() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert!(c.exclude.is_empty(), "exclude defaults to empty");
+        assert!(!c.index_tests, "index_tests defaults to false");
+
+        let toml = r#"
+            index_tests = true
+            exclude = ["vendor/**", "**/*.gen.rs"]
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert!(c.index_tests);
+        assert_eq!(c.exclude, vec!["vendor/**".to_string(), "**/*.gen.rs".to_string()]);
     }
 
     #[test]

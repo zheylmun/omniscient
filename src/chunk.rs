@@ -2,6 +2,14 @@
 use crate::error::{Error, Result};
 use std::path::Path;
 
+/// Version of the chunking logic. Bump this whenever a change to how files are
+/// split into chunks would alter the stored chunks for unchanged source (e.g.
+/// new language support, different definition kinds, the test-skipping rules).
+/// The index records it in `meta.json`; a mismatch forces a full reindex, the
+/// same way a changed embedder id does — otherwise already-indexed files keep
+/// their pre-change chunks until their content hash happens to change.
+pub const CHUNKER_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub text: String,

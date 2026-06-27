@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::distill::{distill_context, ContextEntry};
 use crate::embed::{build_embedder, Embedder};
 use crate::error::{Error, Result};
-use crate::freshness::{diff, scan};
+use crate::freshness::{diff, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use std::path::Path;
 
@@ -24,7 +24,7 @@ impl Engine {
 
     pub async fn new_with_embedder(config: Config, embedder: Box<dyn Embedder>) -> Result<Engine> {
         let dir = config.repo_root.join(".omniscient");
-        let index = Index::open(&dir, embedder.id(), embedder.dim().max(1)).await?;
+        let index = Index::open(&dir, embedder.id(), embedder.dim().max(1), crate::chunk::CHUNKER_VERSION).await?;
         Ok(Engine { config, embedder, index })
     }
 
@@ -35,7 +35,8 @@ impl Engine {
     }
 
     pub async fn refresh(&self) -> Result<()> {
-        let current = scan(&self.config.repo_root)?;
+        let excludes = resolve_excludes(&self.config.exclude, self.config.index_tests);
+        let current = scan(&self.config.repo_root, &excludes)?;
         let stored = self.index.file_hashes().await?;
         let delta = diff(&current, &stored);
         let hash_of: std::collections::HashMap<&str, &str> =
@@ -166,6 +167,23 @@ mod tests {
         let engine = engine_for(repo.path().to_path_buf()).await;
         let entries = engine.search("renew_credentials", Some(3)).await.unwrap();
         assert!(entries.iter().any(|e| e.path == "auth.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_files_are_not_indexed_by_default() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("auth.rs"),
+            "pub fn renew_credentials() -> Token {\n    refresh_token()\n}\n").unwrap();
+        fs::create_dir(repo.path().join("tests")).unwrap();
+        // Same content under tests/: must be excluded, so it never competes in results.
+        fs::write(repo.path().join("tests").join("auth_test.rs"),
+            "pub fn renew_credentials() -> Token {\n    refresh_token()\n}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        let entries = engine.search("renew_credentials", Some(5)).await.unwrap();
+        assert!(entries.iter().any(|e| e.path == "auth.rs"));
+        assert!(!entries.iter().any(|e| e.path.starts_with("tests/")),
+            "tests/ files must be excluded from the index; got {:?}",
+            entries.iter().map(|e| &e.path).collect::<Vec<_>>());
     }
 
     #[tokio::test]

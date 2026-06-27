@@ -29,7 +29,14 @@ pub struct StoredChunk {
 pub struct Hit { pub chunk: StoredChunk, pub score: f32 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Meta { embedder_id: String, dim: usize }
+struct Meta {
+    embedder_id: String,
+    dim: usize,
+    // Defaults to 0 for indexes written before chunker versioning existed, so
+    // they mismatch the current CHUNKER_VERSION (>= 1) and rebuild once.
+    #[serde(default)]
+    chunker_version: u32,
+}
 
 pub struct Index {
     dim: usize,
@@ -53,16 +60,22 @@ fn schema_for(dim: usize) -> Arc<Schema> {
 }
 
 impl Index {
-    pub async fn open(dir: &Path, embedder_id: &str, dim: usize) -> Result<Index> {
+    pub async fn open(dir: &Path, embedder_id: &str, dim: usize, chunker_version: u32) -> Result<Index> {
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join("meta.json");
         let existing: Option<Meta> = std::fs::read_to_string(&meta_path).ok()
             .and_then(|s| serde_json::from_str(&s).ok());
         let mismatch = existing.as_ref()
-            .map(|m| m.embedder_id != embedder_id || m.dim != dim)
+            .map(|m| m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version)
             .unwrap_or(false);
 
+        // Zero read-consistency interval: re-resolve the on-disk manifest before
+        // every read. Without this, a long-lived handle (e.g. the `serve` process)
+        // keeps pointing at fragment files that a separate `reindex` has deleted,
+        // failing every query with "Object ... not found" until the process is
+        // restarted. See `handle_survives_external_index_rebuild`.
         let conn: Connection = lancedb::connect(dir.join("lance").to_string_lossy().as_ref())
+            .read_consistency_interval(std::time::Duration::ZERO)
             .execute().await.map_err(|e| Error::Index(e.to_string()))?;
 
         let has_table = |names: &[String]| names.iter().any(|t| t == "chunks");
@@ -83,7 +96,7 @@ impl Index {
         };
 
         std::fs::write(&meta_path,
-            serde_json::to_string(&Meta { embedder_id: embedder_id.into(), dim }).unwrap())?;
+            serde_json::to_string(&Meta { embedder_id: embedder_id.into(), dim, chunker_version }).unwrap())?;
 
         Ok(Index { dim, table, rebuilt })
     }
@@ -210,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_search_roundtrip() {
         let dir = tempdir().unwrap();
-        let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         idx.upsert_file("a.rs", vec![
             chunk("a.rs","h1",1,vec![1.0,0.0,0.0]),
             chunk("a.rs","h1",5,vec![0.0,1.0,0.0]),
@@ -223,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_old_rows_for_file() {
         let dir = tempdir().unwrap();
-        let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
         idx.upsert_file("a.rs", vec![chunk("a.rs","h2",9,vec![1.0,0.0,0.0])]).await.unwrap();
         let hashes = idx.file_hashes().await.unwrap();
@@ -234,13 +247,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_survives_external_index_rebuild() {
+        // Reproduces the footgun where a long-lived server (e.g. the MCP `serve`
+        // process) holds an Index handle while a *separate* process runs `reindex`,
+        // which wipes `.omniscient/` and rebuilds from scratch. The stale handle
+        // must not keep pointing at deleted fragment files.
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])]).await.unwrap();
+
+        // Simulate `reindex`: blow away the dataset dir and rebuild it via a fresh
+        // handle with different contents.
+        std::fs::remove_dir_all(dir.path().join("lance")).unwrap();
+        {
+            let rebuilt = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+            rebuilt.upsert_file("b.rs", vec![chunk("b.rs", "h2", 7, vec![1.0, 0.0, 0.0])]).await.unwrap();
+        }
+
+        // The original handle must reload to the rebuilt dataset, not error out on
+        // the now-deleted fragment files.
+        let hits = idx.search(&[1.0, 0.0, 0.0], 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk.path, "b.rs");
+    }
+
+    #[tokio::test]
     async fn model_id_mismatch_triggers_rebuild() {
         let dir = tempdir().unwrap();
         {
-            let idx = Index::open(dir.path(), "mock-v1", 3).await.unwrap();
+            let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
             idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
         }
-        let idx = Index::open(dir.path(), "different-model", 3).await.unwrap();
+        let idx = Index::open(dir.path(), "different-model", 3, 1).await.unwrap();
+        assert!(idx.rebuilt());
+        assert!(idx.file_hashes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunker_version_mismatch_triggers_rebuild() {
+        let dir = tempdir().unwrap();
+        {
+            let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+            idx.upsert_file("a.rs", vec![chunk("a.rs","h1",1,vec![1.0,0.0,0.0])]).await.unwrap();
+        }
+        // Same embedder, bumped chunker version: stale chunks must be dropped.
+        let idx = Index::open(dir.path(), "mock-v1", 3, 2).await.unwrap();
         assert!(idx.rebuilt());
         assert!(idx.file_hashes().await.unwrap().is_empty());
     }

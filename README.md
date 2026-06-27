@@ -39,6 +39,13 @@ Copy `omniscient.example.toml` to `omniscient.toml` in your repo root and edit:
 languages = ["rust", "python", "typescript"]
 strip_comments = true
 
+# Test/fixture files (tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*,
+# **/test_*.py, **/conftest.py, **/__tests__/) are skipped by default; examples/
+# is kept. Set true to index test files too.
+index_tests = false
+# Extra glob patterns to skip, on top of the built-in test excludes.
+exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
+
 [embedder]
 base_url = "http://localhost:8080"
 model = "qwen3-embedding-4b"

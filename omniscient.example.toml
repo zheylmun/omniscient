@@ -2,6 +2,15 @@
 languages = ["rust", "python", "typescript"]
 strip_comments = true
 
+# Test/fixture files (tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*,
+# **/test_*.py, **/conftest.py, **/__tests__/) are skipped by default. Set true
+# to index them too.
+index_tests = false
+
+# Extra glob patterns to skip when indexing, in addition to the built-in test
+# excludes above. Matched against repo-relative paths. .gitignore is always honored.
+exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
+
 [embedder]
 base_url = "http://localhost:8080"   # local llama.cpp serving an embedding model
 model = "qwen3-embedding-4b"
