@@ -413,9 +413,9 @@ mod tests {
         engine.refresh().await.unwrap();
 
         let calls = embedder.calls.lock().unwrap().clone();
-        assert!(!calls.is_empty(), "reconcile should have embedded the file");
-        assert!(calls.iter().all(|&n| n <= 2), "no batch may exceed max_batch_chunks=2; got {calls:?}");
-        assert!(calls.iter().any(|&n| n < 5), "5 chunks must be split, not sent as one batch; got {calls:?}");
+        // 5 chunks under max_batch_chunks=2 must split deterministically into 2+2+1,
+        // never one batch of 5 and never a batch over the cap.
+        assert_eq!(calls, vec![2, 2, 1], "5 chunks, cap 2 -> 2+2+1; got {calls:?}");
     }
 
     #[tokio::test]

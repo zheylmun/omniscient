@@ -23,8 +23,14 @@ impl Default for EmbedderConfig {
     }
 }
 impl EmbedderConfig {
+    /// Batch limits for embedding. A `0` in either knob is clamped to 1 so a
+    /// fat-fingered config degrades to one-chunk-per-request rather than being
+    /// rejected — and never produces an empty/looping batch.
     pub fn batch_limits(&self) -> BatchLimits {
-        BatchLimits { max_chunks: self.max_batch_chunks, max_chars: self.max_batch_chars }
+        BatchLimits {
+            max_chunks: self.max_batch_chunks.max(1),
+            max_chars: self.max_batch_chars.max(1),
+        }
     }
 }
 
@@ -192,5 +198,21 @@ mod tests {
         assert_eq!(c.embedder.max_batch_chars, 8000);
         // unspecified embedder fields keep their defaults
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+    }
+
+    #[test]
+    fn batch_limits_clamp_zero_to_one() {
+        let toml = r#"
+            [embedder]
+            max_batch_chunks = 0
+            max_batch_chars = 0
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        // raw fields keep the user's value; batch_limits() clamps to a safe minimum
+        assert_eq!(c.embedder.max_batch_chunks, 0);
+        assert_eq!(c.embedder.max_batch_chars, 0);
+        let limits = c.embedder.batch_limits();
+        assert_eq!(limits.max_chunks, 1);
+        assert_eq!(limits.max_chars, 1);
     }
 }

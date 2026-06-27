@@ -6,7 +6,7 @@ use async_trait::async_trait;
 /// Bounds for splitting a list of texts into embed() batches. A batch is flushed
 /// before adding an item that would exceed either bound (a single item larger than
 /// `max_chars` is sent alone — we never split an item).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimits {
     pub max_chunks: usize,
     pub max_chars: usize,
