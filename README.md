@@ -68,34 +68,56 @@ debounce_ms = 200   # coalesce bursts of FS events into one reconcile
 
 Changing the `model` field triggers an automatic full reindex on the next run — the index records the embedder id and rebuilds when it detects a mismatch.
 
-## Build
+## Install
+
+Install (or update to) the latest build into `~/.cargo/bin` — which is on your
+`PATH` — with the bundled script:
 
 ```bash
-cargo build --release
+./install.sh
 ```
 
-The resulting binary is at `target/release/omniscient`.
+That's a thin wrapper over `cargo install --path . --force`; re-run it any time to
+pick up new commits. If you just want a local build instead, `cargo build --release`
+leaves the binary at `target/release/omniscient`.
 
 ## Register with Claude Code
 
-Add omniscient as a stdio MCP server in your Claude Code project config (`.claude/settings.json` or `~/.claude/settings.json`):
+Register **once** at user scope and it works in every repository:
+
+```bash
+claude mcp add -s user omniscient omniscient -- serve
+```
+
+With no `--repo`, omniscient indexes the git repository enclosing the directory
+Claude is launched from (it walks up from the current directory to find the `.git`
+root). So a single global registration follows you from project to project — each
+repo gets its own `.omniscient/` index. If the launch directory isn't inside a git
+repo, omniscient refuses to guess and exits with an error rather than indexing a
+stray directory.
+
+To pin a specific repository regardless of launch directory, pass `--repo`
+explicitly (useful for a per-project registration):
+
+```bash
+claude mcp add omniscient omniscient -- serve --repo /path/to/your/repo
+```
+
+Either form maps to this entry in `.claude/settings.json` / `~/.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
     "omniscient": {
-      "command": "/path/to/omniscient",
-      "args": ["serve", "--repo", "/path/to/your/repo"]
+      "command": "omniscient",
+      "args": ["serve"]
     }
   }
 }
 ```
 
-Or using the Claude Code CLI:
-
-```bash
-claude mcp add omniscient /path/to/omniscient -- serve --repo /path/to/your/repo
-```
+(Use an absolute `command` path if `~/.cargo/bin` isn't on the PATH seen by your
+MCP client.)
 
 ## Debugging
 
