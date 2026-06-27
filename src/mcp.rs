@@ -109,6 +109,17 @@ fn render(entries: &[ContextEntry]) -> String {
 pub async fn serve(config: Config) -> Result<()> {
     let state = std::sync::Arc::new(crate::refresh::RefreshState::standalone());
     let lazy = LazyEngine::new(config.clone(), state.clone());
+
+    // Held until shutdown; dropping it stops watching and aborts the reconcile task.
+    let _watch_guard = if config.watch.enabled {
+        match crate::watcher::spawn(config.repo_root.clone(), &config.watch, lazy.clone(), state.clone()) {
+            Ok(guard) => Some(guard),
+            Err(e) => { tracing::warn!("file watcher disabled: {e}"); None }
+        }
+    } else {
+        None
+    };
+
     let server = Server::new(lazy);
     let running = server
         .serve(stdio())
