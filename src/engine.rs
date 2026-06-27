@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::distill::{distill_context, ContextEntry};
 use crate::embed::{build_embedder, Embedder};
 use crate::error::{Error, Result};
+use tokio::sync::OnceCell;
 use crate::freshness::{diff, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use crate::refresh::RefreshState;
@@ -160,6 +161,44 @@ impl Engine {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
 
+/// Lazily initialized engine — constructed on first `get()`, not at server startup,
+/// so `tools/list` works even when the embedder endpoint is down and a failed init
+/// is retryable. Shares one `RefreshState` with the watcher.
+#[derive(Clone)]
+pub struct LazyEngine {
+    config: Config,
+    state: Arc<RefreshState>,
+    inner: Arc<OnceCell<Arc<Engine>>>,
+}
+
+impl LazyEngine {
+    pub fn new(config: Config, state: Arc<RefreshState>) -> Self {
+        Self { config, state, inner: Arc::new(OnceCell::new()) }
+    }
+
+    /// Test/seam constructor: a `LazyEngine` whose cell is already filled, so `get()`
+    /// never builds a real embedder.
+    pub fn from_engine(config: Config, state: Arc<RefreshState>, engine: Arc<Engine>) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(engine);
+        Self { config, state, inner: Arc::new(cell) }
+    }
+
+    pub async fn get(&self) -> std::result::Result<Arc<Engine>, String> {
+        self.inner
+            .get_or_try_init(|| async {
+                let embedder = build_embedder(&self.config.embedder).await.map_err(|e| e.to_string())?;
+                Engine::with_refresh_state(self.config.clone(), embedder, self.state.clone())
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map(Arc::clone)
+            .map_err(|e| e.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +323,21 @@ mod tests {
         engine.refresh_state().mark_dirty(); // watcher would do this
         let entries = engine.search("beta", Some(5)).await.unwrap();
         assert!(entries.iter().any(|e| e.path == "b.rs"), "dirty => reconcile picks up b.rs");
+    }
+
+    #[tokio::test]
+    async fn lazy_engine_from_engine_returns_ready_instance() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let engine = Arc::new(
+            Engine::with_refresh_state(cfg.clone(), Box::new(MockEmbedder::new("mock-v1", 64)), state.clone())
+                .await.unwrap(),
+        );
+        let lazy = LazyEngine::from_engine(cfg, state.clone(), engine.clone());
+        let got = lazy.get().await.unwrap();
+        assert!(Arc::ptr_eq(&got, &engine), "from_engine yields the pre-built engine");
     }
 
     #[tokio::test]
