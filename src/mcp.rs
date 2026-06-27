@@ -44,7 +44,27 @@ impl Server {
     }
 
     #[tool(
-        description = "Semantic code search. Returns distilled, relevant code context (file:line + code) for a natural-language or code query."
+        description = "Semantic code search over the indexed implementation + docs corpus. \
+Given a natural-language or code query, returns ranked, distilled context (file:line + code \
+body, each with a relevance note) by meaning rather than literal tokens — it finds relevant \
+code even when your query words never appear in it.\n\
+\n\
+Corpus: implementation source, docs/markdown, build scripts, and config. By design it EXCLUDES \
+test code (#[cfg(test)] modules, tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*) and \
+dependency lock files (Cargo.lock, package-lock.json, go.sum, ...) — their absence is intended, \
+not a relevance bug. examples/ IS indexed. For test code, call sites inside tests, or any \
+exhaustive 'every occurrence of X' sweep, use a grep/text tool — those lines are not in this \
+index and cannot be returned.\n\
+\n\
+Use when: 'where does concept X live', 'how does X work', locating code by behavior, or pulling \
+design rationale from docs. Avoid when: you need every call site (results are top-K ranked, not \
+exhaustive), an exact symbol you already know (grep is faster and literal), or results that must \
+reflect the very latest working-tree edits — the index refreshes on each call but can briefly \
+lag disk if the embedding backend is unreachable or a refresh is mid-flight, so cross-check grep \
+when freshness is load-bearing.\n\
+\n\
+Results are heuristic similarity, not ground truth — verify before acting. Bulk data files may \
+surface as low-relevance noise."
     )]
     async fn search(
         &self,
@@ -60,7 +80,15 @@ impl Server {
     }
 
     #[tool(
-        description = "Return a noise-stripped view of one file. With `focus`, returns the most relevant parts; without it, a structural outline."
+        description = "Noise-stripped view of one file, read live from disk. Without `focus`: a \
+structural outline — every type/impl/fn signature with its line range, bodies elided — a cheap \
+way to grasp a large file's shape before reading it in full. With `focus` (a natural-language \
+description): returns only the parts relevant to it.\n\
+\n\
+Use when: orienting in an unfamiliar or large file (outline), or extracting the relevant slice \
+of a big file without paying to read the whole thing (focus). Avoid when: you need exact, \
+complete file contents — the outline elides bodies and focus is selective; use a full file read \
+for that. Unlike search, this reads current disk content, so it reflects uncommitted edits."
     )]
     async fn read_file(
         &self,

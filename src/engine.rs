@@ -4,9 +4,10 @@ use crate::config::Config;
 use crate::distill::{ContextEntry, distill_context};
 use crate::embed::{Embedder, build_embedder};
 use crate::error::{Error, Result};
-use crate::freshness::{diff, resolve_excludes, scan};
+use crate::freshness::{diff, exclude_matcher, is_excluded, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use crate::refresh::RefreshState;
+use ignore::gitignore::Gitignore;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -18,6 +19,10 @@ pub struct Engine {
     embedder: Box<dyn Embedder>,
     index: Index,
     refresh: Arc<RefreshState>,
+    /// Effective exclude globs (lock files + tests + user), resolved once. Drives
+    /// both the index-time `scan` and the read-time search filter via `matcher`.
+    excludes: Vec<String>,
+    matcher: Gitignore,
 }
 
 impl Engine {
@@ -43,11 +48,15 @@ impl Engine {
             crate::chunk::CHUNKER_VERSION,
         )
         .await?;
+        let excludes = resolve_excludes(&config.exclude, config.index_tests);
+        let matcher = exclude_matcher(&config.repo_root, &excludes)?;
         Ok(Engine {
             config,
             embedder,
             index,
             refresh,
+            excludes,
+            matcher,
         })
     }
 
@@ -101,8 +110,7 @@ impl Engine {
     }
 
     async fn reconcile_inner(&self) -> Result<()> {
-        let excludes = resolve_excludes(&self.config.exclude, self.config.index_tests);
-        let current = scan(&self.config.repo_root, &excludes)?;
+        let current = scan(&self.config.repo_root, &self.excludes)?;
         let stored = self.index.file_hashes().await?;
         let delta = diff(&current, &stored);
         let hash_of: std::collections::HashMap<&str, &str> = current
@@ -176,6 +184,13 @@ impl Engine {
         let k = k.unwrap_or(self.config.search.default_k);
         let qv = self.embed_one(query).await?;
         let hits = self.index.search(&qv, k).await?;
+        // Enforce the exclude policy at read time too: even if the index hasn't
+        // reconciled away an excluded file yet (lag window — embedder was down,
+        // mid-reconcile on a large repo, watcher not caught up), never surface it.
+        let hits: Vec<_> = hits
+            .into_iter()
+            .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
+            .collect();
         Ok(distill_context(
             hits,
             self.config.strip_comments,
@@ -395,6 +410,103 @@ mod tests {
         let entries = engine.search("b", Some(5)).await.unwrap();
         assert!(entries.iter().any(|e| e.path == "b.rs"));
         assert!(!entries.iter().any(|e| e.path == "a.rs"));
+    }
+
+    #[tokio::test]
+    async fn newly_excluded_file_is_purged_on_reconcile() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(repo.path().join("data.txt"), "noise noise noise\n").unwrap();
+
+        // First engine: no excludes -> indexes both files.
+        {
+            let mut cfg = Config::default_for(repo.path().to_path_buf());
+            cfg.index_tests = true;
+            let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+                .await
+                .unwrap();
+            engine.refresh().await.unwrap();
+            let stored = engine.index.file_hashes().await.unwrap();
+            assert!(
+                stored.contains_key("data.txt"),
+                "precondition: data.txt must be indexed first"
+            );
+        }
+
+        // Second engine on the SAME index dir, now excluding data.txt. A reconcile
+        // must purge the previously-indexed file (this is what should happen when a
+        // new built-in/config exclusion ships and the daemon reconciles).
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.index_tests = true;
+        cfg.exclude = vec!["**/data.txt".to_string()];
+        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        engine.refresh().await.unwrap();
+        let stored = engine.index.file_hashes().await.unwrap();
+        assert!(
+            !stored.contains_key("data.txt"),
+            "newly-excluded file must be purged on reconcile; got {:?}",
+            stored.keys().collect::<Vec<_>>()
+        );
+        assert!(stored.contains_key("keep.rs"), "kept file stays indexed");
+        // And it must no longer surface in search results (the user-visible symptom).
+        let hits = engine.search("noise", Some(10)).await.unwrap();
+        assert!(
+            !hits.iter().any(|e| e.path == "data.txt"),
+            "excluded file must not be returned by search; got {:?}",
+            hits.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_excluded_files_when_index_is_stale() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(repo.path().join("data.txt"), "noise noise noise\n").unwrap();
+
+        // Index both with no excludes — simulates an index built before the exclusion.
+        {
+            let mut cfg = Config::default_for(repo.path().to_path_buf());
+            cfg.index_tests = true;
+            let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+                .await
+                .unwrap();
+            engine.refresh().await.unwrap();
+        }
+
+        // New engine excludes data.txt, but force the "watcher caught up" state so
+        // ensure_fresh SKIPS reconcile — the stale row stays in the index. This is
+        // the lag window the read-time filter exists to cover.
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.index_tests = true;
+        cfg.exclude = vec!["**/data.txt".to_string()];
+        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().clear_dirty();
+        assert!(
+            engine.refresh.can_skip_scan(),
+            "precondition: reconcile skipped"
+        );
+        assert!(
+            engine
+                .index
+                .file_hashes()
+                .await
+                .unwrap()
+                .contains_key("data.txt"),
+            "precondition: stale row still in the index (reconcile was skipped)"
+        );
+
+        // Search must not surface the excluded file even though it's still indexed.
+        let hits = engine.search("noise", Some(10)).await.unwrap();
+        assert!(
+            !hits.iter().any(|e| e.path == "data.txt"),
+            "read-time filter must drop excluded files from a stale index; got {:?}",
+            hits.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

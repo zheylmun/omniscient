@@ -1,8 +1,33 @@
 //! Freshness: walk repo (gitignore-aware), hash files, compute delta vs stored hashes.
 use crate::error::{Error, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Built-in glob patterns that are *always* skipped, regardless of `index_tests`:
+/// dependency lock files. They are large, machine-generated, and almost pure noise
+/// for semantic search. `**/` prefixes so they match in workspace members and nested
+/// packages, not just the repo root. Note `go.sum` (checksums) is excluded while
+/// `go.mod` is kept — the latter is meaningful, hand-edited dependency declaration.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "**/Cargo.lock",          // Rust
+    "**/package-lock.json",   // npm
+    "**/npm-shrinkwrap.json", // npm
+    "**/yarn.lock",           // Yarn
+    "**/pnpm-lock.yaml",      // pnpm
+    "**/bun.lock",            // Bun (text)
+    "**/bun.lockb",           // Bun (binary)
+    "**/poetry.lock",         // Poetry
+    "**/Pipfile.lock",        // pipenv
+    "**/uv.lock",             // uv
+    "**/Gemfile.lock",        // Bundler
+    "**/composer.lock",       // Composer
+    "**/go.sum",              // Go module checksums
+    "**/mix.lock",            // Elixir
+    "**/flake.lock",          // Nix
+    "**/packages.lock.json",  // NuGet
+];
 
 /// Built-in glob patterns for test/fixture files that are skipped during
 /// indexing unless `index_tests` is set. `**/` prefixes so they match in
@@ -19,19 +44,42 @@ pub const DEFAULT_TEST_EXCLUDES: &[&str] = &[
     "**/conftest.py",  // pytest fixtures
 ];
 
-/// Resolve the effective exclude patterns: the built-in test excludes (unless
-/// `index_tests`) followed by the user's extra patterns.
+/// Resolve the effective exclude patterns: the always-on built-in excludes (lock
+/// files), then the test excludes unless `index_tests`, then the user's extras.
 pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<String> {
-    let mut out: Vec<String> = if index_tests {
-        Vec::new()
-    } else {
-        DEFAULT_TEST_EXCLUDES
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect()
-    };
+    let mut out: Vec<String> = DEFAULT_EXCLUDES
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    if !index_tests {
+        out.extend(
+            DEFAULT_TEST_EXCLUDES
+                .iter()
+                .map(std::string::ToString::to_string),
+        );
+    }
     out.extend(user_exclude.iter().cloned());
     out
+}
+
+/// Build a matcher over `excludes` so the same patterns `scan` applies at index
+/// time can also be enforced at read time (search). Keeping both paths driven by
+/// one `resolve_excludes` list means they cannot drift apart. Patterns use
+/// gitignore glob semantics, matching how `scan` interprets them.
+pub fn exclude_matcher(repo_root: &Path, excludes: &[String]) -> Result<Gitignore> {
+    let mut b = GitignoreBuilder::new(repo_root);
+    for pat in excludes {
+        b.add_line(None, pat)
+            .map_err(|e| Error::Config(format!("invalid exclude pattern {pat:?}: {e}")))?;
+    }
+    b.build()
+        .map_err(|e| Error::Config(format!("building exclude matcher: {e}")))
+}
+
+/// True if `rel_path` (repo-relative, forward-slashed — as stored on `Hit`s) is
+/// excluded by `matcher`. Paths are always files here, never directories.
+pub fn is_excluded(matcher: &Gitignore, rel_path: &str) -> bool {
+    matcher.matched(rel_path, false).is_ignore()
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +273,62 @@ mod tests {
             paths.contains(&"tests/integration.rs".to_string()),
             "index_tests=true re-includes tests"
         );
+    }
+
+    #[test]
+    fn scan_always_excludes_lock_files() {
+        let d = tempdir().unwrap();
+        write(d.path(), "src/lib.rs", "fn a(){}");
+        write(d.path(), "Cargo.lock", "# generated\n");
+        write(d.path(), "web/package-lock.json", "{}");
+        write(d.path(), "web/yarn.lock", "# yarn\n");
+        write(d.path(), "py/poetry.lock", "# poetry\n");
+        write(d.path(), "go.sum", "mod h1:...\n");
+        write(d.path(), "go.mod", "module x\n"); // meaningful: kept
+
+        // Lock files are not gated by index_tests; assert both settings exclude them.
+        for index_tests in [false, true] {
+            let paths = paths_in(d.path(), &resolve_excludes(&[], index_tests));
+            assert!(paths.contains(&"src/lib.rs".to_string()));
+            assert!(
+                paths.contains(&"go.mod".to_string()),
+                "go.mod is meaningful, kept (index_tests={index_tests})"
+            );
+            for locked in [
+                "Cargo.lock",
+                "web/package-lock.json",
+                "web/yarn.lock",
+                "py/poetry.lock",
+                "go.sum",
+            ] {
+                assert!(
+                    !paths.iter().any(|p| p == locked),
+                    "{locked} must be excluded (index_tests={index_tests}); got {paths:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exclude_matcher_agrees_with_scan_patterns() {
+        // The read-time matcher must exclude exactly what scan excludes, or search
+        // and indexing would disagree. Drive both from the same resolve_excludes set.
+        let excludes = resolve_excludes(&["vendor/**".to_string()], false);
+        let m = exclude_matcher(Path::new("/repo"), &excludes).unwrap();
+        for excluded in [
+            "Cargo.lock",
+            "web/package-lock.json",
+            "go.sum",
+            "tests/it.rs",
+            "a/__tests__/x.ts",
+            "web/app.test.ts",
+            "vendor/dep.rs",
+        ] {
+            assert!(is_excluded(&m, excluded), "{excluded} should be excluded");
+        }
+        for kept in ["src/lib.rs", "go.mod", "examples/demo.rs"] {
+            assert!(!is_excluded(&m, kept), "{kept} should be kept");
+        }
     }
 
     #[test]
