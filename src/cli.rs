@@ -34,7 +34,10 @@ fn find_git_root(start: &Path) -> anyhow::Result<Option<PathBuf>> {
             Ok(true) => return Ok(Some(ancestor.to_path_buf())),
             Ok(false) => {}
             Err(e) => {
-                return Err(anyhow::anyhow!("failed to check {}: {e}", dot_git.display()));
+                return Err(anyhow::anyhow!(
+                    "failed to check {}: {e}",
+                    dot_git.display()
+                ));
             }
         }
     }
