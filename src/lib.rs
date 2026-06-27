@@ -9,5 +9,6 @@ pub mod freshness;
 pub mod index;
 pub mod mcp;
 pub mod refresh;
+pub mod watcher;
 
 pub use error::{Error, Result};
