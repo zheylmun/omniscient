@@ -5,11 +5,12 @@ use async_trait::async_trait;
 
 /// Bounds for splitting a list of texts into embed() batches. A batch is flushed
 /// before adding an item that would exceed either bound (a single item larger than
-/// `max_chars` is sent alone — we never split an item).
+/// `max_bytes` is sent alone — we never split an item).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimits {
     pub max_chunks: usize,
-    pub max_chars: usize,
+    /// Byte budget per batch, measured as the sum of `String::len()` (UTF-8 bytes).
+    pub max_bytes: usize,
 }
 
 #[async_trait]
@@ -24,11 +25,12 @@ pub trait Embedder: Send + Sync {
     async fn embed_batched(&self, texts: &[String], limits: BatchLimits) -> Result<Vec<Vec<f32>>> {
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         let mut start = 0;
-        let mut cur_chars = 0usize;
+        let mut cur_bytes = 0usize;
         let mut cur_len = 0usize;
         for (i, t) in texts.iter().enumerate() {
             let would_overflow = cur_len > 0
-                && (cur_len >= limits.max_chunks || cur_chars + t.len() > limits.max_chars);
+                && (cur_len >= limits.max_chunks
+                    || cur_bytes.saturating_add(t.len()) > limits.max_bytes);
             if would_overflow {
                 let batch = &texts[start..i];
                 let vecs = self.embed(batch).await?;
@@ -39,10 +41,10 @@ pub trait Embedder: Send + Sync {
                 }
                 out.extend(vecs);
                 start = i;
-                cur_chars = 0;
+                cur_bytes = 0;
                 cur_len = 0;
             }
-            cur_chars += t.len();
+            cur_bytes = cur_bytes.saturating_add(t.len());
             cur_len += 1;
         }
         if cur_len > 0 {
@@ -194,18 +196,18 @@ mod tests {
     async fn batched_packs_by_count() {
         let e = SpyEmbedder::new(16);
         let t = texts(&["a", "b", "c", "d", "e"]);
-        let limits = BatchLimits { max_chunks: 2, max_chars: 1_000_000 };
+        let limits = BatchLimits { max_chunks: 2, max_bytes: 1_000_000 };
         let out = e.embed_batched(&t, limits).await.unwrap();
         assert_eq!(out.len(), 5, "one vector per input, in order");
         assert_eq!(*e.calls.lock().unwrap(), vec![2, 2, 1], "5 items, cap 2 -> 2+2+1");
     }
 
     #[tokio::test]
-    async fn batched_packs_by_chars() {
+    async fn batched_packs_by_bytes() {
         let e = SpyEmbedder::new(16);
-        // each item is 4 bytes; max_chars=8 -> 2 per batch
+        // each item is 4 bytes; max_bytes=8 -> 2 per batch
         let t = texts(&["aaaa", "bbbb", "cccc"]);
-        let limits = BatchLimits { max_chunks: 1000, max_chars: 8 };
+        let limits = BatchLimits { max_chunks: 1000, max_bytes: 8 };
         let out = e.embed_batched(&t, limits).await.unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(*e.calls.lock().unwrap(), vec![2, 1], "8-byte budget -> 4+4, then 4");
@@ -215,7 +217,7 @@ mod tests {
     async fn batched_oversized_single_chunk_goes_alone() {
         let e = SpyEmbedder::new(16);
         let t = texts(&["aa", "bbbbbbbbbb", "cc"]); // middle item is 10 bytes > budget 4
-        let limits = BatchLimits { max_chunks: 1000, max_chars: 4 };
+        let limits = BatchLimits { max_chunks: 1000, max_bytes: 4 };
         let out = e.embed_batched(&t, limits).await.unwrap();
         assert_eq!(out.len(), 3);
         // "aa"(2) fits; adding "bbbbbbbbbb" would exceed -> flush [aa]; the big one is
@@ -228,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn batched_empty_input_makes_no_calls() {
         let e = SpyEmbedder::new(16);
-        let out = e.embed_batched(&[], BatchLimits { max_chunks: 4, max_chars: 100 }).await.unwrap();
+        let out = e.embed_batched(&[], BatchLimits { max_chunks: 4, max_bytes: 100 }).await.unwrap();
         assert!(out.is_empty());
         assert!(e.calls.lock().unwrap().is_empty(), "no embed() calls for empty input");
     }
@@ -238,7 +240,7 @@ mod tests {
         let e = MockEmbedder::new("mock-v1", 16);
         let t = texts(&["alpha", "beta", "gamma", "delta", "epsilon"]);
         let whole = e.embed(&t).await.unwrap();
-        let batched = e.embed_batched(&t, BatchLimits { max_chunks: 2, max_chars: 7 }).await.unwrap();
+        let batched = e.embed_batched(&t, BatchLimits { max_chunks: 2, max_bytes: 7 }).await.unwrap();
         assert_eq!(whole, batched, "batching must not change vectors or order");
     }
 }

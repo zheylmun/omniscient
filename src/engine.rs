@@ -398,7 +398,7 @@ mod tests {
 
         let mut cfg = Config::default_for(repo.path().to_path_buf());
         cfg.embedder.max_batch_chunks = 2;       // force splitting
-        cfg.embedder.max_batch_chars = 1_000_000;
+        cfg.embedder.max_batch_bytes = 1_000_000;
 
         let embedder = std::sync::Arc::new(CountingEmbedder::new(64));
         // Engine takes Box<dyn Embedder>; wrap the Arc so we keep a handle to the spy.
