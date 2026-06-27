@@ -1,14 +1,36 @@
 //! Configuration: omniscient.toml -> Config, with defaults.
+use crate::embed::BatchLimits;
 use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct EmbedderConfig { pub base_url: String, pub model: String }
+pub struct EmbedderConfig {
+    pub base_url: String,
+    pub model: String,
+    pub max_batch_chunks: usize,
+    pub max_batch_bytes: usize,
+}
 impl Default for EmbedderConfig {
     fn default() -> Self {
-        Self { base_url: "http://localhost:8080".into(), model: "qwen3-embedding-4b".into() }
+        Self {
+            base_url: "http://localhost:8080".into(),
+            model: "qwen3-embedding-4b".into(),
+            max_batch_chunks: 64,
+            max_batch_bytes: 32000,
+        }
+    }
+}
+impl EmbedderConfig {
+    /// Batch limits for embedding. A `0` in either knob is clamped to 1 so a
+    /// fat-fingered config degrades to one-chunk-per-request rather than being
+    /// rejected — and never produces an empty/looping batch.
+    pub fn batch_limits(&self) -> BatchLimits {
+        BatchLimits {
+            max_chunks: self.max_batch_chunks.max(1),
+            max_bytes: self.max_batch_bytes.max(1),
+        }
     }
 }
 
@@ -152,5 +174,45 @@ mod tests {
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert!(!c.watch.enabled);
         assert_eq!(c.watch.debounce_ms, 500);
+    }
+
+    #[test]
+    fn embedder_batch_defaults() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(c.embedder.max_batch_chunks, 64);
+        assert_eq!(c.embedder.max_batch_bytes, 32000);
+        let limits = c.embedder.batch_limits();
+        assert_eq!(limits.max_chunks, 64);
+        assert_eq!(limits.max_bytes, 32000);
+    }
+
+    #[test]
+    fn embedder_batch_overrides_parse() {
+        let toml = r#"
+            [embedder]
+            max_batch_chunks = 16
+            max_batch_bytes = 8000
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.max_batch_chunks, 16);
+        assert_eq!(c.embedder.max_batch_bytes, 8000);
+        // unspecified embedder fields keep their defaults
+        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+    }
+
+    #[test]
+    fn batch_limits_clamp_zero_to_one() {
+        let toml = r#"
+            [embedder]
+            max_batch_chunks = 0
+            max_batch_bytes = 0
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        // raw fields keep the user's value; batch_limits() clamps to a safe minimum
+        assert_eq!(c.embedder.max_batch_chunks, 0);
+        assert_eq!(c.embedder.max_batch_bytes, 0);
+        let limits = c.embedder.batch_limits();
+        assert_eq!(limits.max_chunks, 1);
+        assert_eq!(limits.max_bytes, 1);
     }
 }
