@@ -37,13 +37,23 @@ impl EmbedderConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
-    pub default_k: usize,
+    /// Upper bound on candidates fetched from the index and results returned. A
+    /// safety ceiling, not a target — relevance-shape selection (see
+    /// `relevance_ratio`) usually returns fewer. The MCP `k` argument overrides
+    /// it per call.
+    pub max_results: usize,
+    /// Keep every result scoring at least this fraction of the top result's
+    /// cosine similarity, so the result count tracks the *shape* of the score
+    /// distribution instead of a fixed k. 0.75 = "within 75% of the best match".
+    /// Clamped to `[0.0, 1.0]`; the best match is always returned.
+    pub relevance_ratio: f32,
     pub token_budget: usize,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_k: 8,
+            max_results: 25,
+            relevance_ratio: 0.75,
             token_budget: 4000,
         }
     }
@@ -135,7 +145,8 @@ mod tests {
         let c = Config::default_for(PathBuf::from("/repo"));
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
         assert_eq!(c.embedder.base_url, "http://localhost:8080");
-        assert_eq!(c.search.default_k, 8);
+        assert_eq!(c.search.max_results, 25);
+        assert!((c.search.relevance_ratio - 0.75).abs() < 1e-6);
         assert!(c.search.token_budget > 0);
         assert_eq!(c.languages, vec!["rust", "python", "typescript"]);
     }
@@ -147,12 +158,15 @@ mod tests {
             [embedder]
             model = "bge-code"
             [search]
-            default_k = 5
+            max_results = 5
+            relevance_ratio = 0.5
         "#;
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert_eq!(c.embedder.model, "bge-code");
         assert_eq!(c.embedder.base_url, "http://localhost:8080"); // defaulted
-        assert_eq!(c.search.default_k, 5);
+        assert_eq!(c.search.max_results, 5);
+        assert!((c.search.relevance_ratio - 0.5).abs() < 1e-6);
+        assert_eq!(c.search.token_budget, 4000); // defaulted
         assert_eq!(c.languages, vec!["rust".to_string()]);
     }
 

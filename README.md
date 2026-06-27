@@ -58,7 +58,10 @@ base_url = "http://localhost:8080"
 model = "qwen3-embedding-4b"
 
 [search]
-default_k = 8
+# Results track the shape of the relevance scores: every hit within
+# relevance_ratio of the top hit is returned (max_results / token_budget cap it).
+relevance_ratio = 0.75
+max_results = 25
 token_budget = 4000
 
 [watch]
@@ -81,6 +84,24 @@ the bundled script:
 That's a thin wrapper over `cargo install --path . --force`; re-run it any time to
 pick up new commits. If you just want a local build instead, `cargo build --release`
 leaves the binary at `target/release/omniscient`.
+
+### Git hooks (CI parity)
+
+Local git hooks are managed by [prek](https://github.com/j178/prek) (a fast,
+Rust-native drop-in for the pre-commit framework) from `.pre-commit-config.yaml`,
+so the checks that gate a PR also run as you work. Stages mirror
+`.github/workflows/ci.yml`:
+
+- **pre-commit** — `cargo fmt` and `dprint fmt` (markdown); both cheap, run on
+  every commit
+- **pre-push** — `cargo clippy --all-targets --all-features` and `cargo test
+  --all-features`, both with `RUSTFLAGS=-Dwarnings` like CI
+
+`install.sh` runs `prek install` for you once prek is on your `PATH`. Both tools
+are Rust binaries: `cargo install --locked prek dprint`. Markdown formatting is
+configured in `dprint.json` (matches the repo's existing style — no churn).
+Bypass a run with `git commit -n` / `git push --no-verify`, or
+`SKIP=fmt,clippy git commit` to skip specific hooks.
 
 ## Register with Claude Code
 

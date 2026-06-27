@@ -55,7 +55,9 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 
 ## Configuration
 
-`omniscient.toml` at the repo root (see `omniscient.example.toml`): `[embedder] base_url/model`, `[search] default_k/token_budget`, `languages`, `strip_comments`, `index_tests`, `exclude`. Defaults apply if the file is absent.
+`omniscient.toml` at the repo root (see `omniscient.example.toml`): `[embedder] base_url/model`, `[search] relevance_ratio/max_results/token_budget`, `languages`, `strip_comments`, `index_tests`, `exclude`. Defaults apply if the file is absent.
+
+**Result selection is relevance-shape, not fixed-k:** `distill_context` returns every entry scoring at least `relevance_ratio` (default 0.75) of the top entry's score, so result count follows the score distribution — a sharp query returns few, a broad one many. `max_results` (the index fetch ceiling, overridable by the MCP `k` arg) and `token_budget` are caps; the single best match is always returned (this also covers a non-positive top score, where the ratio floor would otherwise admit nothing).
 
 **Repo resolution (`cli::resolve_repo`):** an explicit `--repo` is honored as given (only normalized to an absolute path via `canonicalize_repo`, no git-root walk); with no `--repo` the repo root is the `.git` ancestor of the launch cwd (`find_git_root`), and omniscient errors out rather than indexing a non-repo dir. This is what lets one user-scope `claude mcp add -s user omniscient omniscient -- serve` registration work across every repo. `./install.sh` (= `cargo install --path . --force`) puts the binary on PATH.
 

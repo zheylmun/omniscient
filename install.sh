@@ -6,6 +6,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Install the prek-managed git hooks (rustfmt + markdown on commit; clippy +
+# tests on push — see .pre-commit-config.yaml). Safe to re-run. Best-effort: this
+# requires a git checkout, and a failure here must never block `cargo install`.
+if [ -f .pre-commit-config.yaml ] && [ -e .git ]; then
+  if command -v prek >/dev/null 2>&1; then
+    prek install || echo "Note: 'prek install' failed; local git hooks not enabled." >&2
+  else
+    echo "Note: 'prek' not found. Install it with 'cargo install --locked prek'," >&2
+    echo "      then run 'prek install' to enable the local hooks." >&2
+  fi
+  command -v dprint >/dev/null 2>&1 || \
+    echo "Note: 'dprint' not found (markdown hook). Install: 'cargo install --locked dprint'." >&2
+fi
+
 cargo install --path . --force
 
 bin="$(command -v omniscient || true)"

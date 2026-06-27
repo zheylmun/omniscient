@@ -1,0 +1,14 @@
+{
+  "markdown": {
+    "textWrap": "maintain",
+    "emphasisKind": "asterisks"
+  },
+  "excludes": [
+    "target",
+    ".omniscient",
+    "tests/fixtures"
+  ],
+  "plugins": [
+    "https://plugins.dprint.dev/markdown-0.22.1.wasm"
+  ]
+}
