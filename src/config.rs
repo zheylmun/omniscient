@@ -36,16 +36,32 @@ impl EmbedderConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct SearchConfig { pub default_k: usize, pub token_budget: usize }
+pub struct SearchConfig {
+    pub default_k: usize,
+    pub token_budget: usize,
+}
 impl Default for SearchConfig {
-    fn default() -> Self { Self { default_k: 8, token_budget: 4000 } }
+    fn default() -> Self {
+        Self {
+            default_k: 8,
+            token_budget: 4000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct WatchConfig { pub enabled: bool, pub debounce_ms: u64 }
+pub struct WatchConfig {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+}
 impl Default for WatchConfig {
-    fn default() -> Self { Self { enabled: true, debounce_ms: 200 } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 200,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,7 +97,12 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn default_for(repo_root: PathBuf) -> Config { Config { repo_root, ..Default::default() } }
+    pub fn default_for(repo_root: PathBuf) -> Config {
+        Config {
+            repo_root,
+            ..Default::default()
+        }
+    }
 
     pub fn from_toml_str(s: &str, repo_root: PathBuf) -> Result<Config> {
         let mut c: Config = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
@@ -90,11 +111,16 @@ impl Config {
     }
 
     pub fn load(path: Option<&Path>, repo_root: PathBuf) -> Result<Config> {
-        let candidate = path.map(PathBuf::from).unwrap_or_else(|| repo_root.join("omniscient.toml"));
+        let candidate = path.map_or_else(|| repo_root.join("omniscient.toml"), PathBuf::from);
         match std::fs::read_to_string(&candidate) {
             Ok(s) => Config::from_toml_str(&s, repo_root),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default_for(repo_root)),
-            Err(e) => Err(Error::Config(format!("reading {}: {e}", candidate.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Config::default_for(repo_root))
+            }
+            Err(e) => Err(Error::Config(format!(
+                "reading {}: {e}",
+                candidate.display()
+            ))),
         }
     }
 }
@@ -111,7 +137,7 @@ mod tests {
         assert_eq!(c.embedder.base_url, "http://localhost:8080");
         assert_eq!(c.search.default_k, 8);
         assert!(c.search.token_budget > 0);
-        assert_eq!(c.languages, vec!["rust","python","typescript"]);
+        assert_eq!(c.languages, vec!["rust", "python", "typescript"]);
     }
 
     #[test]
@@ -142,7 +168,10 @@ mod tests {
         "#;
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert!(c.index_tests);
-        assert_eq!(c.exclude, vec!["vendor/**".to_string(), "**/*.gen.rs".to_string()]);
+        assert_eq!(
+            c.exclude,
+            vec!["vendor/**".to_string(), "**/*.gen.rs".to_string()]
+        );
     }
 
     #[test]
@@ -157,7 +186,10 @@ mod tests {
         // non-NotFound error; that must surface, not silently fall back to defaults.
         let dir = tempfile::tempdir().unwrap();
         let res = Config::load(Some(dir.path()), PathBuf::from("/repo"));
-        assert!(res.is_err(), "a non-NotFound IO error must not yield defaults");
+        assert!(
+            res.is_err(),
+            "a non-NotFound IO error must not yield defaults"
+        );
     }
 
     #[test]
@@ -166,11 +198,11 @@ mod tests {
         assert!(c.watch.enabled, "watching defaults to on");
         assert_eq!(c.watch.debounce_ms, 200);
 
-        let toml = r#"
+        let toml = r"
             [watch]
             enabled = false
             debounce_ms = 500
-        "#;
+        ";
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert!(!c.watch.enabled);
         assert_eq!(c.watch.debounce_ms, 500);
@@ -188,11 +220,11 @@ mod tests {
 
     #[test]
     fn embedder_batch_overrides_parse() {
-        let toml = r#"
+        let toml = r"
             [embedder]
             max_batch_chunks = 16
             max_batch_bytes = 8000
-        "#;
+        ";
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert_eq!(c.embedder.max_batch_chunks, 16);
         assert_eq!(c.embedder.max_batch_bytes, 8000);
@@ -202,11 +234,11 @@ mod tests {
 
     #[test]
     fn batch_limits_clamp_zero_to_one() {
-        let toml = r#"
+        let toml = r"
             [embedder]
             max_batch_chunks = 0
             max_batch_bytes = 0
-        "#;
+        ";
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         // raw fields keep the user's value; batch_limits() clamps to a safe minimum
         assert_eq!(c.embedder.max_batch_chunks, 0);

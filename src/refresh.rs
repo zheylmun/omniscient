@@ -26,14 +26,26 @@ impl RefreshState {
         }
     }
 
-    pub fn mark_dirty(&self) { self.dirty.store(true, Ordering::Release); }
-    pub fn clear_dirty(&self) { self.dirty.store(false, Ordering::Release); }
-    pub fn set_watch_active(&self, v: bool) { self.watch_active.store(v, Ordering::Release); }
-    pub fn is_dirty(&self) -> bool { self.dirty.load(Ordering::Acquire) }
-    pub fn is_watch_active(&self) -> bool { self.watch_active.load(Ordering::Acquire) }
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+    pub fn clear_dirty(&self) {
+        self.dirty.store(false, Ordering::Release);
+    }
+    pub fn set_watch_active(&self, v: bool) {
+        self.watch_active.store(v, Ordering::Release);
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+    pub fn is_watch_active(&self) -> bool {
+        self.watch_active.load(Ordering::Acquire)
+    }
 
     /// Search may skip its scan only when a healthy watcher guarantees freshness.
-    pub fn can_skip_scan(&self) -> bool { self.is_watch_active() && !self.is_dirty() }
+    pub fn can_skip_scan(&self) -> bool {
+        self.is_watch_active() && !self.is_dirty()
+    }
 }
 
 #[cfg(test)]

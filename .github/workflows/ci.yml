@@ -1,0 +1,79 @@
+name: CI
+
+# PRs run fmt/clippy/test on every push to the branch. The `push` trigger is
+# scoped to the default branch (and version tags) so topic branches with an
+# open PR don't run the whole pipeline twice (push refs and pull_request refs
+# live in different concurrency groups, so they can't cancel each other).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a fresh push doesn't queue behind a stale one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (pedantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # Pedantic lints are configured in Cargo.toml ([lints.clippy]); RUSTFLAGS
+      # promotes every warning to a hard error.
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # The suite is fully offline (MockEmbedder); the one network test is #[ignore]d.
+      # No --all-targets: that would skip doctests, which we want to run.
+      - run: cargo test --all-features
+
+  build-release:
+    name: release build
+    runs-on: ubuntu-latest
+    # The release profile (thin-LTO, codegen-units=1) takes ~20 min to compile.
+    # It's a smoke test for release-time packaging, so run it only when landing
+    # on the default branch or tagging — not on every PR push.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # lancedb -> lance pulls prost-build, which needs the protobuf compiler.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # Exercises the thin-LTO / codegen-units=1 release profile so packaging
+      # issues surface in CI, not at release time.
+      - run: cargo build --release

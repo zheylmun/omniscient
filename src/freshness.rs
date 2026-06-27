@@ -9,14 +9,14 @@ use std::path::Path;
 /// workspace members and nested packages, not just the repo root. `examples/`
 /// is deliberately absent — examples are real, runnable code worth searching.
 pub const DEFAULT_TEST_EXCLUDES: &[&str] = &[
-    "**/tests/**",      // Rust integration tests + fixtures live here
-    "**/benches/**",    // Rust benchmarks
-    "**/__tests__/**",  // JS/TS
-    "**/*.test.*",      // JS/TS
-    "**/*.spec.*",      // JS/TS
-    "**/*_test.*",      // Python *_test.py, Go *_test.go, ...
-    "**/test_*.py",     // pytest
-    "**/conftest.py",   // pytest fixtures
+    "**/tests/**",     // Rust integration tests + fixtures live here
+    "**/benches/**",   // Rust benchmarks
+    "**/__tests__/**", // JS/TS
+    "**/*.test.*",     // JS/TS
+    "**/*.spec.*",     // JS/TS
+    "**/*_test.*",     // Python *_test.py, Go *_test.go, ...
+    "**/test_*.py",    // pytest
+    "**/conftest.py",  // pytest fixtures
 ];
 
 /// Resolve the effective exclude patterns: the built-in test excludes (unless
@@ -25,20 +25,32 @@ pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<Strin
     let mut out: Vec<String> = if index_tests {
         Vec::new()
     } else {
-        DEFAULT_TEST_EXCLUDES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_TEST_EXCLUDES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
     };
     out.extend(user_exclude.iter().cloned());
     out
 }
 
 #[derive(Debug, Clone)]
-pub struct FileState { pub path: String, pub hash: String }
+pub struct FileState {
+    pub path: String,
+    pub hash: String,
+}
 
 #[derive(Debug, Clone, Default)]
-pub struct Delta { pub changed: Vec<String>, pub deleted: Vec<String> }
+pub struct Delta {
+    pub changed: Vec<String>,
+    pub deleted: Vec<String>,
+}
 
 fn rel(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 pub fn scan(repo_root: &Path, excludes: &[String]) -> Result<Vec<FileState>> {
@@ -50,22 +62,38 @@ pub fn scan(repo_root: &Path, excludes: &[String]) -> Result<Vec<FileState>> {
         ob.add(&format!("!{pat}"))
             .map_err(|e| Error::Config(format!("invalid exclude pattern {pat:?}: {e}")))?;
     }
-    let overrides = ob.build().map_err(|e| Error::Config(format!("building excludes: {e}")))?;
+    let overrides = ob
+        .build()
+        .map_err(|e| Error::Config(format!("building excludes: {e}")))?;
 
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(repo_root).overrides(overrides).build() {
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+    for entry in ignore::WalkBuilder::new(repo_root)
+        .overrides(overrides)
+        .build()
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path();
-        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => continue };
-        out.push(FileState { path: rel(repo_root, path), hash: blake3::hash(&bytes).to_hex().to_string() });
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        out.push(FileState {
+            path: rel(repo_root, path),
+            hash: blake3::hash(&bytes).to_hex().to_string(),
+        });
     }
     Ok(out)
 }
 
-pub fn diff(current: &[FileState], stored: &HashMap<String, String>) -> Delta {
+pub fn diff<S: std::hash::BuildHasher>(
+    current: &[FileState],
+    stored: &HashMap<String, String, S>,
+) -> Delta {
     let mut delta = Delta::default();
-    let current_paths: std::collections::HashSet<&str> = current.iter().map(|s| s.path.as_str()).collect();
+    let current_paths: std::collections::HashSet<&str> =
+        current.iter().map(|s| s.path.as_str()).collect();
     for s in current {
         match stored.get(&s.path) {
             Some(h) if *h == s.hash => {}
@@ -73,7 +101,9 @@ pub fn diff(current: &[FileState], stored: &HashMap<String, String>) -> Delta {
         }
     }
     for path in stored.keys() {
-        if !current_paths.contains(path.as_str()) { delta.deleted.push(path.clone()); }
+        if !current_paths.contains(path.as_str()) {
+            delta.deleted.push(path.clone());
+        }
     }
     delta.changed.sort();
     delta.deleted.sort();
@@ -93,7 +123,11 @@ mod tests {
         let git_dir = d.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(git_dir.join("config"), "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
         fs::write(d.path().join("keep.rs"), "fn a(){}").unwrap();
         fs::write(d.path().join(".gitignore"), "ignored.rs\n").unwrap();
         fs::write(d.path().join("ignored.rs"), "fn b(){}").unwrap();
@@ -106,7 +140,10 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.starts_with(".git/")),
             "scan must not emit git-internal files; found: {:?}",
-            paths.iter().filter(|p| p.starts_with(".git/")).collect::<Vec<_>>()
+            paths
+                .iter()
+                .filter(|p| p.starts_with(".git/"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -117,7 +154,11 @@ mod tests {
     }
 
     fn paths_in(root: &Path, excludes: &[String]) -> Vec<String> {
-        scan(root, excludes).unwrap().into_iter().map(|s| s.path).collect()
+        scan(root, excludes)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.path)
+            .collect()
     }
 
     #[test]
@@ -136,12 +177,22 @@ mod tests {
         let paths = paths_in(d.path(), &excludes);
 
         assert!(paths.contains(&"src/lib.rs".to_string()));
-        assert!(paths.contains(&"examples/demo.rs".to_string()), "examples are real code, kept");
+        assert!(
+            paths.contains(&"examples/demo.rs".to_string()),
+            "examples are real code, kept"
+        );
         for excluded in [
-            "tests/integration.rs", "benches/bench.rs", "pkg/test_foo.py",
-            "web/app.test.ts", "web/app.spec.ts", "web/__tests__/helper.ts",
+            "tests/integration.rs",
+            "benches/bench.rs",
+            "pkg/test_foo.py",
+            "web/app.test.ts",
+            "web/app.spec.ts",
+            "web/__tests__/helper.ts",
         ] {
-            assert!(!paths.iter().any(|p| p == excluded), "{excluded} should be excluded; got {paths:?}");
+            assert!(
+                !paths.iter().any(|p| p == excluded),
+                "{excluded} should be excluded; got {paths:?}"
+            );
         }
     }
 
@@ -155,7 +206,10 @@ mod tests {
         let paths = paths_in(d.path(), &excludes);
 
         assert!(paths.contains(&"src/lib.rs".to_string()));
-        assert!(!paths.iter().any(|p| p == "vendor/dep.rs"), "user exclude must apply");
+        assert!(
+            !paths.iter().any(|p| p == "vendor/dep.rs"),
+            "user exclude must apply"
+        );
     }
 
     #[test]
@@ -167,15 +221,27 @@ mod tests {
         let excludes = resolve_excludes(&[], true);
         let paths = paths_in(d.path(), &excludes);
 
-        assert!(paths.contains(&"tests/integration.rs".to_string()), "index_tests=true re-includes tests");
+        assert!(
+            paths.contains(&"tests/integration.rs".to_string()),
+            "index_tests=true re-includes tests"
+        );
     }
 
     #[test]
     fn diff_detects_changed_new_deleted() {
         let current = vec![
-            FileState { path: "a.rs".into(), hash: "h1".into() },
-            FileState { path: "b.rs".into(), hash: "NEW".into() },
-            FileState { path: "c.rs".into(), hash: "h3".into() },
+            FileState {
+                path: "a.rs".into(),
+                hash: "h1".into(),
+            },
+            FileState {
+                path: "b.rs".into(),
+                hash: "NEW".into(),
+            },
+            FileState {
+                path: "c.rs".into(),
+                hash: "h3".into(),
+            },
         ];
         let mut stored = HashMap::new();
         stored.insert("a.rs".to_string(), "h1".to_string());

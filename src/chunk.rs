@@ -23,7 +23,7 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some("rust"),
         Some("py") => Some("python"),
-        Some("ts") | Some("tsx") => Some("typescript"),
+        Some("ts" | "tsx") => Some("typescript"),
         _ => None,
     }
 }
@@ -32,12 +32,18 @@ pub fn chunk_file(path: &Path, source: &str, max_window_lines: usize) -> Result<
     chunk_source(language_for_path(path), source, max_window_lines)
 }
 
-pub fn chunk_source(language: Option<&str>, source: &str, max_window_lines: usize) -> Result<Vec<Chunk>> {
+pub fn chunk_source(
+    language: Option<&str>,
+    source: &str,
+    max_window_lines: usize,
+) -> Result<Vec<Chunk>> {
     if let Some(lang) = language {
         match treesitter_chunks(lang, source) {
             Ok(chunks) if !chunks.is_empty() => return Ok(chunks),
             Ok(_) => {}
-            Err(e) => tracing::warn!("tree-sitter parse failed for {lang}: {e}; using line windows"),
+            Err(e) => {
+                tracing::warn!("tree-sitter parse failed for {lang}: {e}; using line windows");
+            }
         }
         return Ok(line_windows(source, lang, max_window_lines));
     }
@@ -46,7 +52,9 @@ pub fn chunk_source(language: Option<&str>, source: &str, max_window_lines: usiz
 
 fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Chunk> {
     let lines: Vec<&str> = source.lines().collect();
-    if lines.is_empty() { return vec![]; }
+    if lines.is_empty() {
+        return vec![];
+    }
     let win = max_window_lines.max(1);
     let step = (win - win / 5).max(1); // ~20% overlap
     let mut chunks = Vec::new();
@@ -60,7 +68,9 @@ fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Ch
             language: language.to_string(),
             symbol: None,
         });
-        if end == lines.len() { break; }
+        if end == lines.len() {
+            break;
+        }
         start += step;
     }
     chunks
@@ -77,21 +87,35 @@ fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
 
 fn def_kinds(lang: &str) -> &'static [&'static str] {
     match lang {
-        "rust" => &["function_item", "struct_item", "enum_item", "trait_item", "impl_item"],
+        "rust" => &[
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "impl_item",
+        ],
         "python" => &["function_definition", "class_definition"],
-        "typescript" => &["function_declaration", "class_declaration",
-                          "interface_declaration", "method_definition", "lexical_declaration"],
+        "typescript" => &[
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "method_definition",
+            "lexical_declaration",
+        ],
         _ => &[],
     }
 }
 
 fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
-    let language = ts_language(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
+    let language =
+        ts_language(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language).map_err(|e| Error::Chunk(e.to_string()))?;
-    let tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return Ok(vec![]), // non-fatal: caller falls through to line_windows
+    parser
+        .set_language(&language)
+        .map_err(|e| Error::Chunk(e.to_string()))?;
+    // non-fatal: caller falls through to line_windows
+    let Some(tree) = parser.parse(source, None) else {
+        return Ok(vec![]);
     };
     let kinds = def_kinds(lang);
     let bytes = source.as_bytes();
@@ -142,7 +166,7 @@ fn walk_children(
             let symbol = child
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(bytes).ok())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
             chunks.push(Chunk {
                 text,
                 start_line: child.start_position().row + 1,
@@ -164,12 +188,14 @@ fn walk_children(
 /// `cfg(any(test, …))` — but not when `test` is negated (`cfg(not(test))`).
 fn is_test_attribute(attr_item: tree_sitter::Node, bytes: &[u8]) -> bool {
     let mut cursor = attr_item.walk();
-    let attribute = match attr_item.children(&mut cursor).find(|n| n.kind() == "attribute") {
-        Some(a) => a,
-        None => return false,
+    let Some(attribute) = attr_item
+        .children(&mut cursor)
+        .find(|n| n.kind() == "attribute")
+    else {
+        return false;
     };
     match attribute_name_last_segment(attribute, bytes).as_deref() {
-        Some("test") | Some("bench") => true,
+        Some("test" | "bench") => true,
         Some("cfg") => attribute_has_cfg_test(attribute, bytes),
         _ => false,
     }
@@ -183,11 +209,14 @@ fn attribute_name_last_segment(attribute: tree_sitter::Node, bytes: &[u8]) -> Op
         .children(&mut cursor)
         .find(|n| matches!(n.kind(), "identifier" | "scoped_identifier"))?;
     match name.kind() {
-        "identifier" => name.utf8_text(bytes).ok().map(|s| s.to_string()),
+        "identifier" => name
+            .utf8_text(bytes)
+            .ok()
+            .map(std::string::ToString::to_string),
         "scoped_identifier" => name
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(bytes).ok())
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         _ => None,
     }
 }
@@ -199,7 +228,10 @@ fn attribute_name_last_segment(attribute: tree_sitter::Node, bytes: &[u8]) -> Op
 /// so `#[cfg(not(test))]` (production-only code) is not treated as a test gate.
 fn attribute_has_cfg_test(attribute: tree_sitter::Node, bytes: &[u8]) -> bool {
     let mut cursor = attribute.walk();
-    match attribute.children(&mut cursor).find(|n| n.kind() == "token_tree") {
+    match attribute
+        .children(&mut cursor)
+        .find(|n| n.kind() == "token_tree")
+    {
         Some(tt) => token_tree_has_test(tt, bytes),
         None => false,
     }
@@ -237,7 +269,9 @@ fn token_tree_has_test(tt: tree_sitter::Node, bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
-    fn read(p: &str) -> String { std::fs::read_to_string(p).unwrap() }
+    fn read(p: &str) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
 
     #[test]
     fn rust_chunks_on_definitions() {
@@ -247,7 +281,10 @@ mod tests {
         assert!(symbols.contains(&"alpha".to_string()));
         assert!(symbols.contains(&"Point".to_string()));
         assert!(chunks.iter().all(|c| c.language == "rust"));
-        let alpha = chunks.iter().find(|c| c.symbol.as_deref() == Some("alpha")).unwrap();
+        let alpha = chunks
+            .iter()
+            .find(|c| c.symbol.as_deref() == Some("alpha"))
+            .unwrap();
         assert!(alpha.text.contains("pub fn alpha"));
     }
 
@@ -268,12 +305,15 @@ mod tests {
         let c = chunk_file(Path::new("tests/fixtures/sample.md"), &md, 2).unwrap();
         assert!(!c.is_empty());
         assert!(c.iter().all(|c| c.language == "text" && c.symbol.is_none()));
-        assert!(c.iter().all(|c| c.end_line - c.start_line + 1 <= 2));
+        assert!(c.iter().all(|c| c.end_line - c.start_line < 2));
     }
 
     #[test]
     fn line_windows_cover_full_range() {
-        let src = (1..=10).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let src = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let c = chunk_source(None, &src, 4).unwrap();
         assert_eq!(c.first().unwrap().start_line, 1);
         assert_eq!(c.last().unwrap().end_line, 10);
@@ -291,7 +331,12 @@ mod tests {
             "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
         );
         // Exactly 3 top-level definitions: alpha (fn), Point (struct), impl Point (symbol=None)
-        assert_eq!(chunks.len(), 3, "expected exactly 3 chunks, got {}: {chunks:?}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            3,
+            "expected exactly 3 chunks, got {}: {chunks:?}",
+            chunks.len()
+        );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
         assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
@@ -309,7 +354,12 @@ mod tests {
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
         assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(chunks.len(), 2, "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -323,9 +373,17 @@ mod tests {
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         // alpha is exported (wrapped in export_statement) — must still be captured
-        assert!(symbols.contains(&"alpha"), "alpha (exported fn) missing from {symbols:?}");
+        assert!(
+            symbols.contains(&"alpha"),
+            "alpha (exported fn) missing from {symbols:?}"
+        );
         assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(chunks.len(), 2, "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -334,17 +392,33 @@ mod tests {
         let chunks = chunk_file(Path::new("tests/fixtures/sample_tests.rs"), &src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         // production code is kept
-        assert!(symbols.contains(&"production_fn"), "production_fn missing from {symbols:?}");
-        assert!(symbols.contains(&"Widget"), "Widget missing from {symbols:?}");
+        assert!(
+            symbols.contains(&"production_fn"),
+            "production_fn missing from {symbols:?}"
+        );
+        assert!(
+            symbols.contains(&"Widget"),
+            "Widget missing from {symbols:?}"
+        );
         // every flavor of test code is dropped
-        for banned in ["test_helper", "checks_widget", "checks_production_fn", "standalone_test"] {
+        for banned in [
+            "test_helper",
+            "checks_widget",
+            "checks_production_fn",
+            "standalone_test",
+        ] {
             assert!(
                 !symbols.contains(&banned),
                 "{banned} should be skipped; chunks: {chunks:?}"
             );
         }
         // exactly the two production defs survive
-        assert_eq!(chunks.len(), 2, "expected exactly 2 production chunks, got {}: {chunks:?}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly 2 production chunks, got {}: {chunks:?}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -359,7 +433,10 @@ pub fn always() -> i32 { 2 }
 "#;
         let chunks = chunk_source(Some("rust"), src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"util_fn"), "util_fn wrongly skipped: {symbols:?}");
+        assert!(
+            symbols.contains(&"util_fn"),
+            "util_fn wrongly skipped: {symbols:?}"
+        );
         assert!(symbols.contains(&"always"), "always missing: {symbols:?}");
     }
 
@@ -367,7 +444,7 @@ pub fn always() -> i32 { 2 }
     fn cfg_not_test_is_kept() {
         // `#[cfg(not(test))]` is production-only code (compiled when NOT testing):
         // a `test` nested under `not(...)` must NOT be treated as a test gate.
-        let src = r#"
+        let src = r"
 #[cfg(not(test))]
 pub fn only_in_prod() -> i32 { 1 }
 
@@ -375,26 +452,35 @@ pub fn only_in_prod() -> i32 { 1 }
 pub fn unix_prod() -> i32 { 2 }
 
 pub fn always() -> i32 { 3 }
-"#;
+";
         let chunks = chunk_source(Some("rust"), src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"only_in_prod"), "only_in_prod wrongly skipped: {symbols:?}");
-        assert!(symbols.contains(&"unix_prod"), "unix_prod wrongly skipped: {symbols:?}");
+        assert!(
+            symbols.contains(&"only_in_prod"),
+            "only_in_prod wrongly skipped: {symbols:?}"
+        );
+        assert!(
+            symbols.contains(&"unix_prod"),
+            "unix_prod wrongly skipped: {symbols:?}"
+        );
         assert!(symbols.contains(&"always"), "always missing: {symbols:?}");
     }
 
     #[test]
     fn tokio_test_attribute_is_skipped() {
         // `#[tokio::test]` (scoped path ending in `test`) is also a test marker.
-        let src = r#"
+        let src = r"
 pub fn keep_me() -> i32 { 1 }
 
 #[tokio::test]
 async fn async_test() {}
-"#;
+";
         let chunks = chunk_source(Some("rust"), src, 100).unwrap();
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&"keep_me"), "keep_me missing: {symbols:?}");
-        assert!(!symbols.contains(&"async_test"), "async_test should be skipped: {symbols:?}");
+        assert!(
+            !symbols.contains(&"async_test"),
+            "async_test should be skipped: {symbols:?}"
+        );
     }
 }

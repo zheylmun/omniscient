@@ -4,4 +4,7 @@
 .omniscient/
 .DS_Store
 
+# Claude Code local session data and worktrees
+.claude/
+
 omniscient.toml
