@@ -1,14 +1,30 @@
 //! Configuration: omniscient.toml -> Config, with defaults.
+use crate::embed::BatchLimits;
 use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct EmbedderConfig { pub base_url: String, pub model: String }
+pub struct EmbedderConfig {
+    pub base_url: String,
+    pub model: String,
+    pub max_batch_chunks: usize,
+    pub max_batch_chars: usize,
+}
 impl Default for EmbedderConfig {
     fn default() -> Self {
-        Self { base_url: "http://localhost:8080".into(), model: "qwen3-embedding-4b".into() }
+        Self {
+            base_url: "http://localhost:8080".into(),
+            model: "qwen3-embedding-4b".into(),
+            max_batch_chunks: 64,
+            max_batch_chars: 32000,
+        }
+    }
+}
+impl EmbedderConfig {
+    pub fn batch_limits(&self) -> BatchLimits {
+        BatchLimits { max_chunks: self.max_batch_chunks, max_chars: self.max_batch_chars }
     }
 }
 
@@ -152,5 +168,29 @@ mod tests {
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert!(!c.watch.enabled);
         assert_eq!(c.watch.debounce_ms, 500);
+    }
+
+    #[test]
+    fn embedder_batch_defaults() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(c.embedder.max_batch_chunks, 64);
+        assert_eq!(c.embedder.max_batch_chars, 32000);
+        let limits = c.embedder.batch_limits();
+        assert_eq!(limits.max_chunks, 64);
+        assert_eq!(limits.max_chars, 32000);
+    }
+
+    #[test]
+    fn embedder_batch_overrides_parse() {
+        let toml = r#"
+            [embedder]
+            max_batch_chunks = 16
+            max_batch_chars = 8000
+        "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.max_batch_chunks, 16);
+        assert_eq!(c.embedder.max_batch_chars, 8000);
+        // unspecified embedder fields keep their defaults
+        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
     }
 }
