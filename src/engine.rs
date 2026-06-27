@@ -6,7 +6,9 @@ use crate::embed::{build_embedder, Embedder};
 use crate::error::{Error, Result};
 use crate::freshness::{diff, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
+use crate::refresh::RefreshState;
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_WINDOW_LINES: usize = 80;
 
@@ -14,6 +16,7 @@ pub struct Engine {
     config: Config,
     embedder: Box<dyn Embedder>,
     index: Index,
+    refresh: Arc<RefreshState>,
 }
 
 impl Engine {
@@ -23,18 +26,51 @@ impl Engine {
     }
 
     pub async fn new_with_embedder(config: Config, embedder: Box<dyn Embedder>) -> Result<Engine> {
+        Self::with_refresh_state(config, embedder, Arc::new(RefreshState::standalone())).await
+    }
+
+    pub async fn with_refresh_state(
+        config: Config,
+        embedder: Box<dyn Embedder>,
+        refresh: Arc<RefreshState>,
+    ) -> Result<Engine> {
         let dir = config.repo_root.join(".omniscient");
         let index = Index::open(&dir, embedder.id(), embedder.dim().max(1), crate::chunk::CHUNKER_VERSION).await?;
-        Ok(Engine { config, embedder, index })
+        Ok(Engine { config, embedder, index, refresh })
     }
 
     pub fn embedder_id(&self) -> &str { self.embedder.id() }
+
+    pub fn refresh_state(&self) -> &Arc<RefreshState> { &self.refresh }
 
     pub async fn stats(&self) -> Result<(usize, usize)> {
         Ok((self.index.file_hashes().await?.len(), self.index.chunk_count().await?))
     }
 
+    /// Skip the scan entirely when a healthy watcher guarantees freshness;
+    /// otherwise reconcile. This is the only search-path change vs. always-scan.
+    pub async fn ensure_fresh(&self) -> Result<()> {
+        if self.refresh.can_skip_scan() { return Ok(()); }
+        self.reconcile().await
+    }
+
+    /// Single-flight reconcile. Clears `dirty` BEFORE scanning so an event arriving
+    /// mid-scan re-sets it (costing at most one redundant reconcile, never a lost update).
+    pub async fn reconcile(&self) -> Result<()> {
+        let _guard = self.refresh.lock.lock().await;
+        if self.refresh.can_skip_scan() { return Ok(()); } // another reconcile beat us
+        self.refresh.clear_dirty();
+        self.reconcile_inner().await
+    }
+
+    /// Force a full reconcile regardless of flags (used by `reindex` and tests).
     pub async fn refresh(&self) -> Result<()> {
+        let _guard = self.refresh.lock.lock().await;
+        self.refresh.clear_dirty();
+        self.reconcile_inner().await
+    }
+
+    async fn reconcile_inner(&self) -> Result<()> {
         let excludes = resolve_excludes(&self.config.exclude, self.config.index_tests);
         let current = scan(&self.config.repo_root, &excludes)?;
         let stored = self.index.file_hashes().await?;
@@ -80,7 +116,7 @@ impl Engine {
     }
 
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
-        self.refresh().await?;
+        self.ensure_fresh().await?;
         let k = k.unwrap_or(self.config.search.default_k);
         let qv = self.embed_one(query).await?;
         let hits = self.index.search(&qv, k).await?;
@@ -216,6 +252,38 @@ mod tests {
         let focus = engine.read_file("lib.rs", Some("alpha")).await.unwrap();
         assert!(!focus.is_empty());
         assert!(focus.iter().all(|e| e.why_matched.contains("focus similarity")));
+    }
+
+    #[tokio::test]
+    async fn search_skips_scan_when_watch_active_and_clean() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        // Prime the index, then simulate a healthy, caught-up watcher.
+        engine.refresh().await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().clear_dirty();
+
+        // Change the tree WITHOUT marking dirty: a skipped scan must not see it.
+        fs::write(repo.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let entries = engine.search("beta", Some(5)).await.unwrap();
+        assert!(!entries.iter().any(|e| e.path == "b.rs"),
+            "active+clean must skip the scan; got {:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn search_reconciles_when_dirty() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        engine.refresh().await.unwrap();
+        engine.refresh_state().set_watch_active(true);
+        engine.refresh_state().clear_dirty();
+
+        fs::write(repo.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        engine.refresh_state().mark_dirty(); // watcher would do this
+        let entries = engine.search("beta", Some(5)).await.unwrap();
+        assert!(entries.iter().any(|e| e.path == "b.rs"), "dirty => reconcile picks up b.rs");
     }
 
     #[tokio::test]

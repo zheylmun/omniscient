@@ -42,7 +42,7 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 
 ### Invariants you must not break
 
-- **Always-fresh:** `Engine::search` calls `refresh()` *before* querying. Stale results are a bug, not a workflow step. Never add a search path that skips `refresh`.
+- **Always-fresh (watcher-aware):** `Engine::search` calls `ensure_fresh()` before querying. It may skip the filesystem scan *only* when a healthy watcher guarantees the index already reflects the working tree (`RefreshState::can_skip_scan()`); in every other case — watching disabled, watcher not yet started, embedder was down, a watch error — it falls back to a full `reconcile()`. Never add a search path that can return stale results when the watcher is not known-caught-up.
 - **Embedder id keys the index:** `index/meta.json` stores the embedder id + dim. On mismatch (e.g. config `model` changed) `Index::open` drops the table and forces a full rebuild. The index lives in `<repo_root>/.omniscient/` (excluded from the scan because dotfiles are skipped).
 - **No LLM in `search`:** distillation is deterministic. v1 deliberately has NO generative "answer" mode, NO in-process/candle embeddings, and NO device (Metal/CUDA) policy. The `Embedder` trait is the seam for adding in-process embeddings later — keep that boundary clean rather than reintroducing those features inline.
 - **stdout is reserved for the MCP protocol.** All logging goes to stderr (`tracing_subscriber` writer is stderr). Never `println!` in the `serve` path; `status`/`reindex` print to stdout only because they are human CLI commands.
