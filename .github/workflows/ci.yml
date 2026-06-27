@@ -1,8 +1,13 @@
 name: CI
 
+# PRs run fmt/clippy/test on every push to the branch. The `push` trigger is
+# scoped to the default branch (and version tags) so topic branches with an
+# open PR don't run the whole pipeline twice (push refs and pull_request refs
+# live in different concurrency groups, so they can't cancel each other).
 on:
   push:
-    branches: [main, "feat/**", "chore/**", "fix/**"]
+    branches: [feat/polish]
+    tags: ["v*"]
   pull_request:
 
 # Cancel superseded runs on the same ref so a fresh push doesn't queue behind a stale one.
@@ -58,6 +63,10 @@ jobs:
   build-release:
     name: release build
     runs-on: ubuntu-latest
+    # The release profile (thin-LTO, codegen-units=1) takes ~20 min to compile.
+    # It's a smoke test for release-time packaging, so run it only when landing
+    # on the default branch or tagging — not on every PR push.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
