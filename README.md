@@ -29,17 +29,29 @@ llama serve \
   -hf Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M \
   --port 8080 \
   --embedding \
-  --pooling last
+  --pooling last \
+  --ctx-size 32000 \
+  --batch-size 32000 \
+  --ubatch-size 32000
 ```
 
 > **Pooling:** Qwen3-Embedding is a decoder/LLM-based embedder and uses **last-token** pooling (`--pooling last`), not mean pooling. BERT-family embedders (BGE, jina, nomic) use `--pooling mean`. If you omit `--pooling`, llama.cpp falls back to the model's metadata default. Wrong pooling produces degenerate embeddings, so it's the first thing to check if search quality looks off.
+
+> **Context/batch size:** llama.cpp's defaults (context ~4096, `--ubatch-size` 512)
+> are far smaller than the embedding requests omniscient sends — it batches up to
+> `max_batch_bytes` (32000) of text per request. A pooled embedding model must fit
+> each sequence whole in one ubatch and within the context, so an under-sized server
+> answers the startup probe and then **aborts on the first real batch** — the server
+> looks healthy, then "silently" dies mid-use. Size `--ctx-size`/`--batch-size`/`--ubatch-size`
+> to your `max_batch_bytes` (a token is always ≥ 1 byte, so that's a safe ceiling).
+> The `auto_start` path does this for you automatically.
 
 ### Let omniscient start the server for you
 
 Don't want to manage a separate process? Set `auto_start = true` under `[embedder]`
 and omniscient will launch llama.cpp itself whenever `base_url` is unreachable —
 running exactly the command above, derived from your config (`hf_repo`, `pooling`,
-and the port from `base_url`). It waits for the server to come up (the first run
+the port from `base_url`, and context/batch sizes from `max_batch_bytes`). It waits for the server to come up (the first run
 downloads the GGUF, which can take a while) and shuts it down when omniscient
 exits. An endpoint you started yourself is always reused as-is and never spawned
 over.

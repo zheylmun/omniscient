@@ -1,6 +1,6 @@
 [package]
 name = "omniscient"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Local MCP server for semantic, distilled code search over a repository, backed by a LanceDB vector store and an external llama.cpp embeddings endpoint."
 authors = ["Zach Heylmun <zheylmun@gmail.com>"]

@@ -143,9 +143,29 @@ fn is_local_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+/// Smallest context/batch size we will ever ask the spawned server for, so a tiny
+/// `max_batch_bytes` can't shrink it to something uselessly small. llama.cpp's own
+/// historical default; comfortably below any embedding model's trained context.
+const MIN_SERVER_CTX: usize = 2048;
+
+/// Context/batch size for the spawned server, derived from our own batching budget.
+/// llama.cpp defaults (ctx ~4096, ubatch 512) are far smaller than the requests we
+/// send — for a pooled embedding model every sequence must fit whole in one ubatch
+/// and within `n_ctx`, so an under-sized server accepts the readiness probe and then
+/// aborts on the first real reconcile batch. A token is always ≥ 1 byte, so
+/// `max_batch_bytes` is a safe upper bound on the tokens in any single request
+/// (including a lone oversized chunk sent on its own). Tying it to the same knob
+/// that bounds our batches means the two can't drift apart.
+fn server_ctx_size(cfg: &EmbedderConfig) -> usize {
+    cfg.max_batch_bytes.max(MIN_SERVER_CTX)
+}
+
 /// The argument vector for `llama serve …`, mirroring the documented manual
 /// command. Factored out so it can be unit-tested without spawning.
 fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
+    // ctx == batch == ubatch: the whole request must fit, and for pooled embeddings
+    // a sequence can't be split across ubatches, so all three share one bound.
+    let ctx = server_ctx_size(cfg).to_string();
     vec![
         "serve".into(),
         "-hf".into(),
@@ -155,6 +175,12 @@ fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
         "--embedding".into(),
         "--pooling".into(),
         cfg.pooling.clone(),
+        "--ctx-size".into(),
+        ctx.clone(),
+        "--batch-size".into(),
+        ctx.clone(),
+        "--ubatch-size".into(),
+        ctx,
     ]
 }
 
@@ -449,7 +475,9 @@ mod tests {
 
     #[test]
     fn server_args_mirror_documented_command() {
-        // The defaults already match the documented command.
+        // The defaults already match the documented command. ctx/batch/ubatch are
+        // sized to max_batch_bytes (32000) so the spawned server can hold the
+        // largest request omniscient will send, not llama.cpp's tiny defaults.
         let cfg = EmbedderConfig::default();
         assert_eq!(
             server_args(&cfg, 8080),
@@ -462,8 +490,24 @@ mod tests {
                 "--embedding",
                 "--pooling",
                 "last",
+                "--ctx-size",
+                "32000",
+                "--batch-size",
+                "32000",
+                "--ubatch-size",
+                "32000",
             ]
         );
+    }
+
+    #[test]
+    fn server_ctx_floors_a_tiny_batch_budget() {
+        // A small max_batch_bytes must not shrink the server below the floor.
+        let cfg = EmbedderConfig {
+            max_batch_bytes: 100,
+            ..Default::default()
+        };
+        assert_eq!(server_ctx_size(&cfg), MIN_SERVER_CTX);
     }
 
     #[tokio::test]

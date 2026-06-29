@@ -20,7 +20,10 @@ base_url = "http://localhost:8080"   # local llama.cpp serving an embedding mode
 model = "qwen3-embedding-4b"
 # Embedding requests are split into batches so a massive file can't overload the
 # GPU. A batch is flushed before it would exceed either bound (a single chunk
-# larger than max_batch_bytes is sent on its own).
+# larger than max_batch_bytes is sent on its own). When auto_start launches the
+# server, max_batch_bytes also sizes its --ctx-size/--batch-size/--ubatch-size so
+# it can hold the largest request we send (llama.cpp's tiny defaults would make it
+# accept the startup probe and then crash on the first real batch).
 max_batch_chunks = 64       # max chunks per embed request
 max_batch_bytes = 32000     # max total bytes per embed request (~8k tokens)
 

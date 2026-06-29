@@ -49,6 +49,11 @@ Given a natural-language or code query, returns ranked, distilled context (file:
 body, each with a relevance note) by meaning rather than literal tokens — it finds relevant \
 code even when your query words never appear in it.\n\
 \n\
+Result count follows the relevance shape, not a fixed number: every hit scoring within a set \
+ratio of the top hit is returned, so a sharp query yields a few results and a broad one yields \
+more. The optional `k` is a ceiling on how many results come back (it overrides the configured \
+max), not a target — omit it and let the relevance distribution decide.\n\
+\n\
 Corpus: implementation source, docs/markdown, build scripts, and config. By design it EXCLUDES \
 test code (#[cfg(test)] modules, tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*) and \
 dependency lock files (Cargo.lock, package-lock.json, go.sum, ...) — their absence is intended, \
@@ -57,8 +62,8 @@ exhaustive 'every occurrence of X' sweep, use a grep/text tool — those lines a
 index and cannot be returned.\n\
 \n\
 Use when: 'where does concept X live', 'how does X work', locating code by behavior, or pulling \
-design rationale from docs. Avoid when: you need every call site (results are top-K ranked, not \
-exhaustive), an exact symbol you already know (grep is faster and literal), or results that must \
+design rationale from docs. Avoid when: you need every call site (results are relevance-ranked and \
+capped, not exhaustive), an exact symbol you already know (grep is faster and literal), or results that must \
 reflect the very latest working-tree edits — the index refreshes on each call but can briefly \
 lag disk if the embedding backend is unreachable or a refresh is mid-flight, so cross-check grep \
 when freshness is load-bearing.\n\
