@@ -113,6 +113,12 @@ pub async fn run(config: &Config, engine: std::result::Result<&Arc<Engine>, &str
     // Index + end-to-end query (only meaningful when the engine is up).
     match engine {
         Ok(e) => {
+            // Run the sample query FIRST: search() reconciles via ensure_fresh(), so a
+            // cold / not-yet-reconciled index gets populated before we read stats().
+            // stats() does not reconcile, so reading it first would FAIL a healthy
+            // server whose index just hasn't been built yet (the cold-start case this
+            // tool is meant to be called in).
+            let query_result = e.search("function definition", Some(1)).await;
             match e.stats().await {
                 Ok((files, chunks)) if chunks == 0 => checks.push(Check {
                     name: "index".into(),
@@ -130,7 +136,7 @@ pub async fn run(config: &Config, engine: std::result::Result<&Arc<Engine>, &str
                     detail: err.to_string(),
                 }),
             }
-            match e.search("function definition", Some(1)).await {
+            match query_result {
                 Ok(hits) if hits.is_empty() => checks.push(Check {
                     name: "query".into(),
                     status: Status::Warn,
@@ -258,5 +264,31 @@ mod tests {
             report.render()
         );
         assert!(report.render().contains("nothing indexed"));
+    }
+
+    #[tokio::test]
+    async fn cold_index_is_reconciled_before_stats_check() {
+        // A freshly-built engine whose on-disk index is not yet populated must NOT
+        // report FAIL: the sample query reconciles via ensure_fresh(), so the index
+        // check must see the reconciled chunks rather than a spurious 0. Regression
+        // for the stats()-before-search() ordering bug.
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        // NOTE: intentionally NO engine.refresh() — the on-disk index starts empty.
+        let engine = Arc::new(
+            Engine::new_with_embedder(cfg.clone(), Box::new(MockEmbedder::new("mock-v1", 64)))
+                .await
+                .unwrap(),
+        );
+
+        let report = run(&cfg, Ok(&engine)).await;
+
+        assert_eq!(
+            report.overall(),
+            Status::Pass,
+            "cold index must reconcile via the sample query, not FAIL:\n{}",
+            report.render()
+        );
     }
 }
