@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `omniscient --version` / `-V` and a corrected MCP `serverInfo` (previously
+  advertised as `rmcp`/`1.8.0`).
+- `diagnostics` MCP tool and `omniscient doctor` CLI command: an end-to-end
+  self-test (embedder connectivity, index population, live sample query) that
+  reports PASS/FAIL. Server instructions now direct agents to run `diagnostics`
+  before relying on `search` and to surface failures instead of silently
+  dropping the tool.
+
 ### Fixed
 
 - **MCP connect no longer times out while indexing a large repo.** The filesystem
