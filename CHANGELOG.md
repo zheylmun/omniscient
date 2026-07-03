@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **MCP connect no longer times out while indexing a large repo.** The filesystem
+  watcher was set up synchronously in `serve` before the stdio handshake, and
+  `notify`'s recursive watch walks the entire tree (gitignore-blind, so it descends
+  into `target/`, `node_modules/`, `.git/`) to build its file-id map. On a large
+  repo, cold, that walk outlasted the client's 30-second connect timeout. Watcher
+  setup now runs on a background blocking task, so `serve` reaches the handshake
+  immediately; the watcher activates once setup finishes and `search` scans until
+  then, so results are never stale during warm-up.
+
+### Changed
+
+- **`search`/`read_file` arguments now carry per-parameter schema descriptions.**
+  The `k` ceiling-not-a-target framing (and `query`/`path`/`focus` docs) previously
+  lived only in the tool's overall description; clients that render an argument list
+  now see it at the parameter level too.
+
 ## [0.1.1]
 
 ### Fixed
@@ -61,5 +81,6 @@ semantic, distilled code search over a repository.
   plus `languages`, `strip_comments`, `index_tests`, `exclude`); sensible defaults
   apply when the file is absent.
 
+[Unreleased]: https://github.com/zheylmun/omniscient/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/zheylmun/omniscient/releases/tag/v0.1.1
 [0.1.0]: https://github.com/zheylmun/omniscient/releases/tag/v0.1.0
