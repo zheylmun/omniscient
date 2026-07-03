@@ -162,27 +162,53 @@ fn render(entries: &[ContextEntry]) -> String {
     out
 }
 
+/// Holds the live filesystem watcher (once its deferred setup finishes). Dropping
+/// it stops watching and aborts the reconcile task, so `serve` keeps it to shutdown.
+type WatcherSlot = std::sync::Arc<std::sync::Mutex<Option<crate::watcher::WatchGuard>>>;
+
+/// Set up the file watcher WITHOUT blocking the caller. `notify`'s recursive watch
+/// builds its file-id map by walking the whole tree synchronously — and it is
+/// gitignore-blind, so it descends into `target/`, `node_modules/`, `.git/`, etc.
+/// On a large repo that walk can outlast an MCP client's connect timeout, so we run
+/// it on a blocking thread and return immediately, letting `serve` reach the stdio
+/// handshake right away. Until setup lands the guard in the slot and a first reconcile
+/// flips `watch_active`, `RefreshState::can_skip_scan()` stays false and `search`
+/// takes the full-scan path — so results are never stale during the warm-up window.
+fn spawn_watcher_deferred(
+    config: &Config,
+    lazy: LazyEngine,
+    state: std::sync::Arc<crate::refresh::RefreshState>,
+) -> WatcherSlot {
+    let slot: WatcherSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if !config.watch.enabled {
+        return slot;
+    }
+    let slot_for_task = slot.clone();
+    let repo = config.repo_root.clone();
+    let watch_cfg = config.watch.clone();
+    tokio::spawn(async move {
+        // The recursive watch walk is blocking I/O; keep it off the async workers.
+        match tokio::task::spawn_blocking(move || {
+            crate::watcher::spawn(&repo, &watch_cfg, lazy, state)
+        })
+        .await
+        {
+            Ok(Ok(guard)) => *slot_for_task.lock().unwrap() = Some(guard),
+            Ok(Err(e)) => tracing::warn!("file watcher disabled: {e}"),
+            Err(e) => tracing::warn!("file watcher setup task failed: {e}"),
+        }
+    });
+    slot
+}
+
 pub async fn serve(config: Config) -> Result<()> {
     let state = std::sync::Arc::new(crate::refresh::RefreshState::standalone());
     let lazy = LazyEngine::new(config.clone(), state.clone());
 
-    // Held until shutdown; dropping it stops watching and aborts the reconcile task.
-    let _watch_guard = if config.watch.enabled {
-        match crate::watcher::spawn(
-            &config.repo_root,
-            &config.watch,
-            lazy.clone(),
-            state.clone(),
-        ) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                tracing::warn!("file watcher disabled: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Set up the watcher off the handshake path so a large repo's recursive watch
+    // walk can't stall the MCP connect. Held until shutdown; dropping the slot stops
+    // watching and aborts the reconcile task.
+    let _watch_slot = spawn_watcher_deferred(&config, lazy.clone(), state.clone());
 
     let server = Server::new(lazy);
     let running = server
@@ -194,4 +220,79 @@ pub async fn serve(config: Config) -> Result<()> {
         .await
         .map_err(|e| crate::error::Error::Other(anyhow::anyhow!("mcp wait: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, WatchConfig};
+    use crate::embed::MockEmbedder;
+    use crate::engine::{Engine, LazyEngine};
+    use crate::refresh::RefreshState;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    async fn lazy_for(cfg: &Config, state: &Arc<RefreshState>) -> LazyEngine {
+        let engine = Arc::new(
+            Engine::with_refresh_state(
+                cfg.clone(),
+                Box::new(MockEmbedder::new("mock-v1", 64)),
+                state.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        LazyEngine::from_engine(cfg.clone(), state.clone(), engine)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_watcher_setup_activates_the_watcher() {
+        // The watcher is set up on a background blocking task (so a huge repo's
+        // recursive watch walk never blocks the MCP handshake), yet it must still
+        // come up and mark itself active once that setup finishes.
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.watch = WatchConfig {
+            enabled: true,
+            debounce_ms: 50,
+        };
+        let state = Arc::new(RefreshState::standalone());
+        let lazy = lazy_for(&cfg, &state).await;
+
+        let slot = spawn_watcher_deferred(&cfg, lazy, state.clone());
+
+        // Condition-based wait (no fixed sleep): setup + first reconcile flips active.
+        let mut active = false;
+        for _ in 0..100 {
+            if state.is_watch_active() {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(active, "deferred watcher setup should activate the watcher");
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "the live watcher guard must land in the slot"
+        );
+        drop(slot);
+    }
+
+    #[tokio::test]
+    async fn disabled_watch_yields_empty_slot_and_inactive_state() {
+        let repo = tempdir().unwrap();
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.watch.enabled = false;
+        let state = Arc::new(RefreshState::standalone());
+        let lazy = lazy_for(&cfg, &state).await;
+
+        let slot = spawn_watcher_deferred(&cfg, lazy, state.clone());
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "no watcher should be created when watching is disabled"
+        );
+        assert!(!state.is_watch_active());
+    }
 }
