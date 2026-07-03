@@ -296,6 +296,10 @@ impl LazyEngine {
         }
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub async fn get(&self) -> std::result::Result<Arc<Engine>, String> {
         self.inner
             .get_or_try_init(|| async {

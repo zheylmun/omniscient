@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod distill;
 pub mod embed;
 pub mod engine;
