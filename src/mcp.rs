@@ -7,7 +7,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
@@ -124,6 +124,7 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("omniscient", env!("CARGO_PKG_VERSION")))
             .with_instructions("Local semantic code search (omniscient). Tools: search, read_file.")
     }
 
@@ -306,5 +307,17 @@ mod tests {
             "no watcher should be created when watching is disabled"
         );
         assert!(!state.is_watch_active());
+    }
+
+    #[tokio::test]
+    async fn server_info_reports_omniscient_version() {
+        let repo = tempdir().unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let lazy = lazy_for(&cfg, &state).await;
+        let server = Server::new(lazy);
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, "omniscient");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 }

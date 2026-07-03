@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "omniscient")]
+#[command(name = "omniscient", version)]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
