@@ -16,14 +16,26 @@ use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_router};
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SearchParams {
+    /// Natural-language or code query. Matches by meaning, not literal tokens, so
+    /// it finds relevant code even when your query words never appear in it.
     query: String,
+    /// Optional ceiling on how many results come back (it overrides the configured
+    /// `max_results` for this call) — NOT a target. Results are selected by
+    /// relevance shape: every hit within a set ratio of the top hit is returned, so
+    /// a sharp query yields a few and a broad one more. Omit it to let the relevance
+    /// distribution decide; set it only to cap an over-broad query.
     #[serde(default)]
     k: Option<u32>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct ReadFileParams {
+    /// Repo-relative path of the file to read. Read live from disk, so it reflects
+    /// uncommitted edits.
     path: String,
+    /// Optional natural-language description of what you're looking for. Omit for a
+    /// structural outline (every definition's signature + line range, bodies elided);
+    /// provide it to get back only the chunks of the file most relevant to it.
     #[serde(default)]
     focus: Option<String>,
 }
