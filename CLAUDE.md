@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes exactly two stdio tools — `search(query, k?)` and `read_file(path, focus?)`. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
+`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes three stdio tools — `search(query, k?)`, `read_file(path, focus?)`, and `diagnostics()` (an end-to-end self-test). `diagnostics` runs only on explicit call, never on the connect handshake, so the fast-handshake invariant is preserved. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
 
 ## Commands
 
