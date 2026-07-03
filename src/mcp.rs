@@ -130,7 +130,7 @@ omniscient. Takes no arguments."
         let engine = self.engine.get().await;
         let report = crate::diagnostics::run(
             self.engine.config(),
-            engine.as_ref().map_err(|e| e.as_str()),
+            engine.as_ref().map_err(String::as_str),
         )
         .await;
         report.render()

@@ -138,7 +138,7 @@ pub fn run() -> anyhow::Result<()> {
                     .map(Arc::new)
                     .map_err(|e| e.to_string());
                 let report =
-                    crate::diagnostics::run(&cfg, engine.as_ref().map_err(|e| e.as_str())).await;
+                    crate::diagnostics::run(&cfg, engine.as_ref().map_err(String::as_str)).await;
                 print!("{}", report.render());
                 if report.overall() == crate::diagnostics::Status::Fail {
                     std::process::exit(1);

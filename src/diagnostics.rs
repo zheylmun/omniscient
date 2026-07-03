@@ -66,125 +66,138 @@ impl Report {
 /// Run every check we can and classify each — never abort on the first failure,
 /// because the whole point is to report *which* stage is broken.
 pub async fn run(config: &Config, engine: std::result::Result<&Arc<Engine>, &str>) -> Report {
-    let mut checks = Vec::new();
+    let mut checks = vec![build_check(), repo_check(config)];
+    checks.push(embedder_check(config, engine).await);
+    checks.extend(index_and_query_checks(engine).await);
+    checks.push(watcher_check(config, engine));
+    Report { checks }
+}
 
-    // Build — always informational.
-    checks.push(Check {
+/// Build/version — always informational.
+fn build_check() -> Check {
+    Check {
         name: "build".into(),
         status: Status::Pass,
         detail: format!("omniscient {}", env!("CARGO_PKG_VERSION")),
-    });
+    }
+}
 
-    // Repo + config source.
+/// Resolved repo root + whether config came from a file or built-in defaults.
+fn repo_check(config: &Config) -> Check {
     let cfg_file = config.repo_root.join("omniscient.toml");
     let source = if cfg_file.exists() {
         format!("config {}", cfg_file.display())
     } else {
         "built-in defaults (no omniscient.toml)".into()
     };
-    checks.push(Check {
+    Check {
         name: "repo".into(),
         status: Status::Pass,
         detail: format!("{} — {source}", config.repo_root.display()),
-    });
+    }
+}
 
-    // Embedder.
+/// Embedder connectivity. On engine-init failure, a TCP probe of the endpoint
+/// disambiguates "endpoint down" from other init errors and drives the hint.
+async fn embedder_check(config: &Config, engine: std::result::Result<&Arc<Engine>, &str>) -> Check {
     match engine {
-        Ok(e) => checks.push(Check {
+        Ok(e) => Check {
             name: "embedder".into(),
             status: Status::Pass,
             detail: format!("{} @ {}", e.embedder_id(), config.embedder.base_url),
-        }),
+        },
         Err(err) => {
-            let listening = endpoint_listening(&config.embedder.base_url).await;
-            let hint = if listening {
+            let hint = if endpoint_listening(&config.embedder.base_url).await {
                 "endpoint is listening but init failed"
             } else {
                 "endpoint not listening — start llama.cpp or set [embedder] auto_start = true"
             };
-            checks.push(Check {
+            Check {
                 name: "embedder".into(),
                 status: Status::Fail,
                 detail: format!("{} — {err} ({hint})", config.embedder.base_url),
-            });
+            }
         }
     }
+}
 
-    // Index + end-to-end query (only meaningful when the engine is up).
-    match engine {
-        Ok(e) => {
-            // Run the sample query FIRST: search() reconciles via ensure_fresh(), so a
-            // cold / not-yet-reconciled index gets populated before we read stats().
-            // stats() does not reconcile, so reading it first would FAIL a healthy
-            // server whose index just hasn't been built yet (the cold-start case this
-            // tool is meant to be called in).
-            let query_result = e.search("function definition", Some(1)).await;
-            match e.stats().await {
-                Ok((files, chunks)) if chunks == 0 => checks.push(Check {
-                    name: "index".into(),
-                    status: Status::Fail,
-                    detail: format!("{files} files, 0 chunks — nothing indexed"),
-                }),
-                Ok((files, chunks)) => checks.push(Check {
-                    name: "index".into(),
-                    status: Status::Pass,
-                    detail: format!("{files} files, {chunks} chunks"),
-                }),
-                Err(err) => checks.push(Check {
-                    name: "index".into(),
-                    status: Status::Fail,
-                    detail: err.to_string(),
-                }),
-            }
-            match query_result {
-                Ok(hits) if hits.is_empty() => checks.push(Check {
-                    name: "query".into(),
-                    status: Status::Warn,
-                    detail: "sample query returned no matches (index may be empty or query too specific)".into(),
-                }),
-                Ok(hits) => checks.push(Check {
-                    name: "query".into(),
-                    status: Status::Pass,
-                    detail: format!("sample query returned {} result(s)", hits.len()),
-                }),
-                Err(err) => checks.push(Check {
-                    name: "query".into(),
-                    status: Status::Fail,
-                    detail: format!("sample query failed: {err}"),
-                }),
-            }
-        }
-        Err(_) => {
-            checks.push(Check {
+/// Index population + a live end-to-end sample query. Only meaningful when the
+/// engine is up; both are FAIL-skipped otherwise.
+async fn index_and_query_checks(engine: std::result::Result<&Arc<Engine>, &str>) -> [Check; 2] {
+    let Ok(e) = engine else {
+        return [
+            Check {
                 name: "index".into(),
                 status: Status::Fail,
                 detail: "skipped — engine unavailable".into(),
-            });
-            checks.push(Check {
+            },
+            Check {
                 name: "query".into(),
                 status: Status::Fail,
                 detail: "skipped — engine unavailable".into(),
-            });
-        }
-    }
+            },
+        ];
+    };
+    // Run the sample query FIRST: search() reconciles via ensure_fresh(), so a
+    // cold / not-yet-reconciled index gets populated before we read stats().
+    // stats() does not reconcile, so reading it first would FAIL a healthy
+    // server whose index just hasn't been built yet (the cold-start case this
+    // tool is meant to be called in).
+    let query_result = e.search("function definition", Some(1)).await;
+    let index = match e.stats().await {
+        Ok((files, 0)) => Check {
+            name: "index".into(),
+            status: Status::Fail,
+            detail: format!("{files} files, 0 chunks — nothing indexed"),
+        },
+        Ok((files, chunks)) => Check {
+            name: "index".into(),
+            status: Status::Pass,
+            detail: format!("{files} files, {chunks} chunks"),
+        },
+        Err(err) => Check {
+            name: "index".into(),
+            status: Status::Fail,
+            detail: err.to_string(),
+        },
+    };
+    let query = match query_result {
+        Ok(hits) if hits.is_empty() => Check {
+            name: "query".into(),
+            status: Status::Warn,
+            detail: "sample query returned no matches (index may be empty or query too specific)"
+                .into(),
+        },
+        Ok(hits) => Check {
+            name: "query".into(),
+            status: Status::Pass,
+            detail: format!("sample query returned {} result(s)", hits.len()),
+        },
+        Err(err) => Check {
+            name: "query".into(),
+            status: Status::Fail,
+            detail: format!("sample query failed: {err}"),
+        },
+    };
+    [index, query]
+}
 
-    // Watcher — informational.
-    let watch_detail = if !config.watch.enabled {
-        "disabled".to_string()
-    } else {
+/// Watcher state — informational (enabled-but-warming is expected on cold start).
+fn watcher_check(config: &Config, engine: std::result::Result<&Arc<Engine>, &str>) -> Check {
+    let detail = if config.watch.enabled {
         match engine {
             Ok(e) if e.refresh_state().is_watch_active() => "enabled, active".into(),
             Ok(_) => "enabled, warming up (scan-on-search until caught up)".into(),
             Err(_) => "enabled (status unknown — engine unavailable)".into(),
         }
+    } else {
+        "disabled".to_string()
     };
-    checks.push(Check {
+    Check {
         name: "watcher".into(),
         status: Status::Pass,
-        detail: watch_detail,
-    });
-
-    Report { checks }
+        detail,
+    }
 }
 
 #[cfg(test)]
