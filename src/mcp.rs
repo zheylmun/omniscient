@@ -7,7 +7,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
@@ -119,12 +119,34 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
             },
         }
     }
+
+    #[tool(
+        description = "Self-test the omniscient server end-to-end and return a PASS/FAIL \
+report: embedder connectivity, index population, and a live sample query. Call this once before \
+relying on `search` — if it reports FAIL, tell the user what failed instead of silently skipping \
+omniscient. Takes no arguments."
+    )]
+    async fn diagnostics(&self) -> String {
+        let engine = self.engine.get().await;
+        let report = crate::diagnostics::run(
+            self.engine.config(),
+            engine.as_ref().map_err(String::as_str),
+        )
+        .await;
+        report.render()
+    }
 }
 
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Local semantic code search (omniscient). Tools: search, read_file.")
+            .with_server_info(Implementation::new("omniscient", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Local semantic code search (omniscient). Tools: search, read_file, diagnostics.\n\
+                 Before relying on search, call `diagnostics` once to confirm the server is \
+                 healthy. If it reports FAIL, tell the user what failed instead of skipping \
+                 omniscient — do not silently ignore search errors.",
+            )
     }
 
     fn call_tool(
@@ -306,5 +328,43 @@ mod tests {
             "no watcher should be created when watching is disabled"
         );
         assert!(!state.is_watch_active());
+    }
+
+    #[tokio::test]
+    async fn server_info_reports_omniscient_version() {
+        let repo = tempdir().unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let lazy = lazy_for(&cfg, &state).await;
+        let server = Server::new(lazy);
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, "omniscient");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_tool_listed_and_returns_report() {
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let lazy = lazy_for(&cfg, &state).await;
+        let server = Server::new(lazy);
+
+        // Tool is advertised.
+        let names: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.contains(&"diagnostics".to_string()),
+            "tools: {names:?}"
+        );
+
+        // And it produces a report string.
+        let out = server.diagnostics().await;
+        assert!(out.contains("omniscient diagnostics:"), "out:\n{out}");
     }
 }

@@ -3,9 +3,10 @@ use crate::config::Config;
 use crate::engine::Engine;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "omniscient")]
+#[command(name = "omniscient", version)]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -20,6 +21,8 @@ enum Cmd {
     Serve,
     Status,
     Reindex,
+    /// End-to-end health check: embedder, index, and a live sample query.
+    Doctor,
 }
 
 /// First ancestor of `start` (inclusive) that contains a `.git` entry. `.git` is
@@ -121,6 +124,25 @@ pub fn run() -> anyhow::Result<()> {
                 let engine = Engine::new(cfg).await?;
                 engine.refresh().await?;
                 println!("reindex complete");
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Cmd::Doctor => {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
+            let cfg = load(&cli)?;
+            rt.block_on(async {
+                let engine = Engine::new(cfg.clone())
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string());
+                let report =
+                    crate::diagnostics::run(&cfg, engine.as_ref().map_err(String::as_str)).await;
+                print!("{}", report.render());
+                if report.overall() == crate::diagnostics::Status::Fail {
+                    std::process::exit(1);
+                }
                 Ok::<_, anyhow::Error>(())
             })?;
         }

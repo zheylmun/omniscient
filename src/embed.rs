@@ -106,7 +106,7 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
 /// to distinguish "nothing is bound here" (safe to spawn) from "a server is up but
 /// answered badly" (must not spawn over it). A malformed URL or DNS failure counts
 /// as not listening.
-async fn endpoint_listening(base_url: &str) -> bool {
+pub(crate) async fn endpoint_listening(base_url: &str) -> bool {
     let Ok((host, port)) = parse_host_port(base_url) else {
         return false;
     };

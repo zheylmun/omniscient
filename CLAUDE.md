@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes exactly two stdio tools — `search(query, k?)` and `read_file(path, focus?)`. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
+`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes three stdio tools — `search(query, k?)`, `read_file(path, focus?)`, and `diagnostics()` (an end-to-end self-test). `diagnostics` runs only on explicit call, never on the connect handshake, so the fast-handshake invariant is preserved. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
 
 ## Commands
 
@@ -16,6 +16,8 @@ cargo test chunk::          # run one module's tests (chunk|config|embed|index|f
 cargo test --test integration   # the end-to-end integration test
 cargo test embed::live -- --ignored   # the ONE network test: needs a running llama.cpp embeddings server
 
+cargo clippy --all-targets -- -D warnings   # the lint gate the pre-push hook enforces (clippy pedantic)
+
 # Run the server / debug the index (require a reachable embeddings endpoint to build the Engine):
 cargo run -- serve --repo <path>      # stdio MCP server
 cargo run -- status --repo <path>     # embedder id + file/chunk counts
@@ -23,6 +25,8 @@ cargo run -- reindex --repo <path>    # delete .omniscient/ then rebuild
 ```
 
 The whole suite runs offline because tests inject `embed::MockEmbedder` (deterministic, in `src/embed.rs`). Only the `#[ignore]`d `embed::live` test hits a real server.
+
+**Every implementation task's verification must include `cargo clippy --all-targets -- -D warnings`, not just `cargo build`/`cargo test`.** The pre-push hook runs clippy at the `pedantic` level (`[lints.clippy]` in `Cargo.toml`) promoted to errors — code that builds and tests green can still be rejected at push time. Fix lints idiomatically (this codebase uses **no** inline `#[allow(clippy::…)]`); prefer splitting an over-long fn into helpers over silencing `too_many_lines`. When writing plans, add the clippy step to each task's verification alongside the test run.
 
 ## Architecture
 
