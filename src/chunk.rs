@@ -23,6 +23,7 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some("rust"),
         Some("py") => Some("python"),
+        Some("js" | "jsx") => Some("javascript"),
         Some("ts" | "tsx") => Some("typescript"),
         _ => None,
     }
@@ -80,6 +81,7 @@ fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
     match lang {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         _ => None,
     }
@@ -95,6 +97,13 @@ fn def_kinds(lang: &str) -> &'static [&'static str] {
             "impl_item",
         ],
         "python" => &["function_definition", "class_definition"],
+        "javascript" => &[
+            "function_declaration",
+            "class_declaration",
+            "method_definition",
+            "lexical_declaration",
+            "variable_declaration",
+        ],
         "typescript" => &[
             "function_declaration",
             "class_declaration",
