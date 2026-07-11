@@ -115,7 +115,11 @@ pub struct Config {
     pub search: SearchConfig,
     pub watch: WatchConfig,
     pub languages: Vec<String>,
-    pub strip_comments: bool,
+    /// Strip leading banner comments (license headers, module doc comments) from
+    /// the code returned in search results. Does NOT strip inline or trailing
+    /// comments — those carry implementation intent.
+    #[serde(alias = "strip_comments")]
+    pub strip_banner_comments: bool,
     /// Extra glob patterns to skip when indexing, unioned with the built-in
     /// test/fixture excludes (see `freshness`). Matched against repo-relative paths.
     pub exclude: Vec<String>,
@@ -131,7 +135,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             watch: WatchConfig::default(),
             languages: vec!["rust".into(), "python".into(), "typescript".into()],
-            strip_comments: true,
+            strip_banner_comments: true,
             exclude: Vec::new(),
             index_tests: false,
         }
