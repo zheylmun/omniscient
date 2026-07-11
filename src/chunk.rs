@@ -8,7 +8,7 @@ use std::path::Path;
 /// The index records it in `meta.json`; a mismatch forces a full reindex, the
 /// same way a changed embedder id does — otherwise already-indexed files keep
 /// their pre-change chunks until their content hash happens to change.
-pub const CHUNKER_VERSION: u32 = 1;
+pub const CHUNKER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -24,7 +24,8 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         Some("rs") => Some("rust"),
         Some("py") => Some("python"),
         Some("js" | "jsx") => Some("javascript"),
-        Some("ts" | "tsx") => Some("typescript"),
+        Some("ts") => Some("typescript"),
+        Some("tsx") => Some("tsx"),
         _ => None,
     }
 }
@@ -83,6 +84,7 @@ fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         _ => None,
     }
 }
@@ -104,7 +106,7 @@ fn def_kinds(lang: &str) -> &'static [&'static str] {
             "lexical_declaration",
             "variable_declaration",
         ],
-        "typescript" => &[
+        "typescript" | "tsx" => &[
             "function_declaration",
             "class_declaration",
             "interface_declaration",
@@ -298,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn python_ts_and_js_recognized() {
+    fn python_ts_js_tsx_jsx_recognized() {
         let py = read("tests/fixtures/sample.py");
         let c = chunk_file(Path::new("tests/fixtures/sample.py"), &py, 100).unwrap();
         assert!(c.iter().any(|c| c.symbol.as_deref() == Some("alpha")));
@@ -309,6 +311,16 @@ mod tests {
         let js = read("tests/fixtures/sample.js");
         let c = chunk_file(Path::new("tests/fixtures/sample.js"), &js, 100).unwrap();
         assert!(c.iter().any(|c| c.symbol.as_deref() == Some("alpha")));
+        assert!(c.iter().all(|c| c.language == "javascript"));
+        // TSX uses the dedicated TSX grammar, not the TS grammar.
+        let tsx = read("tests/fixtures/sample.tsx");
+        let c = chunk_file(Path::new("tests/fixtures/sample.tsx"), &tsx, 100).unwrap();
+        assert!(c.iter().any(|c| c.symbol.as_deref() == Some("Alpha")));
+        assert!(c.iter().all(|c| c.language == "tsx"));
+        // JSX uses the JavaScript grammar (no separate JSX grammar exists).
+        let jsx = read("tests/fixtures/sample.jsx");
+        let c = chunk_file(Path::new("tests/fixtures/sample.jsx"), &jsx, 100).unwrap();
+        assert!(c.iter().any(|c| c.symbol.as_deref() == Some("Alpha")));
         assert!(c.iter().all(|c| c.language == "javascript"));
     }
 
@@ -395,6 +407,27 @@ mod tests {
             chunks.len(),
             2,
             "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn tsx_no_over_chunking() {
+        let src = read("tests/fixtures/sample.tsx");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample.tsx"), &src, 100).unwrap();
+        // render is a method inside class Point — must NOT be a standalone chunk
+        assert!(
+            !chunks.iter().any(|c| c.symbol.as_deref() == Some("render")),
+            "render should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        );
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"Alpha"), "Alpha missing from {symbols:?}");
+        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert!(chunks.iter().all(|c| c.language == "tsx"));
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly 2 chunks (Alpha, Point), got {}: {chunks:?}",
             chunks.len()
         );
     }
