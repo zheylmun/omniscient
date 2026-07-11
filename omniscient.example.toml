@@ -37,6 +37,7 @@ llama_bin = "llama"                                 # llama.cpp CLI binary
 hf_repo = "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M"     # GGUF repo[:quant], downloaded on first run
 pooling = "last"                                    # last = Qwen3-Embedding; mean = BERT-family
 auto_start_timeout_secs = 600                       # max seconds to wait for readiness
+request_timeout_secs = 30                           # seconds per HTTP embedding request
 
 [search]
 # Results are selected by the *shape* of the relevance scores, not a fixed count:
@@ -46,6 +47,7 @@ auto_start_timeout_secs = 600                       # max seconds to wait for re
 relevance_ratio = 0.75   # keep hits within 75% of the top hit's score
 max_results = 25         # ceiling on candidates fetched + results returned
 token_budget = 4000
+search_timeout_secs = 60   # seconds for entire search (ensure_fresh + embed + index + distill)
 
 [watch]
 enabled = true      # set false to disable the filesystem watcher

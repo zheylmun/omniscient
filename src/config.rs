@@ -30,6 +30,9 @@ pub struct EmbedderConfig {
     /// before giving up. Generous by default because the first run downloads the
     /// model.
     pub auto_start_timeout_secs: u64,
+    /// Timeout in seconds for each HTTP request to the embeddings endpoint.
+    /// Guards against a hanging llama.cpp server blocking the MCP tool call.
+    pub request_timeout_secs: u64,
 }
 impl Default for EmbedderConfig {
     fn default() -> Self {
@@ -43,6 +46,7 @@ impl Default for EmbedderConfig {
             hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
             pooling: "last".into(),
             auto_start_timeout_secs: 600,
+            request_timeout_secs: 30,
         }
     }
 }
@@ -72,6 +76,9 @@ pub struct SearchConfig {
     /// Clamped to `[0.0, 1.0]`; the best match is always returned.
     pub relevance_ratio: f32,
     pub token_budget: usize,
+    /// Timeout in seconds for the entire `search` operation (`ensure_fresh` + embed
+    /// + index query + distill). Guards against any step hanging indefinitely.
+    pub search_timeout_secs: u64,
 }
 impl Default for SearchConfig {
     fn default() -> Self {
@@ -79,6 +86,7 @@ impl Default for SearchConfig {
             max_results: 25,
             relevance_ratio: 0.75,
             token_budget: 4000,
+            search_timeout_secs: 60,
         }
     }
 }
@@ -438,5 +446,28 @@ mod tests {
             !c.is_language_allowed(Path::new("app.ts"), Some("typescript")),
             "typescript should be blocked"
         );
+    }
+
+    #[test]
+    fn timeout_defaults_and_parse() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(
+            c.embedder.request_timeout_secs, 30,
+            "embedder timeout defaults to 30s"
+        );
+        assert_eq!(
+            c.search.search_timeout_secs, 60,
+            "search timeout defaults to 60s"
+        );
+
+        let toml = r"
+            [embedder]
+            request_timeout_secs = 10
+            [search]
+            search_timeout_secs = 120
+        ";
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.request_timeout_secs, 10);
+        assert_eq!(c.search.search_timeout_secs, 120);
     }
 }

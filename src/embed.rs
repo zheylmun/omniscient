@@ -80,7 +80,13 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
     // Always prefer an already-running endpoint: connect first, and only fall
     // through to spawning when that fails AND auto_start is enabled. This means a
     // user-managed server is used as-is and never spawned over.
-    match LlamaCppEmbedder::connect(cfg.base_url.clone(), cfg.model.clone()).await {
+    match LlamaCppEmbedder::connect(
+        cfg.base_url.clone(),
+        cfg.model.clone(),
+        cfg.request_timeout_secs,
+    )
+    .await
+    {
         Ok(e) => return Ok(Box::new(e)),
         Err(e) if !cfg.auto_start => return Err(e),
         Err(e) => {
@@ -247,7 +253,13 @@ async fn connect_managed(
                 server.bin
             )));
         }
-        match LlamaCppEmbedder::connect(cfg.base_url.clone(), cfg.model.clone()).await {
+        match LlamaCppEmbedder::connect(
+            cfg.base_url.clone(),
+            cfg.model.clone(),
+            cfg.request_timeout_secs,
+        )
+        .await
+        {
             Ok(e) => {
                 tracing::info!("llama.cpp embeddings server is ready");
                 return Ok(e.with_server(server));
@@ -320,12 +332,20 @@ pub struct LlamaCppEmbedder {
 }
 
 impl LlamaCppEmbedder {
-    pub async fn connect(base_url: String, model: String) -> Result<Self> {
+    pub async fn connect(
+        base_url: String,
+        model: String,
+        request_timeout_secs: u64,
+    ) -> Result<Self> {
+        let client = reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(request_timeout_secs.max(1)))
+            .build()
+            .map_err(|e| Error::Embed(format!("failed to build HTTP client: {e}")))?;
         let mut e = Self {
             base_url,
             model,
             dim: 0,
-            client: reqwest::Client::new(),
+            client,
             server: None,
         };
         let probe = e.embed_raw(&["probe".to_string()]).await?;
@@ -653,10 +673,13 @@ mod live {
     #[tokio::test]
     #[ignore = "requires a running llama.cpp embeddings server"]
     async fn live_embed_dim_and_norm() {
-        let e =
-            LlamaCppEmbedder::connect("http://localhost:8080".into(), "qwen3-embedding-4b".into())
-                .await
-                .unwrap();
+        let e = LlamaCppEmbedder::connect(
+            "http://localhost:8080".into(),
+            "qwen3-embedding-4b".into(),
+            30,
+        )
+        .await
+        .unwrap();
         assert!(e.dim() > 0);
         let v = e.embed(&["fn main() {}".into()]).await.unwrap();
         let n: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
