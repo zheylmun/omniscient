@@ -157,6 +157,30 @@ impl Config {
             ))),
         }
     }
+
+    /// Check if a file should be indexed based on the language whitelist.
+    ///
+    /// Empty `languages` → allow all. Otherwise, matches both the chunker's
+    /// detected language name ("rust", "python", "typescript") and the raw
+    /// extension ("rs", "py", "ts", "tsx"), so a user specifying either works.
+    pub fn is_language_allowed(&self, path: &Path, detected_language: Option<&str>) -> bool {
+        if self.languages.is_empty() {
+            return true;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        let ext_matches = ext
+            .as_deref()
+            .is_some_and(|e| self.languages.iter().any(|l| l.eq_ignore_ascii_case(e)));
+        let lang_matches = detected_language.is_some_and(|l| {
+            self.languages
+                .iter()
+                .any(|lang| lang.eq_ignore_ascii_case(l))
+        });
+        ext_matches || lang_matches
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +335,108 @@ mod tests {
         let limits = c.embedder.batch_limits();
         assert_eq!(limits.max_chunks, 1);
         assert_eq!(limits.max_bytes, 1);
+    }
+
+    #[test]
+    fn is_language_allowed_empty_whitelist_allows_all() {
+        let c = Config {
+            languages: vec![],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(c.is_language_allowed(Path::new("lib.rs"), Some("rust")));
+        assert!(c.is_language_allowed(Path::new("lib.py"), Some("python")));
+        assert!(c.is_language_allowed(Path::new("README.md"), None));
+        assert!(c.is_language_allowed(Path::new("Cargo.toml"), None));
+    }
+
+    #[test]
+    fn is_language_allowed_matches_by_language_name() {
+        let c = Config {
+            languages: vec!["rust".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c.is_language_allowed(Path::new("lib.rs"), Some("rust")),
+            "rust name matches rust"
+        );
+        assert!(
+            !c.is_language_allowed(Path::new("lib.py"), Some("python")),
+            "python should be blocked"
+        );
+        assert!(
+            !c.is_language_allowed(Path::new("README.md"), None),
+            "unknown language with no extension match should be blocked"
+        );
+    }
+
+    #[test]
+    fn is_language_allowed_matches_by_extension() {
+        let c = Config {
+            languages: vec!["md".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c.is_language_allowed(Path::new("README.md"), None),
+            "md extension should match"
+        );
+        assert!(
+            !c.is_language_allowed(Path::new("lib.rs"), Some("rust")),
+            "rust should be blocked"
+        );
+    }
+
+    #[test]
+    fn is_language_allowed_case_insensitive() {
+        let c = Config {
+            languages: vec!["Rust".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c.is_language_allowed(Path::new("lib.rs"), Some("rust")),
+            "Rust config should match rust language (name match)"
+        );
+        assert!(
+            !c.is_language_allowed(Path::new("lib.rs"), None),
+            "Rust config should NOT match .rs extension (different strings)"
+        );
+        // Extension match works when config uses the extension form
+        let c2 = Config {
+            languages: vec!["rs".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c2.is_language_allowed(Path::new("lib.rs"), None),
+            "rs config should match .rs extension"
+        );
+    }
+
+    #[test]
+    fn is_language_allowed_typescript_matches_both_ts_and_tsx() {
+        let c = Config {
+            languages: vec!["typescript".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c.is_language_allowed(Path::new("app.ts"), Some("typescript")),
+            ".ts with typescript language should match"
+        );
+        assert!(
+            c.is_language_allowed(Path::new("App.tsx"), Some("typescript")),
+            ".tsx with typescript language should match"
+        );
+    }
+
+    #[test]
+    fn is_language_allowed_multiple_languages() {
+        let c = Config {
+            languages: vec!["rust".into(), "python".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(c.is_language_allowed(Path::new("lib.rs"), Some("rust")));
+        assert!(c.is_language_allowed(Path::new("main.py"), Some("python")));
+        assert!(
+            !c.is_language_allowed(Path::new("app.ts"), Some("typescript")),
+            "typescript should be blocked"
+        );
     }
 }
