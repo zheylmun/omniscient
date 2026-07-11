@@ -185,25 +185,36 @@ impl Engine {
     }
 
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
-        self.ensure_fresh().await?;
-        // `k` is the candidate ceiling, not a target: relevance-shape selection in
-        // `distill_context` trims this pool down to results of similar relevance.
-        let k = k.unwrap_or(self.config.search.max_results).max(1);
-        let qv = self.embed_one(query).await?;
-        let hits = self.index.search(&qv, k).await?;
-        // Enforce the exclude policy at read time too: even if the index hasn't
-        // reconciled away an excluded file yet (lag window — embedder was down,
-        // mid-reconcile on a large repo, watcher not caught up), never surface it.
-        let hits: Vec<_> = hits
-            .into_iter()
-            .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
-            .collect();
-        Ok(distill_context(
-            hits,
-            self.config.strip_comments,
-            self.config.search.token_budget,
-            self.config.search.relevance_ratio,
-        ))
+        let timeout = std::time::Duration::from_secs(self.config.search.search_timeout_secs.max(1));
+        tokio::time::timeout(timeout, async {
+            self.ensure_fresh().await?;
+            // `k` is the candidate ceiling, not a target: relevance-shape selection in
+            // `distill_context` trims this pool down to results of similar relevance.
+            let k = k.unwrap_or(self.config.search.max_results).max(1);
+            let qv = self.embed_one(query).await?;
+            let hits = self.index.search(&qv, k).await?;
+            // Enforce the exclude policy at read time too: even if the index hasn't
+            // reconciled away an excluded file yet (lag window — embedder was down,
+            // mid-reconcile on a large repo, watcher not caught up), never surface it.
+            let hits: Vec<_> = hits
+                .into_iter()
+                .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
+                .collect();
+            Ok(distill_context(
+                hits,
+                self.config.strip_comments,
+                self.config.search.token_budget,
+                self.config.search.relevance_ratio,
+            ))
+        })
+        .await
+        .map_err(|_| {
+            Error::Timeout(format!(
+                "search timed out after {}s — ensure_fresh + embed + index query exceeded the \
+                 limit (set [search] search_timeout_secs)",
+                self.config.search.search_timeout_secs
+            ))
+        })?
     }
 
     pub async fn read_file(&self, path: &str, focus: Option<&str>) -> Result<Vec<ContextEntry>> {
@@ -782,6 +793,48 @@ mod tests {
         assert!(
             hits.iter().any(|e| e.path == "lib.rs"),
             "rust file should appear in search results"
+        );
+    }
+
+    /// Slow embedder that sleeps on every call — used to verify search timeout fires.
+    struct SlowEmbedder {
+        inner: MockEmbedder,
+    }
+    #[async_trait]
+    impl Embedder for SlowEmbedder {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            self.inner.embed(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn search_times_out_when_embedder_is_slow() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.search_timeout_secs = 1; // very short timeout
+        let engine = Engine::new_with_embedder(
+            cfg,
+            Box::new(SlowEmbedder {
+                inner: MockEmbedder::new("mock-v1", 64),
+            }),
+        )
+        .await
+        .unwrap();
+        // Index is empty and clean, so ensure_fresh returns Ok fast; embed_one(query)
+        // will sleep 10s but the overall search timeout is 1s.
+        let err = engine.search("anything", Some(3)).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Timeout(_)),
+            "expected Error::Timeout, got {err:?}"
         );
     }
 }

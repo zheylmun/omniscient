@@ -12,6 +12,8 @@ pub enum Error {
     Index(String),
     #[error("chunking: {0}")]
     Chunk(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
