@@ -23,6 +23,7 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some("rust"),
         Some("py") => Some("python"),
+        Some("js" | "jsx") => Some("javascript"),
         Some("ts" | "tsx") => Some("typescript"),
         _ => None,
     }
@@ -80,6 +81,7 @@ fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
     match lang {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         _ => None,
     }
@@ -95,6 +97,13 @@ fn def_kinds(lang: &str) -> &'static [&'static str] {
             "impl_item",
         ],
         "python" => &["function_definition", "class_definition"],
+        "javascript" => &[
+            "function_declaration",
+            "class_declaration",
+            "method_definition",
+            "lexical_declaration",
+            "variable_declaration",
+        ],
         "typescript" => &[
             "function_declaration",
             "class_declaration",
@@ -289,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn python_and_ts_recognized() {
+    fn python_ts_and_js_recognized() {
         let py = read("tests/fixtures/sample.py");
         let c = chunk_file(Path::new("tests/fixtures/sample.py"), &py, 100).unwrap();
         assert!(c.iter().any(|c| c.symbol.as_deref() == Some("alpha")));
@@ -297,6 +306,10 @@ mod tests {
         let c = chunk_file(Path::new("tests/fixtures/sample.ts"), &ts, 100).unwrap();
         assert!(c.iter().any(|c| c.symbol.as_deref() == Some("alpha")));
         assert!(c.iter().all(|c| c.language == "typescript"));
+        let js = read("tests/fixtures/sample.js");
+        let c = chunk_file(Path::new("tests/fixtures/sample.js"), &js, 100).unwrap();
+        assert!(c.iter().any(|c| c.symbol.as_deref() == Some("alpha")));
+        assert!(c.iter().all(|c| c.language == "javascript"));
     }
 
     #[test]
@@ -377,6 +390,26 @@ mod tests {
             symbols.contains(&"alpha"),
             "alpha (exported fn) missing from {symbols:?}"
         );
+        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn javascript_no_over_chunking() {
+        let src = read("tests/fixtures/sample.js");
+        let chunks = chunk_file(Path::new("tests/fixtures/sample.js"), &src, 100).unwrap();
+        // beta is a method inside class Point — must NOT be a standalone chunk
+        assert!(
+            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
+            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        );
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
         assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
         assert_eq!(
             chunks.len(),
