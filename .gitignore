@@ -8,3 +8,7 @@
 .claude/
 
 omniscient.toml
+
+# Local llama.cpp preset configs
+presets.ini
+ROADMAP.md

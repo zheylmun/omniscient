@@ -1,5 +1,5 @@
 //! Engine: ties freshness + embed + index + distill into the always-fresh search path.
-use crate::chunk::chunk_file;
+use crate::chunk::{chunk_file, language_for_path};
 use crate::config::Config;
 use crate::distill::{ContextEntry, distill_context};
 use crate::embed::{Embedder, build_embedder};
@@ -119,6 +119,11 @@ impl Engine {
             .collect();
 
         for path in &delta.changed {
+            // Gate on the language whitelist: skip files not in the configured languages.
+            let detected = language_for_path(Path::new(path));
+            if !self.config.is_language_allowed(Path::new(path), detected) {
+                continue;
+            }
             let abs = self.config.repo_root.join(path);
             let Ok(source) = std::fs::read_to_string(&abs) else {
                 continue;
@@ -425,9 +430,10 @@ mod tests {
         fs::write(repo.path().join("keep.rs"), "pub fn keep() {}\n").unwrap();
         fs::write(repo.path().join("data.txt"), "noise noise noise\n").unwrap();
 
-        // First engine: no excludes -> indexes both files.
+        // First engine: no excludes, no language filter -> indexes both files.
         {
             let mut cfg = Config::default_for(repo.path().to_path_buf());
+            cfg.languages = vec![]; // allow all languages
             cfg.index_tests = true;
             let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
                 .await
@@ -444,6 +450,7 @@ mod tests {
         // must purge the previously-indexed file (this is what should happen when a
         // new built-in/config exclusion ships and the daemon reconciles).
         let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.languages = vec![]; // allow all languages
         cfg.index_tests = true;
         cfg.exclude = vec!["**/data.txt".to_string()];
         let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
@@ -475,6 +482,7 @@ mod tests {
         // Index both with no excludes — simulates an index built before the exclusion.
         {
             let mut cfg = Config::default_for(repo.path().to_path_buf());
+            cfg.languages = vec![]; // allow all languages
             cfg.index_tests = true;
             let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
                 .await
@@ -486,6 +494,7 @@ mod tests {
         // ensure_fresh SKIPS reconcile — the stale row stays in the index. This is
         // the lag window the read-time filter exists to cover.
         let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.languages = vec![]; // allow all languages
         cfg.index_tests = true;
         cfg.exclude = vec!["**/data.txt".to_string()];
         let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
@@ -731,6 +740,48 @@ mod tests {
             engine2.stats().await.unwrap(),
             (files, chunks),
             "unchanged files not re-indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn language_whitelist_gates_indexing() {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join("lib.rs"),
+            "pub fn rust_fn() -> i32 { 42 }\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("lib.py"), "def py_fn(): return 42\n").unwrap();
+
+        // Engine with languages = ["rust"] should only index .rs files.
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.languages = vec!["rust".to_string()];
+        cfg.index_tests = true; // don't let test excludes interfere
+        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        engine.refresh().await.unwrap();
+
+        let stored = engine.index.file_hashes().await.unwrap();
+        assert!(stored.contains_key("lib.rs"), "rust file should be indexed");
+        assert!(
+            !stored.contains_key("lib.py"),
+            "python file should be skipped by language whitelist; got {:?}",
+            stored.keys().collect::<Vec<_>>()
+        );
+
+        // Search for python content should not surface the .py file.
+        let hits = engine.search("py_fn", Some(10)).await.unwrap();
+        assert!(
+            !hits.iter().any(|e| e.path == "lib.py"),
+            "python file must not appear in search results"
+        );
+
+        // Rust content should still be found.
+        let hits = engine.search("rust_fn", Some(10)).await.unwrap();
+        assert!(
+            hits.iter().any(|e| e.path == "lib.rs"),
+            "rust file should appear in search results"
         );
     }
 }
