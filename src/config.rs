@@ -115,7 +115,11 @@ pub struct Config {
     pub search: SearchConfig,
     pub watch: WatchConfig,
     pub languages: Vec<String>,
-    pub strip_comments: bool,
+    /// Strip leading banner comments (license headers, module doc comments) from
+    /// the code returned in search results. Does NOT strip inline or trailing
+    /// comments — those carry implementation intent.
+    #[serde(alias = "strip_comments")]
+    pub strip_banner_comments: bool,
     /// Extra glob patterns to skip when indexing, unioned with the built-in
     /// test/fixture excludes (see `freshness`). Matched against repo-relative paths.
     pub exclude: Vec<String>,
@@ -131,7 +135,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             watch: WatchConfig::default(),
             languages: vec!["rust".into(), "python".into(), "typescript".into()],
-            strip_comments: true,
+            strip_banner_comments: true,
             exclude: Vec::new(),
             index_tests: false,
         }
@@ -469,5 +473,21 @@ mod tests {
         let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
         assert_eq!(c.embedder.request_timeout_secs, 10);
         assert_eq!(c.search.search_timeout_secs, 120);
+    }
+
+    #[test]
+    fn strip_banner_aliases_old_key() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert!(
+            c.strip_banner_comments,
+            "strip_banner_comments defaults to true"
+        );
+        // Old key name 'strip_comments' must still work via #[serde(alias = ...)].
+        let c = Config::from_toml_str("strip_comments = false", PathBuf::from("/repo")).unwrap();
+        assert!(!c.strip_banner_comments, "old key must be aliased");
+        // New key name works too.
+        let c =
+            Config::from_toml_str("strip_banner_comments = false", PathBuf::from("/repo")).unwrap();
+        assert!(!c.strip_banner_comments, "new key must work");
     }
 }

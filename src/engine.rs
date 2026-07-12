@@ -202,7 +202,7 @@ impl Engine {
                 .collect();
             Ok(distill_context(
                 hits,
-                self.config.strip_comments,
+                self.config.strip_banner_comments,
                 self.config.search.token_budget,
                 self.config.search.relevance_ratio,
             ))

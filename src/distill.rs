@@ -20,9 +20,9 @@ pub fn approx_tokens(s: &str) -> usize {
     (s.chars().count() / 4).max(1)
 }
 
-fn strip_noise(text: &str, strip_comments: bool) -> String {
+fn strip_banner(text: &str, strip: bool) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
-    if strip_comments {
+    if strip {
         let mut i = 0;
         while i < lines.len() {
             let t = lines[i].trim_start();
@@ -144,7 +144,7 @@ fn finish(path: &str, m: Merged, strip_comments: bool) -> ContextEntry {
         end_line: m.e,
         language: m.language,
         symbol: m.symbol,
-        code: strip_noise(&m.text, strip_comments),
+        code: strip_banner(&m.text, strip_comments),
         score: m.score,
         why_matched: format!("similarity {:.3}", m.score),
     }
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_leading_license_comments_when_enabled() {
+    fn strips_banner_when_enabled() {
         let out = distill_context(
             vec![hit(
                 "a.rs",

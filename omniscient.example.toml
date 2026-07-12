@@ -1,6 +1,9 @@
 # Copy to omniscient.toml in your repo root and edit.
 languages = ["rust", "python", "typescript"]
-strip_comments = true
+# Strip leading banner comments (license headers, module doc comments) from search
+# results. Inline comments are preserved — they carry implementation intent.
+# The old key name 'strip_comments' is still accepted for backward compatibility.
+strip_banner_comments = true
 
 # Dependency lock files (Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml,
 # poetry.lock, go.sum, ...) are ALWAYS skipped — large, generated, pure noise.
