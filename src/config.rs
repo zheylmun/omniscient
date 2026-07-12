@@ -11,6 +11,10 @@ pub struct EmbedderConfig {
     pub model: String,
     pub max_batch_chunks: usize,
     pub max_batch_bytes: usize,
+    /// Maximum number of concurrent embedding requests during reconcile.
+    /// Each request covers one file's chunks (batched by `max_batch_chunks/bytes`).
+    /// Higher values saturate the endpoint faster on large initial indexes.
+    pub embed_concurrency: usize,
     /// When true and `base_url` is unreachable at startup, omniscient launches a
     /// local llama.cpp server (`llama serve …`) itself and waits for it to come
     /// up, instead of erroring. Off by default — an already-running endpoint is
@@ -41,6 +45,7 @@ impl Default for EmbedderConfig {
             model: "qwen3-embedding-4b".into(),
             max_batch_chunks: 64,
             max_batch_bytes: 32000,
+            embed_concurrency: 4,
             auto_start: false,
             llama_bin: "llama".into(),
             hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),

@@ -2,6 +2,7 @@ use omniscient::config::Config;
 use omniscient::embed::MockEmbedder;
 use omniscient::engine::Engine;
 use std::fs;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -19,7 +20,7 @@ async fn end_to_end_semantic_search_with_mock() {
     .unwrap();
 
     let cfg = Config::default_for(repo.path().to_path_buf());
-    let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+    let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
         .await
         .unwrap();
 

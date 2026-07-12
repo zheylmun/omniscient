@@ -272,7 +272,7 @@ mod tests {
         let engine = Arc::new(
             Engine::with_refresh_state(
                 cfg.clone(),
-                Box::new(MockEmbedder::new("mock-v1", 64)),
+                Arc::new(MockEmbedder::new("mock-v1", 64)),
                 state.clone(),
             )
             .await

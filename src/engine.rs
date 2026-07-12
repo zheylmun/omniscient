@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::freshness::{diff, exclude_matcher, is_excluded, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use crate::refresh::RefreshState;
+use futures::stream::{FuturesUnordered, StreamExt};
 use ignore::gitignore::Gitignore;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,9 +15,16 @@ use tokio::sync::OnceCell;
 
 const MAX_WINDOW_LINES: usize = 80;
 
+/// A single file's work item for parallel reconcile: chunks + metadata.
+struct WorkItem {
+    path: String,
+    chunks: Vec<crate::chunk::Chunk>,
+    file_hash: String,
+}
+
 pub struct Engine {
     config: Config,
-    embedder: Box<dyn Embedder>,
+    embedder: Arc<dyn Embedder>,
     index: Index,
     refresh: Arc<RefreshState>,
     /// Effective exclude globs (lock files + tests + user), resolved once. Drives
@@ -31,13 +39,13 @@ impl Engine {
         Self::new_with_embedder(config, embedder).await
     }
 
-    pub async fn new_with_embedder(config: Config, embedder: Box<dyn Embedder>) -> Result<Engine> {
+    pub async fn new_with_embedder(config: Config, embedder: Arc<dyn Embedder>) -> Result<Engine> {
         Self::with_refresh_state(config, embedder, Arc::new(RefreshState::standalone())).await
     }
 
     pub async fn with_refresh_state(
         config: Config,
-        embedder: Box<dyn Embedder>,
+        embedder: Arc<dyn Embedder>,
         refresh: Arc<RefreshState>,
     ) -> Result<Engine> {
         let dir = config.repo_root.join(".omniscient");
@@ -118,6 +126,8 @@ impl Engine {
             .map(|s| (s.path.as_str(), s.hash.as_str()))
             .collect();
 
+        // Phase 1: collect work items (sequential, I/O + tree-sitter is fast).
+        let mut work: Vec<WorkItem> = Vec::new();
         for path in &delta.changed {
             // Gate on the language whitelist: skip files not in the configured languages.
             let detected = language_for_path(Path::new(path));
@@ -132,38 +142,60 @@ impl Engine {
             if chunks.is_empty() {
                 continue;
             }
-            let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-            let vectors = self
-                .embedder
-                .embed_batched(&texts, self.config.embedder.batch_limits())
-                .await?;
-            if vectors.len() != texts.len() {
-                return Err(Error::Embed(format!(
-                    "embedder returned {} vectors for {} inputs (file {path})",
-                    vectors.len(),
-                    texts.len()
-                )));
-            }
             let file_hash = hash_of
                 .get(path.as_str())
                 .copied()
                 .unwrap_or("")
                 .to_string();
-            let stored_chunks: Vec<StoredChunk> = chunks
-                .into_iter()
-                .zip(vectors)
-                .map(|(c, v)| StoredChunk {
-                    path: path.clone(),
-                    start_line: c.start_line,
-                    end_line: c.end_line,
-                    language: c.language,
-                    symbol: c.symbol,
-                    text: c.text,
-                    file_hash: file_hash.clone(),
-                    vector: v,
-                })
-                .collect();
-            self.index.upsert_file(path, stored_chunks).await?;
+            work.push(WorkItem {
+                path: path.clone(),
+                chunks,
+                file_hash,
+            });
+        }
+
+        // Phase 2: embed + upsert in parallel with bounded concurrency.
+        let concurrency = self.config.embedder.embed_concurrency.max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = FuturesUnordered::new();
+        for item in work {
+            let semaphore = semaphore.clone();
+            let embedder = self.embedder.clone();
+            let index = self.index.clone();
+            let batch_limits = self.config.embedder.batch_limits();
+            tasks.push(async move {
+                let _permit = semaphore.acquire_owned().await.unwrap();
+                let texts: Vec<String> = item.chunks.iter().map(|c| c.text.clone()).collect();
+                let vectors = embedder.embed_batched(&texts, batch_limits).await?;
+                if vectors.len() != texts.len() {
+                    return Err(Error::Embed(format!(
+                        "embedder returned {} vectors for {} inputs (file {})",
+                        vectors.len(),
+                        texts.len(),
+                        item.path
+                    )));
+                }
+                let stored_chunks: Vec<StoredChunk> = item
+                    .chunks
+                    .into_iter()
+                    .zip(vectors)
+                    .map(|(c, v)| StoredChunk {
+                        path: item.path.clone(),
+                        start_line: c.start_line,
+                        end_line: c.end_line,
+                        language: c.language,
+                        symbol: c.symbol,
+                        text: c.text,
+                        file_hash: item.file_hash.clone(),
+                        vector: v,
+                    })
+                    .collect();
+                index.upsert_file(&item.path, stored_chunks).await
+            });
+        }
+        // Drive futures to completion, returning first error.
+        while let Some(res) = tasks.next().await {
+            res?;
         }
         for path in &delta.deleted {
             self.index.delete_file(path).await?;
@@ -344,7 +376,7 @@ mod tests {
 
     async fn engine_for(root: std::path::PathBuf) -> Engine {
         let cfg = Config::default_for(root);
-        Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+        Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap()
     }
@@ -369,7 +401,7 @@ mod tests {
         // Empty repo: refresh embeds nothing, so this isolates embed_one(query).
         let repo = tempdir().unwrap();
         let cfg = Config::default_for(repo.path().to_path_buf());
-        let engine = Engine::new_with_embedder(cfg, Box::new(ZeroEmbedder))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(ZeroEmbedder))
             .await
             .unwrap();
         let err = engine.search("anything", Some(3)).await.unwrap_err();
@@ -446,7 +478,7 @@ mod tests {
             let mut cfg = Config::default_for(repo.path().to_path_buf());
             cfg.languages = vec![]; // allow all languages
             cfg.index_tests = true;
-            let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
                 .await
                 .unwrap();
             engine.refresh().await.unwrap();
@@ -464,7 +496,7 @@ mod tests {
         cfg.languages = vec![]; // allow all languages
         cfg.index_tests = true;
         cfg.exclude = vec!["**/data.txt".to_string()];
-        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
         engine.refresh().await.unwrap();
@@ -495,7 +527,7 @@ mod tests {
             let mut cfg = Config::default_for(repo.path().to_path_buf());
             cfg.languages = vec![]; // allow all languages
             cfg.index_tests = true;
-            let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+            let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
                 .await
                 .unwrap();
             engine.refresh().await.unwrap();
@@ -508,7 +540,7 @@ mod tests {
         cfg.languages = vec![]; // allow all languages
         cfg.index_tests = true;
         cfg.exclude = vec!["**/data.txt".to_string()];
-        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
         engine.refresh_state().set_watch_active(true);
@@ -590,7 +622,7 @@ mod tests {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
         let cfg = Config::default_for(repo.path().to_path_buf());
-        let engine = Engine::new_with_embedder(cfg, Box::new(ZeroEmbedder))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(ZeroEmbedder))
             .await
             .unwrap();
         engine.refresh_state().set_watch_active(true);
@@ -630,6 +662,34 @@ mod tests {
         );
     }
 
+    /// Verify that parallel reconcile indexes all changed files concurrently.
+    #[tokio::test]
+    async fn reconcile_embeds_multiple_files_in_parallel() {
+        let repo = tempdir().unwrap();
+        // Create several files that will all need embedding on first reconcile.
+        for i in 0..5 {
+            fs::write(
+                repo.path().join(format!("mod_{i}.rs")),
+                format!("pub fn func_{i}() {{ /* body {i} */ }}\n"),
+            )
+            .unwrap();
+        }
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        engine.refresh().await.unwrap();
+        let hashes = engine.index.file_hashes().await.unwrap();
+        for i in 0..5 {
+            assert!(
+                hashes.contains_key(&format!("mod_{i}.rs")),
+                "mod_{i}.rs should be indexed"
+            );
+        }
+        let count = engine.index.chunk_count().await.unwrap();
+        assert_eq!(count, 5, "exactly 5 chunks from 5 files");
+    }
+
     #[tokio::test]
     async fn lazy_engine_from_engine_returns_ready_instance() {
         let repo = tempdir().unwrap();
@@ -639,7 +699,7 @@ mod tests {
         let engine = Arc::new(
             Engine::with_refresh_state(
                 cfg.clone(),
-                Box::new(MockEmbedder::new("mock-v1", 64)),
+                Arc::new(MockEmbedder::new("mock-v1", 64)),
                 state.clone(),
             )
             .await
@@ -711,7 +771,7 @@ mod tests {
         cfg.embedder.max_batch_bytes = 1_000_000;
 
         let embedder = std::sync::Arc::new(CountingEmbedder::new(64));
-        let engine = Engine::new_with_embedder(cfg, Box::new(Shared(embedder.clone())))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(Shared(embedder.clone())))
             .await
             .unwrap();
         engine.refresh().await.unwrap();
@@ -768,7 +828,7 @@ mod tests {
         let mut cfg = Config::default_for(repo.path().to_path_buf());
         cfg.languages = vec!["rust".to_string()];
         cfg.index_tests = true; // don't let test excludes interfere
-        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
         engine.refresh().await.unwrap();
@@ -823,7 +883,7 @@ mod tests {
         cfg.search.search_timeout_secs = 1; // very short timeout
         let engine = Engine::new_with_embedder(
             cfg,
-            Box::new(SlowEmbedder {
+            Arc::new(SlowEmbedder {
                 inner: MockEmbedder::new("mock-v1", 64),
             }),
         )

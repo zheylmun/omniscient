@@ -41,6 +41,7 @@ struct Meta {
     chunker_version: u32,
 }
 
+#[derive(Clone)]
 pub struct Index {
     dim: usize,
     table: Table,
