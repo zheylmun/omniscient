@@ -211,7 +211,7 @@ mod tests {
 
     async fn healthy_engine(root: std::path::PathBuf) -> Arc<Engine> {
         let cfg = Config::default_for(root);
-        let engine = Engine::new_with_embedder(cfg, Box::new(MockEmbedder::new("mock-v1", 64)))
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
         engine.refresh().await.unwrap();
@@ -263,7 +263,7 @@ mod tests {
         let repo = tempdir().unwrap();
         let cfg = Config::default_for(repo.path().to_path_buf());
         let engine = Arc::new(
-            Engine::new_with_embedder(cfg.clone(), Box::new(MockEmbedder::new("mock-v1", 64)))
+            Engine::new_with_embedder(cfg.clone(), Arc::new(MockEmbedder::new("mock-v1", 64)))
                 .await
                 .unwrap(),
         );
@@ -290,7 +290,7 @@ mod tests {
         let cfg = Config::default_for(repo.path().to_path_buf());
         // NOTE: intentionally NO engine.refresh() — the on-disk index starts empty.
         let engine = Arc::new(
-            Engine::new_with_embedder(cfg.clone(), Box::new(MockEmbedder::new("mock-v1", 64)))
+            Engine::new_with_embedder(cfg.clone(), Arc::new(MockEmbedder::new("mock-v1", 64)))
                 .await
                 .unwrap(),
         );

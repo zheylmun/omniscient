@@ -3,6 +3,7 @@ use crate::config::EmbedderConfig;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Bounds for splitting a list of texts into `embed()` batches. A batch is flushed
@@ -76,7 +77,7 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
+pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Arc<dyn Embedder>> {
     // Always prefer an already-running endpoint: connect first, and only fall
     // through to spawning when that fails AND auto_start is enabled. This means a
     // user-managed server is used as-is and never spawned over.
@@ -87,7 +88,7 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
     )
     .await
     {
-        Ok(e) => return Ok(Box::new(e)),
+        Ok(e) => return Ok(Arc::new(e)),
         Err(e) if !cfg.auto_start => return Err(e),
         Err(e) => {
             // `connect()` failing doesn't always mean the port is free: a server
@@ -105,7 +106,7 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Box<dyn Embedder>> {
         }
     }
     let server = ManagedServer::spawn(cfg)?;
-    Ok(Box::new(connect_managed(server, cfg).await?))
+    Ok(Arc::new(connect_managed(server, cfg).await?))
 }
 
 /// Whether something is accepting TCP connections at `base_url`'s host:port. Used
