@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, DistanceType, Table};
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ struct Meta {
 pub struct Index {
     dim: usize,
     table: Table,
+    meta: Table,
     rebuilt: bool,
 }
 
@@ -94,7 +95,7 @@ impl Index {
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
 
-        let has_table = |names: &[String]| names.iter().any(|t| t == "chunks");
+        let has_table = |names: &[String], t: &str| names.iter().any(|n| n == t);
         let names = conn
             .table_names()
             .execute()
@@ -102,10 +103,15 @@ impl Index {
             .map_err(|e| Error::Index(e.to_string()))?;
 
         let mut rebuilt = false;
-        if mismatch && has_table(&names) {
+        if mismatch && has_table(&names, "chunks") {
             conn.drop_table("chunks", &[])
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?;
+            if has_table(&names, "file_meta") {
+                conn.drop_table("file_meta", &[])
+                    .await
+                    .map_err(|e| Error::Index(e.to_string()))?;
+            }
             rebuilt = true;
         }
 
@@ -114,13 +120,32 @@ impl Index {
             .execute()
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
-        let table = if has_table(&names) {
+        let table = if has_table(&names, "chunks") {
             conn.open_table("chunks")
                 .execute()
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?
         } else {
             conn.create_empty_table("chunks", schema_for(dim))
+                .execute()
+                .await
+                .map_err(|e| Error::Index(e.to_string()))?
+        };
+
+        // Lightweight metadata table: one row per file (path, file_hash).
+        // file_hashes() reads from this instead of scanning every chunk row,
+        // so it scales O(files) not O(chunks).
+        let meta_schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("file_hash", DataType::Utf8, false),
+        ]));
+        let meta = if has_table(&names, "file_meta") {
+            conn.open_table("file_meta")
+                .execute()
+                .await
+                .map_err(|e| Error::Index(e.to_string()))?
+        } else {
+            conn.create_empty_table("file_meta", meta_schema)
                 .execute()
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?
@@ -139,6 +164,7 @@ impl Index {
         Ok(Index {
             dim,
             table,
+            meta,
             rebuilt,
         })
     }
@@ -148,8 +174,40 @@ impl Index {
     }
 
     pub async fn delete_file(&self, path: &str) -> Result<()> {
+        let filter = format!("path = '{}'", path.replace('\'', "''"));
         self.table
+            .delete(&filter)
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?;
+        self.meta
+            .delete(&filter)
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Upsert a single (path, `file_hash`) row into the lightweight metadata table.
+    pub async fn upsert_file_meta(&self, path: &str, file_hash: &str) -> Result<()> {
+        let meta_schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("file_hash", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            meta_schema,
+            vec![
+                Arc::new(StringArray::from(vec![path.to_string()])),
+                Arc::new(StringArray::from(vec![file_hash.to_string()])),
+            ],
+        )
+        .map_err(|e| Error::Index(e.to_string()))?;
+        // Delete old row for this path first, then add — ensures at most one row.
+        self.meta
             .delete(&format!("path = '{}'", path.replace('\'', "''")))
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?;
+        self.meta
+            .add(batch)
+            .execute()
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
         Ok(())
@@ -186,14 +244,17 @@ impl Index {
             .delete(&pred)
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
+        // Keep the lightweight metadata table in sync.
+        self.upsert_file_meta(path, &new_hash).await?;
         Ok(())
     }
 
     pub async fn file_hashes(&self) -> Result<HashMap<String, String>> {
+        // Read from the lightweight meta table (one row per file) instead of
+        // scanning every chunk row — O(files) not O(chunks).
         let batches: Vec<RecordBatch> = self
-            .table
+            .meta
             .query()
-            .select(Select::columns(&["path", "file_hash"]))
             .execute()
             .await
             .map_err(|e| Error::Index(e.to_string()))?
