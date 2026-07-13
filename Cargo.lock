@@ -3766,6 +3766,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "clap",
+ "dirs",
  "futures",
  "ignore",
  "lancedb",

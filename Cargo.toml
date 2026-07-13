@@ -21,6 +21,7 @@ must_use_candidate = "allow"
 
 [dependencies]
 anyhow = "1.0.103"
+dirs = "6.0"
 arrow-array = "58"
 arrow-schema = "58"
 async-trait = "0.1.89"
