@@ -21,6 +21,14 @@ exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
 [embedder]
 base_url = "http://localhost:8080"   # local llama.cpp serving an embedding model
 model = "qwen3-embedding-4b"
+# Bearer token for an authenticated endpoint (a llama.cpp server started with
+# --api-key, or an OpenAI-compatible router). Sent as `Authorization: Bearer <key>`.
+# Omit for an unauthenticated local server. A whole-string ${VAR} or $VAR is read
+# from the environment at startup (errors if unset), so the secret stays out of
+# this file; any other value is used literally. Note: over plain HTTP the token is
+# not encrypted in transit — prefer a trusted LAN or an HTTPS endpoint.
+# api_key = "${OMNISCIENT_API_KEY}"
+
 # Embedding requests are split into batches so a massive file can't overload the
 # GPU. A batch is flushed before it would exceed either bound (a single chunk
 # larger than max_batch_bytes is sent on its own). When auto_start launches the

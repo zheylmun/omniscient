@@ -78,6 +78,7 @@ pub fn l2_normalize(v: &mut [f32]) {
 }
 
 pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Arc<dyn Embedder>> {
+    let api_key = cfg.resolved_api_key()?;
     // Always prefer an already-running endpoint: connect first, and only fall
     // through to spawning when that fails AND auto_start is enabled. This means a
     // user-managed server is used as-is and never spawned over.
@@ -85,6 +86,7 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Arc<dyn Embedder>> {
         cfg.base_url.clone(),
         cfg.model.clone(),
         cfg.request_timeout_secs,
+        api_key.clone(),
     )
     .await
     {
@@ -106,7 +108,7 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Arc<dyn Embedder>> {
         }
     }
     let server = ManagedServer::spawn(cfg)?;
-    Ok(Arc::new(connect_managed(server, cfg).await?))
+    Ok(Arc::new(connect_managed(server, cfg, api_key).await?))
 }
 
 /// Whether something is accepting TCP connections at `base_url`'s host:port. Used
@@ -242,6 +244,7 @@ impl ManagedServer {
 async fn connect_managed(
     mut server: ManagedServer,
     cfg: &EmbedderConfig,
+    api_key: Option<String>,
 ) -> Result<LlamaCppEmbedder> {
     let deadline = Instant::now() + Duration::from_secs(cfg.auto_start_timeout_secs);
     let mut waited_secs = 0u64;
@@ -258,6 +261,7 @@ async fn connect_managed(
             cfg.base_url.clone(),
             cfg.model.clone(),
             cfg.request_timeout_secs,
+            api_key.clone(),
         )
         .await
         {
@@ -325,6 +329,9 @@ pub struct LlamaCppEmbedder {
     model: String,
     dim: usize,
     client: reqwest::Client,
+    /// Bearer token for the embeddings endpoint, resolved once at connect time.
+    /// `None` for an unauthenticated endpoint.
+    api_key: Option<String>,
     /// A llama.cpp server omniscient spawned itself (`auto_start`), kept alive for
     /// the embedder's lifetime and killed on drop. `None` when connecting to a
     /// user-managed endpoint. Held purely for its `Drop` side effect.
@@ -332,11 +339,21 @@ pub struct LlamaCppEmbedder {
     server: Option<ManagedServer>,
 }
 
+/// Attach `Authorization: Bearer <key>` when a key is configured. Factored out
+/// so the header decision is unit-testable without a live server.
+fn apply_auth(rb: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => rb.bearer_auth(key),
+        None => rb,
+    }
+}
+
 impl LlamaCppEmbedder {
     pub async fn connect(
         base_url: String,
         model: String,
         request_timeout_secs: u64,
+        api_key: Option<String>,
     ) -> Result<Self> {
         let client = reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(request_timeout_secs.max(1)))
@@ -347,6 +364,7 @@ impl LlamaCppEmbedder {
             model,
             dim: 0,
             client,
+            api_key,
             server: None,
         };
         let probe = e.embed_raw(&["probe".to_string()]).await?;
@@ -380,9 +398,7 @@ impl LlamaCppEmbedder {
             data: Vec<Item>,
         }
         let url = format!("{}/v1/embeddings", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&url)
+        let resp = apply_auth(self.client.post(&url), self.api_key.as_deref())
             .json(&Req {
                 model: &self.model,
                 input: texts,
@@ -649,6 +665,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_auth_sets_bearer_when_present() {
+        let client = reqwest::Client::new();
+        let req = apply_auth(client.post("http://x.invalid/"), Some("sk-test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
+        );
+    }
+
+    #[test]
+    fn apply_auth_omits_header_when_absent() {
+        let client = reqwest::Client::new();
+        let req = apply_auth(client.post("http://x.invalid/"), None)
+            .build()
+            .unwrap();
+        assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
     #[tokio::test]
     async fn batched_equals_unbatched_elementwise() {
         let e = MockEmbedder::new("mock-v1", 16);
@@ -678,6 +715,7 @@ mod live {
             "http://localhost:8080".into(),
             "qwen3-embedding-4b".into(),
             30,
+            None,
         )
         .await
         .unwrap();

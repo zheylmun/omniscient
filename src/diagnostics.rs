@@ -66,7 +66,7 @@ impl Report {
 /// Run every check we can and classify each — never abort on the first failure,
 /// because the whole point is to report *which* stage is broken.
 pub async fn run(config: &Config, engine: std::result::Result<&Arc<Engine>, &str>) -> Report {
-    let mut checks = vec![build_check(), repo_check(config)];
+    let mut checks = vec![build_check(), config_check(config)];
     checks.push(embedder_check(config, engine).await);
     checks.extend(index_and_query_checks(engine).await);
     checks.push(watcher_check(config, engine));
@@ -82,19 +82,178 @@ fn build_check() -> Check {
     }
 }
 
-/// Resolved repo root + whether config came from a file or built-in defaults.
-fn repo_check(config: &Config) -> Check {
-    let cfg_file = config.repo_root.join("omniscient.toml");
-    let source = if cfg_file.exists() {
-        format!("config {}", cfg_file.display())
-    } else {
-        "built-in defaults (no omniscient.toml)".into()
-    };
-    Check {
-        name: "repo".into(),
-        status: Status::Pass,
-        detail: format!("{} — {source}", config.repo_root.display()),
+/// Resolved repo root + config cascade (global → repo → cli) with override details.
+fn config_check(config: &Config) -> Check {
+    use crate::config::ConfigSource;
+    use std::fmt::Write;
+
+    let mut detail = format!("{}", config.repo_root.display());
+
+    if config.cascade.is_empty() {
+        detail.push_str(" — built-in defaults (no config files)");
+        return Check {
+            name: "config".into(),
+            status: Status::Pass,
+            detail,
+        };
     }
+
+    // List each level
+    for (i, level) in config.cascade.iter().enumerate() {
+        let (tag, path_ref) = match &level.source {
+            ConfigSource::Global { path } => ("global", path),
+            ConfigSource::Repo { path } => ("repo", path),
+            ConfigSource::Cli { path } => ("cli", path),
+        };
+        let _ = writeln!(detail, "\n  [{i}] {tag}: {}", path_ref.display());
+    }
+
+    // Show overrides between levels
+    if config.cascade.len() >= 2 {
+        let _ = writeln!(detail, "\n  overrides:");
+        for i in 1..config.cascade.len() {
+            let prev = &config.cascade[i - 1];
+            let curr = &config.cascade[i];
+            let prev_tag = match &prev.source {
+                ConfigSource::Global { .. } => "global",
+                ConfigSource::Repo { .. } => "repo",
+                ConfigSource::Cli { .. } => "cli",
+            };
+            let curr_tag = match &curr.source {
+                ConfigSource::Global { .. } => "global",
+                ConfigSource::Repo { .. } => "repo",
+                ConfigSource::Cli { .. } => "cli",
+            };
+
+            let overrides = collect_overrides(&prev.config, &curr.config);
+            if overrides.is_empty() {
+                let _ = writeln!(
+                    detail,
+                    "    (none — {curr_tag} config uses {prev_tag} values for all fields)"
+                );
+            } else {
+                for field_name in &overrides {
+                    let _ = writeln!(
+                        detail,
+                        "    {field_name}: ({prev_tag}) → ({curr_tag})  [OVERRIDDEN]"
+                    );
+                }
+            }
+        }
+        // Note about vector replacement semantics
+        let _ = writeln!(
+            detail,
+            "    note: vector fields (languages, exclude) are replaced entirely, not merged"
+        );
+    }
+
+    Check {
+        name: "config".into(),
+        status: Status::Pass,
+        detail,
+    }
+}
+
+/// Return field names where `overlay` differs from `base` (non-default values).
+fn collect_overrides(base: &Config, overlay: &Config) -> Vec<String> {
+    let def = Config::default();
+    let mut names = Vec::new();
+
+    // Embedder fields
+    if overlay.embedder.model != def.embedder.model && overlay.embedder.model != base.embedder.model
+    {
+        names.push("embedder.model".into());
+    }
+    if overlay.embedder.base_url != def.embedder.base_url
+        && overlay.embedder.base_url != base.embedder.base_url
+    {
+        names.push("embedder.base_url".into());
+    }
+    if overlay.embedder.max_batch_chunks != def.embedder.max_batch_chunks
+        && overlay.embedder.max_batch_chunks != base.embedder.max_batch_chunks
+    {
+        names.push("embedder.max_batch_chunks".into());
+    }
+    if overlay.embedder.max_batch_bytes != def.embedder.max_batch_bytes
+        && overlay.embedder.max_batch_bytes != base.embedder.max_batch_bytes
+    {
+        names.push("embedder.max_batch_bytes".into());
+    }
+    if overlay.embedder.auto_start != def.embedder.auto_start
+        && overlay.embedder.auto_start != base.embedder.auto_start
+    {
+        names.push("embedder.auto_start".into());
+    }
+    if overlay.embedder.llama_bin != def.embedder.llama_bin
+        && overlay.embedder.llama_bin != base.embedder.llama_bin
+    {
+        names.push("embedder.llama_bin".into());
+    }
+    if overlay.embedder.hf_repo != def.embedder.hf_repo
+        && overlay.embedder.hf_repo != base.embedder.hf_repo
+    {
+        names.push("embedder.hf_repo".into());
+    }
+    if overlay.embedder.pooling != def.embedder.pooling
+        && overlay.embedder.pooling != base.embedder.pooling
+    {
+        names.push("embedder.pooling".into());
+    }
+    if overlay.embedder.auto_start_timeout_secs != def.embedder.auto_start_timeout_secs
+        && overlay.embedder.auto_start_timeout_secs != base.embedder.auto_start_timeout_secs
+    {
+        names.push("embedder.auto_start_timeout_secs".into());
+    }
+    if overlay.embedder.api_key != def.embedder.api_key
+        && overlay.embedder.api_key != base.embedder.api_key
+    {
+        names.push("embedder.api_key".into());
+    }
+
+    // Search fields
+    if overlay.search.max_results != def.search.max_results
+        && overlay.search.max_results != base.search.max_results
+    {
+        names.push("search.max_results".into());
+    }
+    if (overlay.search.relevance_ratio - def.search.relevance_ratio).abs() > 1e-6
+        && (overlay.search.relevance_ratio - base.search.relevance_ratio).abs() > 1e-6
+    {
+        names.push("search.relevance_ratio".into());
+    }
+    if overlay.search.token_budget != def.search.token_budget
+        && overlay.search.token_budget != base.search.token_budget
+    {
+        names.push("search.token_budget".into());
+    }
+
+    // Watch fields
+    if overlay.watch.enabled != def.watch.enabled && overlay.watch.enabled != base.watch.enabled {
+        names.push("watch.enabled".into());
+    }
+    if overlay.watch.debounce_ms != def.watch.debounce_ms
+        && overlay.watch.debounce_ms != base.watch.debounce_ms
+    {
+        names.push("watch.debounce_ms".into());
+    }
+
+    // Top-level fields
+    if !overlay.languages.is_empty() && overlay.languages != base.languages {
+        names.push("languages".into());
+    }
+    if overlay.strip_banner_comments != def.strip_banner_comments
+        && overlay.strip_banner_comments != base.strip_banner_comments
+    {
+        names.push("strip_banner_comments".into());
+    }
+    if !overlay.exclude.is_empty() && overlay.exclude != base.exclude {
+        names.push("exclude".into());
+    }
+    if overlay.index_tests != def.index_tests && overlay.index_tests != base.index_tests {
+        names.push("index_tests".into());
+    }
+
+    names
 }
 
 /// Embedder connectivity. On engine-init failure, a TCP probe of the endpoint
@@ -254,6 +413,47 @@ mod tests {
         assert!(
             text.contains("auto_start"),
             "should hint remediation:\n{text}"
+        );
+    }
+
+    #[test]
+    fn config_check_reports_api_key_override_without_leaking_value() {
+        use crate::config::{Config, ConfigLevel, ConfigSource};
+        use std::path::PathBuf;
+
+        let repo = PathBuf::from("/repo");
+        let mut global = Config::default_for(repo.clone());
+        global.embedder.api_key = None;
+        let mut local = Config::default_for(repo.clone());
+        local.embedder.api_key = Some("super-secret-key".into());
+
+        let mut config = Config::default_for(repo.clone());
+        config.embedder.api_key = Some("super-secret-key".into());
+        config.cascade = vec![
+            ConfigLevel {
+                source: ConfigSource::Global {
+                    path: PathBuf::from("/g/omniscient.toml"),
+                },
+                config: global,
+            },
+            ConfigLevel {
+                source: ConfigSource::Repo {
+                    path: repo.join("omniscient.toml"),
+                },
+                config: local,
+            },
+        ];
+
+        let check = config_check(&config);
+        assert!(
+            check.detail.contains("embedder.api_key"),
+            "override report must name the field, got:\n{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("super-secret-key"),
+            "the secret VALUE must never appear in diagnostics, got:\n{}",
+            check.detail
         );
     }
 

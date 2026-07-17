@@ -1,8 +1,183 @@
-//! Configuration: omniscient.toml -> Config, with defaults.
+//! Configuration cascade: defaults → global → repo → `--config`.
+//!
+//! Each level is partial — fields not set at a higher level inherit from the
+//! lower one. Vector fields (`languages`, `exclude`) are **replaced** entirely
+//! by the higher level (not merged).
 use crate::embed::BatchLimits;
 use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+/// Where a config level came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// `~/.config/omniscient/omniscient.toml`
+    Global { path: PathBuf },
+    /// `<repo_root>/omniscient.toml`
+    Repo { path: PathBuf },
+    /// `--config <path>`
+    Cli { path: PathBuf },
+}
+
+/// One resolved level in the config cascade.
+#[derive(Debug, Clone)]
+pub struct ConfigLevel {
+    /// Where this level was loaded from.
+    pub source: ConfigSource,
+    /// The raw parsed config at this level (before merge into the final result).
+    pub config: Config,
+}
+
+/// Resolve the global config path.
+///
+/// Returns `dirs::config_dir().join("omniscient/omniscient.toml")`. On macOS
+/// this is `~/Library/Application Support/omniscient/omniscient.toml`; on
+/// Linux `~/.config/omniscient/omniscient.toml`.
+pub fn global_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("omniscient/omniscient.toml"))
+}
+
+/// Merge `overlay` onto `base`. For all fields the overlay wins when it
+/// differs from its default value. Vector fields (`languages`, `exclude`) are
+/// replaced entirely (not merged). `repo_root` is preserved from `base`.
+pub fn merge(base: Config, overlay: Config) -> Config {
+    let def = Config::default();
+    Config {
+        repo_root: base.repo_root,
+        embedder: merge_embedder(base.embedder, overlay.embedder),
+        search: merge_search(&base.search, &overlay.search),
+        watch: merge_watch(&base.watch, &overlay.watch),
+        languages: if overlay.languages == def.languages {
+            base.languages
+        } else {
+            overlay.languages
+        },
+        strip_banner_comments: if overlay.strip_banner_comments == def.strip_banner_comments {
+            base.strip_banner_comments
+        } else {
+            overlay.strip_banner_comments
+        },
+        exclude: if overlay.exclude == def.exclude {
+            base.exclude
+        } else {
+            overlay.exclude
+        },
+        index_tests: if overlay.index_tests == def.index_tests {
+            base.index_tests
+        } else {
+            overlay.index_tests
+        },
+        cascade: base.cascade, // cascade metadata stays on the base (accumulator)
+    }
+}
+
+fn merge_embedder(base: EmbedderConfig, overlay: EmbedderConfig) -> EmbedderConfig {
+    let def = EmbedderConfig::default();
+    EmbedderConfig {
+        base_url: if overlay.base_url == def.base_url {
+            base.base_url
+        } else {
+            overlay.base_url
+        },
+        model: if overlay.model == def.model {
+            base.model
+        } else {
+            overlay.model
+        },
+        max_batch_chunks: if overlay.max_batch_chunks == def.max_batch_chunks {
+            base.max_batch_chunks
+        } else {
+            overlay.max_batch_chunks
+        },
+        max_batch_bytes: if overlay.max_batch_bytes == def.max_batch_bytes {
+            base.max_batch_bytes
+        } else {
+            overlay.max_batch_bytes
+        },
+        embed_concurrency: if overlay.embed_concurrency == def.embed_concurrency {
+            base.embed_concurrency
+        } else {
+            overlay.embed_concurrency
+        },
+        auto_start: if overlay.auto_start == def.auto_start {
+            base.auto_start
+        } else {
+            overlay.auto_start
+        },
+        llama_bin: if overlay.llama_bin == def.llama_bin {
+            base.llama_bin
+        } else {
+            overlay.llama_bin
+        },
+        hf_repo: if overlay.hf_repo == def.hf_repo {
+            base.hf_repo
+        } else {
+            overlay.hf_repo
+        },
+        pooling: if overlay.pooling == def.pooling {
+            base.pooling
+        } else {
+            overlay.pooling
+        },
+        auto_start_timeout_secs: if overlay.auto_start_timeout_secs == def.auto_start_timeout_secs {
+            base.auto_start_timeout_secs
+        } else {
+            overlay.auto_start_timeout_secs
+        },
+        request_timeout_secs: if overlay.request_timeout_secs == def.request_timeout_secs {
+            base.request_timeout_secs
+        } else {
+            overlay.request_timeout_secs
+        },
+        api_key: if overlay.api_key == def.api_key {
+            base.api_key
+        } else {
+            overlay.api_key
+        },
+    }
+}
+
+fn merge_search(base: &SearchConfig, overlay: &SearchConfig) -> SearchConfig {
+    let def = SearchConfig::default();
+    SearchConfig {
+        max_results: if overlay.max_results == def.max_results {
+            base.max_results
+        } else {
+            overlay.max_results
+        },
+        relevance_ratio: if (overlay.relevance_ratio - def.relevance_ratio).abs() <= 1e-6 {
+            base.relevance_ratio
+        } else {
+            overlay.relevance_ratio
+        },
+        token_budget: if overlay.token_budget == def.token_budget {
+            base.token_budget
+        } else {
+            overlay.token_budget
+        },
+        search_timeout_secs: if overlay.search_timeout_secs == def.search_timeout_secs {
+            base.search_timeout_secs
+        } else {
+            overlay.search_timeout_secs
+        },
+    }
+}
+
+fn merge_watch(base: &WatchConfig, overlay: &WatchConfig) -> WatchConfig {
+    let def = WatchConfig::default();
+    WatchConfig {
+        enabled: if overlay.enabled == def.enabled {
+            base.enabled
+        } else {
+            overlay.enabled
+        },
+        debounce_ms: if overlay.debounce_ms == def.debounce_ms {
+            base.debounce_ms
+        } else {
+            overlay.debounce_ms
+        },
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -37,6 +212,14 @@ pub struct EmbedderConfig {
     /// Timeout in seconds for each HTTP request to the embeddings endpoint.
     /// Guards against a hanging llama.cpp server blocking the MCP tool call.
     pub request_timeout_secs: u64,
+    /// Bearer token for an authenticated embeddings endpoint (a llama.cpp server
+    /// started with `--api-key`, or an OpenAI-compatible router). Sent as
+    /// `Authorization: Bearer <key>`. `None`/absent → no auth header.
+    ///
+    /// A whole-string `${VAR}` or `$VAR` value is expanded from the environment
+    /// at connect time (errors if the var is unset), keeping the secret out of
+    /// the config file. Any other value is used literally.
+    pub api_key: Option<String>,
 }
 impl Default for EmbedderConfig {
     fn default() -> Self {
@@ -52,6 +235,7 @@ impl Default for EmbedderConfig {
             pooling: "last".into(),
             auto_start_timeout_secs: 600,
             request_timeout_secs: 30,
+            api_key: None,
         }
     }
 }
@@ -64,6 +248,12 @@ impl EmbedderConfig {
             max_chunks: self.max_batch_chunks.max(1),
             max_bytes: self.max_batch_bytes.max(1),
         }
+    }
+
+    /// Resolve `api_key` into the literal bearer token to send (see `resolve_key`).
+    /// Called once on the connect path; the expanded secret is never stored.
+    pub fn resolved_api_key(&self) -> Result<Option<String>> {
+        resolve_key(self.api_key.as_deref(), |n| std::env::var(n).ok())
     }
 }
 
@@ -111,11 +301,57 @@ impl Default for WatchConfig {
     }
 }
 
+/// Parse the `api_key` form and produce the literal secret to send.
+/// Pure: env access is injected via `lookup` so the logic is testable without
+/// touching process env.
+///
+/// - `None` / blank: `Ok(None)` (no auth header)
+/// - whole-string `${NAME}`/`$NAME` (NAME = `[A-Za-z_][A-Za-z0-9_]*`): `lookup(NAME)`;
+///   `Err` if it returns `None`
+/// - anything else: `Ok(Some(literal))`
+fn resolve_key(
+    raw: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(name) = env_var_ref(val) {
+        let Some(resolved) = lookup(name) else {
+            return Err(Error::Config(format!(
+                "embedder.api_key references ${{{name}}} but that environment variable is not set"
+            )));
+        };
+        let trimmed = resolved.trim();
+        return Ok((!trimmed.is_empty()).then(|| trimmed.to_string()));
+    }
+    Ok(Some(val.to_string()))
+}
+
+/// If `s` is a whole-string environment reference (`${NAME}` or `$NAME` with a
+/// valid shell-identifier `NAME`), return `NAME`; otherwise `None` (literal).
+fn env_var_ref(s: &str) -> Option<&str> {
+    let inner = s
+        .strip_prefix("${")
+        .and_then(|r| r.strip_suffix('}'))
+        .or_else(|| s.strip_prefix('$'))?;
+    let valid = inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(inner)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(skip)]
     pub repo_root: PathBuf,
+    /// Per-level snapshots of the cascade (global → repo → cli).
+    /// Populated by `Config::load` so diagnostics can report overrides.
+    #[serde(skip)]
+    pub cascade: Vec<ConfigLevel>,
     pub embedder: EmbedderConfig,
     pub search: SearchConfig,
     pub watch: WatchConfig,
@@ -136,6 +372,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             repo_root: PathBuf::new(),
+            cascade: Vec::new(),
             embedder: EmbedderConfig::default(),
             search: SearchConfig::default(),
             watch: WatchConfig::default(),
@@ -161,18 +398,75 @@ impl Config {
         Ok(c)
     }
 
+    /// Load with cascade: defaults → global → repo/`--config`.
+    ///
+    /// `path` is `Some` when `--config` is given; it replaces the repo config
+    /// slot (not additive with it). Returns the merged config with
+    /// `cascade` populated so diagnostics can report overrides.
     pub fn load(path: Option<&Path>, repo_root: PathBuf) -> Result<Config> {
-        let candidate = path.map_or_else(|| repo_root.join("omniscient.toml"), PathBuf::from);
-        match std::fs::read_to_string(&candidate) {
-            Ok(s) => Config::from_toml_str(&s, repo_root),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Config::default_for(repo_root))
+        Self::load_with_global(path, repo_root, global_path().as_deref())
+    }
+
+    /// Core cascade loader with the global-config path injected explicitly.
+    ///
+    /// `load` is the production entry point and passes `global_path()`; tests
+    /// call this directly to point the global slot at a temp file (or `None`),
+    /// so the suite never reads the machine's real global config. Keeping a
+    /// single implementation ensures the production and test paths cannot drift.
+    fn load_with_global(
+        path: Option<&Path>,
+        repo_root: PathBuf,
+        global: Option<&Path>,
+    ) -> Result<Config> {
+        let mut base = Config::default_for(repo_root.clone());
+
+        if let Some(global_p) = global {
+            let global_path_buf = PathBuf::from(global_p);
+            if global_path_buf.exists() {
+                let s = std::fs::read_to_string(&global_path_buf).map_err(|e| {
+                    Error::Config(format!("reading {}: {e}", global_path_buf.display()))
+                })?;
+                let parsed = Config::from_toml_str(&s, repo_root.clone())?;
+                base.cascade.push(ConfigLevel {
+                    source: ConfigSource::Global {
+                        path: global_path_buf,
+                    },
+                    config: parsed.clone(),
+                });
+                base = merge(base, parsed);
             }
-            Err(e) => Err(Error::Config(format!(
-                "reading {}: {e}",
-                candidate.display()
-            ))),
         }
+
+        let local_candidate = path.map_or_else(|| repo_root.join("omniscient.toml"), PathBuf::from);
+        match std::fs::read_to_string(&local_candidate) {
+            Ok(s) => {
+                let source = if path.is_some() {
+                    ConfigSource::Cli {
+                        path: local_candidate.clone(),
+                    }
+                } else {
+                    ConfigSource::Repo {
+                        path: local_candidate.clone(),
+                    }
+                };
+                let parsed = Config::from_toml_str(&s, repo_root.clone())?;
+                base.cascade.push(ConfigLevel {
+                    source,
+                    config: parsed.clone(),
+                });
+                base = merge(base, parsed);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "reading {}: {e}",
+                    local_candidate.display()
+                )));
+            }
+        }
+
+        base.repo_root = repo_root;
+        Ok(base)
     }
 
     /// Check if a file should be indexed based on the language whitelist.
@@ -214,6 +508,7 @@ mod tests {
         assert!((c.search.relevance_ratio - 0.75).abs() < 1e-6);
         assert!(c.search.token_budget > 0);
         assert_eq!(c.languages, vec!["rust", "python", "typescript"]);
+        assert!(c.cascade.is_empty(), "defaults have no cascade levels");
     }
 
     #[test]
@@ -255,7 +550,12 @@ mod tests {
 
     #[test]
     fn missing_file_yields_defaults() {
-        let c = Config::load(Some(Path::new("/nonexistent.toml")), PathBuf::from("/repo")).unwrap();
+        let c = Config::load_with_global(
+            Some(Path::new("/nonexistent.toml")),
+            PathBuf::from("/repo"),
+            None,
+        )
+        .unwrap();
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
     }
 
@@ -264,7 +564,7 @@ mod tests {
         // Pointing the config path at a directory makes read_to_string fail with a
         // non-NotFound error; that must surface, not silently fall back to defaults.
         let dir = tempfile::tempdir().unwrap();
-        let res = Config::load(Some(dir.path()), PathBuf::from("/repo"));
+        let res = Config::load_with_global(Some(dir.path()), PathBuf::from("/repo"), None);
         assert!(
             res.is_err(),
             "a non-NotFound IO error must not yield defaults"
@@ -352,6 +652,23 @@ mod tests {
         let limits = c.embedder.batch_limits();
         assert_eq!(limits.max_chunks, 1);
         assert_eq!(limits.max_bytes, 1);
+    }
+
+    // — Merge unit tests —
+
+    #[test]
+    fn merge_scalar_override() {
+        let base = Config::default_for(PathBuf::from("/repo"));
+        let mut overlay = Config::default_for(PathBuf::from("/other"));
+        overlay.search.max_results = 5;
+
+        let merged = merge(base, overlay);
+        assert_eq!(merged.search.max_results, 5, "overlay scalar wins");
+        assert!(
+            (merged.search.relevance_ratio - 0.75).abs() < 1e-6,
+            "unspecified overlay field keeps base value (got {})",
+            merged.search.relevance_ratio
+        );
     }
 
     #[test]
@@ -494,5 +811,320 @@ mod tests {
         let c =
             Config::from_toml_str("strip_banner_comments = false", PathBuf::from("/repo")).unwrap();
         assert!(!c.strip_banner_comments, "new key must work");
+    }
+
+    #[test]
+    fn merge_vec_replacement() {
+        let base = Config::default_for(PathBuf::from("/repo"));
+        let mut overlay = Config::default_for(PathBuf::from("/other"));
+        overlay.languages = vec!["go".into()];
+
+        let merged = merge(base, overlay);
+        assert_eq!(
+            merged.languages,
+            vec!["go"],
+            "overlay Vec replaces base entirely, not merged"
+        );
+        assert_eq!(
+            merged.exclude,
+            Vec::<String>::new(),
+            "empty overlay exclude keeps base empty"
+        );
+    }
+
+    #[test]
+    fn merge_default_vec_keeps_base() {
+        // When overlay's vec equals the global default, base wins.
+        // This covers the real-world case where the overlay TOML doesn't
+        // mention `languages` / `exclude` and they fall back to defaults.
+        let mut base = Config::default_for(PathBuf::from("/repo"));
+        base.languages = vec!["rust".into(), "python".into()];
+        base.exclude = vec!["vendor/**".into()];
+        let overlay = Config::default_for(PathBuf::from("/other")); // default vecs
+
+        let merged = merge(base, overlay);
+        assert_eq!(
+            merged.languages,
+            vec!["rust", "python"],
+            "overlay default Vec preserves base"
+        );
+        assert_eq!(
+            merged.exclude,
+            vec!["vendor/**"],
+            "overlay default empty exclude preserves base"
+        );
+    }
+
+    #[test]
+    fn merge_repo_root_from_base() {
+        let base = Config::default_for(PathBuf::from("/base-repo"));
+        let overlay = Config::default_for(PathBuf::from("/overlay-repo"));
+        let merged = merge(base, overlay);
+        assert_eq!(
+            merged.repo_root,
+            PathBuf::from("/base-repo"),
+            "repo_root always comes from base"
+        );
+    }
+
+    // — Cascade integration tests —
+
+    #[test]
+    fn cascade_defaults_only() {
+        let repo = tempfile::tempdir().unwrap();
+        // No global, no repo file
+        let c = Config::load_with_global(
+            None,
+            repo.path().to_path_buf(),
+            Some(Path::new("/no/global")),
+        )
+        .unwrap();
+        assert!(c.cascade.is_empty(), "no files → no cascade levels");
+        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+    }
+
+    #[test]
+    fn cascade_global_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_file = global_dir.path().join("omniscient.toml");
+        std::fs::write(&global_file, "[embedder]\nmodel = \"global-model\"\n").unwrap();
+
+        let c =
+            Config::load_with_global(None, repo.path().to_path_buf(), Some(global_file.as_ref()))
+                .unwrap();
+
+        assert_eq!(c.cascade.len(), 1);
+        assert!(matches!(&c.cascade[0].source, ConfigSource::Global { .. }));
+        assert_eq!(c.embedder.model, "global-model");
+    }
+
+    #[test]
+    fn cascade_repo_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_file = repo.path().join("omniscient.toml");
+        std::fs::write(&repo_file, "[search]\nmax_results = 10\n").unwrap();
+
+        let c = Config::load_with_global(
+            None,
+            repo.path().to_path_buf(),
+            Some(Path::new("/no/global")),
+        )
+        .unwrap();
+
+        assert_eq!(c.cascade.len(), 1);
+        assert!(matches!(&c.cascade[0].source, ConfigSource::Repo { .. }));
+        assert_eq!(c.search.max_results, 10);
+    }
+
+    #[test]
+    fn cascade_global_and_repo_repo_overrides() {
+        let repo = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_file = global_dir.path().join("omniscient.toml");
+        std::fs::write(
+            &global_file,
+            r#"
+            [embedder]
+            model = "global-model"
+            [search]
+            max_results = 20
+            "#,
+        )
+        .unwrap();
+
+        let repo_file = repo.path().join("omniscient.toml");
+        std::fs::write(&repo_file, "[search]\nmax_results = 5\n").unwrap();
+
+        let c =
+            Config::load_with_global(None, repo.path().to_path_buf(), Some(global_file.as_ref()))
+                .unwrap();
+
+        assert_eq!(c.cascade.len(), 2);
+        assert!(matches!(&c.cascade[0].source, ConfigSource::Global { .. }));
+        assert!(matches!(&c.cascade[1].source, ConfigSource::Repo { .. }));
+        assert_eq!(
+            c.embedder.model, "global-model",
+            "global model preserved (repo didn't set it)"
+        );
+        assert_eq!(c.search.max_results, 5, "repo max_results overrides global");
+    }
+
+    #[test]
+    fn cascade_cli_replaces_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        // Repo config exists
+        let repo_file = repo.path().join("omniscient.toml");
+        std::fs::write(&repo_file, "[search]\nmax_results = 10\n").unwrap();
+
+        // CLI config exists
+        let cli_dir = tempfile::tempdir().unwrap();
+        let cli_file = cli_dir.path().join("cli.toml");
+        std::fs::write(&cli_file, "[search]\nmax_results = 99\n").unwrap();
+
+        let c = Config::load_with_global(
+            Some(cli_file.as_ref()),
+            repo.path().to_path_buf(),
+            Some(Path::new("/no/global")),
+        )
+        .unwrap();
+
+        assert_eq!(c.cascade.len(), 1);
+        assert!(matches!(&c.cascade[0].source, ConfigSource::Cli { .. }));
+        assert_eq!(c.search.max_results, 99);
+    }
+
+    #[test]
+    fn cascade_vec_replacement_across_levels() {
+        let repo = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_file = global_dir.path().join("omniscient.toml");
+        std::fs::write(
+            &global_file,
+            r#"
+            languages = ["rust", "python", "typescript"]
+            exclude = ["vendor/**"]
+            "#,
+        )
+        .unwrap();
+
+        let repo_file = repo.path().join("omniscient.toml");
+        std::fs::write(&repo_file, "languages = [\"rust\"]\n").unwrap();
+
+        let c =
+            Config::load_with_global(None, repo.path().to_path_buf(), Some(global_file.as_ref()))
+                .unwrap();
+
+        assert_eq!(
+            c.languages,
+            vec!["rust"],
+            "repo languages replaces global (not appended)"
+        );
+        assert_eq!(
+            c.exclude,
+            vec!["vendor/**"],
+            "global exclude preserved (repo didn't set it)"
+        );
+    }
+
+    #[test]
+    fn resolve_key_none_and_empty() {
+        assert_eq!(resolve_key(None, |_| None).unwrap(), None);
+        assert_eq!(resolve_key(Some(""), |_| None).unwrap(), None);
+        assert_eq!(resolve_key(Some("   "), |_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_key_literal() {
+        assert_eq!(
+            resolve_key(Some("sk-abc123"), |_| None).unwrap(),
+            Some("sk-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_key_braced_env() {
+        let out = resolve_key(Some("${MY_KEY}"), |n| {
+            (n == "MY_KEY").then(|| "secret-val".to_string())
+        })
+        .unwrap();
+        assert_eq!(out, Some("secret-val".to_string()));
+    }
+
+    #[test]
+    fn resolve_key_unbraced_env() {
+        let out = resolve_key(Some("$MY_KEY"), |n| {
+            (n == "MY_KEY").then(|| "secret-val".to_string())
+        })
+        .unwrap();
+        assert_eq!(out, Some("secret-val".to_string()));
+    }
+
+    #[test]
+    fn resolve_key_referenced_but_unset_errors() {
+        let err = resolve_key(Some("${MISSING}"), |_| None).unwrap_err();
+        assert!(
+            matches!(&err, Error::Config(m) if m.contains("MISSING")),
+            "error must name the missing var, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_key_env_set_but_empty_is_none() {
+        // A referenced var that is set but empty/whitespace → no auth (not an empty Bearer).
+        assert_eq!(
+            resolve_key(Some("${MY_KEY}"), |n| (n == "MY_KEY").then(String::new)).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_key(Some("$MY_KEY"), |n| (n == "MY_KEY")
+                .then(|| "   ".to_string()))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_key_env_value_is_trimmed() {
+        assert_eq!(
+            resolve_key(Some("${MY_KEY}"), |n| (n == "MY_KEY")
+                .then(|| "  sk-xyz  ".to_string()))
+            .unwrap(),
+            Some("sk-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_key_malformed_dollar_is_literal() {
+        // No valid var name after $ → treated as a literal key, not an env ref.
+        assert_eq!(
+            resolve_key(Some("${BAD-NAME}"), |_| None).unwrap(),
+            Some("${BAD-NAME}".to_string())
+        );
+        assert_eq!(
+            resolve_key(Some("$"), |_| None).unwrap(),
+            Some("$".to_string())
+        );
+    }
+
+    #[test]
+    fn api_key_defaults_none_and_parses() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(c.embedder.api_key, None, "api_key defaults to None");
+
+        let toml = r#"
+        [embedder]
+        api_key = "${OMNISCIENT_API_KEY}"
+    "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.api_key.as_deref(), Some("${OMNISCIENT_API_KEY}"));
+    }
+
+    #[test]
+    fn merge_api_key_overlay_wins_and_inherits() {
+        // Overlay sets it → overlay wins.
+        let base = Config::default_for(PathBuf::from("/repo"));
+        let mut overlay = Config::default_for(PathBuf::from("/other"));
+        overlay.embedder.api_key = Some("repo-key".into());
+        let merged = merge(base, overlay);
+        assert_eq!(merged.embedder.api_key.as_deref(), Some("repo-key"));
+
+        // Overlay unset (None = default) → base value inherited.
+        let mut base = Config::default_for(PathBuf::from("/repo"));
+        base.embedder.api_key = Some("global-key".into());
+        let overlay = Config::default_for(PathBuf::from("/other"));
+        let merged = merge(base, overlay);
+        assert_eq!(merged.embedder.api_key.as_deref(), Some("global-key"));
+    }
+
+    #[test]
+    fn global_path_uses_dirs_config_dir() {
+        let p = global_path();
+        // On any supported platform this should resolve to something
+        // ending in `omniscient/omniscient.toml`
+        assert!(p.is_some(), "global_path should resolve on this platform");
+        let path = p.unwrap();
+        assert_eq!(path.file_name().unwrap(), "omniscient.toml");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "omniscient");
     }
 }
