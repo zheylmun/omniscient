@@ -204,6 +204,11 @@ fn collect_overrides(base: &Config, overlay: &Config) -> Vec<String> {
     {
         names.push("embedder.auto_start_timeout_secs".into());
     }
+    if overlay.embedder.api_key != def.embedder.api_key
+        && overlay.embedder.api_key != base.embedder.api_key
+    {
+        names.push("embedder.api_key".into());
+    }
 
     // Search fields
     if overlay.search.max_results != def.search.max_results
@@ -408,6 +413,47 @@ mod tests {
         assert!(
             text.contains("auto_start"),
             "should hint remediation:\n{text}"
+        );
+    }
+
+    #[test]
+    fn config_check_reports_api_key_override_without_leaking_value() {
+        use crate::config::{Config, ConfigLevel, ConfigSource};
+        use std::path::PathBuf;
+
+        let repo = PathBuf::from("/repo");
+        let mut global = Config::default_for(repo.clone());
+        global.embedder.api_key = None;
+        let mut local = Config::default_for(repo.clone());
+        local.embedder.api_key = Some("super-secret-key".into());
+
+        let mut config = Config::default_for(repo.clone());
+        config.embedder.api_key = Some("super-secret-key".into());
+        config.cascade = vec![
+            ConfigLevel {
+                source: ConfigSource::Global {
+                    path: PathBuf::from("/g/omniscient.toml"),
+                },
+                config: global,
+            },
+            ConfigLevel {
+                source: ConfigSource::Repo {
+                    path: repo.join("omniscient.toml"),
+                },
+                config: local,
+            },
+        ];
+
+        let check = config_check(&config);
+        assert!(
+            check.detail.contains("embedder.api_key"),
+            "override report must name the field, got:\n{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("super-secret-key"),
+            "the secret VALUE must never appear in diagnostics, got:\n{}",
+            check.detail
         );
     }
 
