@@ -404,61 +404,16 @@ impl Config {
     /// slot (not additive with it). Returns the merged config with
     /// `cascade` populated so diagnostics can report overrides.
     pub fn load(path: Option<&Path>, repo_root: PathBuf) -> Result<Config> {
-        let mut base = Config::default_for(repo_root.clone());
-
-        // Level 1: global config
-        if let Some(ref global) = global_path().filter(|p| p.exists()) {
-            let s = std::fs::read_to_string(global)
-                .map_err(|e| Error::Config(format!("reading {}: {e}", global.display())))?;
-            let parsed = Config::from_toml_str(&s, repo_root.clone())?;
-            base.cascade.push(ConfigLevel {
-                source: ConfigSource::Global {
-                    path: global.clone(),
-                },
-                config: parsed.clone(),
-            });
-            base = merge(base, parsed);
-        }
-
-        // Level 2: repo config or --config (mutually exclusive)
-        let local_candidate = path.map_or_else(|| repo_root.join("omniscient.toml"), PathBuf::from);
-        match std::fs::read_to_string(&local_candidate) {
-            Ok(s) => {
-                let source = if path.is_some() {
-                    ConfigSource::Cli {
-                        path: local_candidate.clone(),
-                    }
-                } else {
-                    ConfigSource::Repo {
-                        path: local_candidate.clone(),
-                    }
-                };
-                let parsed = Config::from_toml_str(&s, repo_root.clone())?;
-                base.cascade.push(ConfigLevel {
-                    source,
-                    config: parsed.clone(),
-                });
-                base = merge(base, parsed);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // no local file — use whatever we have so far (defaults ± global)
-            }
-            Err(e) => {
-                return Err(Error::Config(format!(
-                    "reading {}: {e}",
-                    local_candidate.display()
-                )));
-            }
-        }
-
-        // Ensure repo_root is set on the final merged config
-        base.repo_root = repo_root;
-        Ok(base)
+        Self::load_with_global(path, repo_root, global_path().as_deref())
     }
 
-    /// Variant of `load` that lets tests inject a custom global path.
-    #[cfg(test)]
-    pub fn load_with_global(
+    /// Core cascade loader with the global-config path injected explicitly.
+    ///
+    /// `load` is the production entry point and passes `global_path()`; tests
+    /// call this directly to point the global slot at a temp file (or `None`),
+    /// so the suite never reads the machine's real global config. Keeping a
+    /// single implementation ensures the production and test paths cannot drift.
+    fn load_with_global(
         path: Option<&Path>,
         repo_root: PathBuf,
         global: Option<&Path>,
@@ -595,7 +550,12 @@ mod tests {
 
     #[test]
     fn missing_file_yields_defaults() {
-        let c = Config::load(Some(Path::new("/nonexistent.toml")), PathBuf::from("/repo")).unwrap();
+        let c = Config::load_with_global(
+            Some(Path::new("/nonexistent.toml")),
+            PathBuf::from("/repo"),
+            None,
+        )
+        .unwrap();
         assert_eq!(c.embedder.model, "qwen3-embedding-4b");
     }
 
@@ -604,7 +564,7 @@ mod tests {
         // Pointing the config path at a directory makes read_to_string fail with a
         // non-NotFound error; that must surface, not silently fall back to defaults.
         let dir = tempfile::tempdir().unwrap();
-        let res = Config::load(Some(dir.path()), PathBuf::from("/repo"));
+        let res = Config::load_with_global(Some(dir.path()), PathBuf::from("/repo"), None);
         assert!(
             res.is_err(),
             "a non-NotFound IO error must not yield defaults"
