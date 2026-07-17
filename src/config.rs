@@ -317,11 +317,13 @@ fn resolve_key(
         return Ok(None);
     };
     if let Some(name) = env_var_ref(val) {
-        return lookup(name).map(Some).ok_or_else(|| {
-            Error::Config(format!(
+        let Some(resolved) = lookup(name) else {
+            return Err(Error::Config(format!(
                 "embedder.api_key references ${{{name}}} but that environment variable is not set"
-            ))
-        });
+            )));
+        };
+        let trimmed = resolved.trim();
+        return Ok((!trimmed.is_empty()).then(|| trimmed.to_string()));
     }
     Ok(Some(val.to_string()))
 }
@@ -1084,6 +1086,31 @@ mod tests {
         assert!(
             matches!(&err, Error::Config(m) if m.contains("MISSING")),
             "error must name the missing var, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_key_env_set_but_empty_is_none() {
+        // A referenced var that is set but empty/whitespace → no auth (not an empty Bearer).
+        assert_eq!(
+            resolve_key(Some("${MY_KEY}"), |n| (n == "MY_KEY").then(String::new)).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_key(Some("$MY_KEY"), |n| (n == "MY_KEY")
+                .then(|| "   ".to_string()))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_key_env_value_is_trimmed() {
+        assert_eq!(
+            resolve_key(Some("${MY_KEY}"), |n| (n == "MY_KEY")
+                .then(|| "  sk-xyz  ".to_string()))
+            .unwrap(),
+            Some("sk-xyz".to_string())
         );
     }
 
