@@ -129,6 +129,11 @@ fn merge_embedder(base: EmbedderConfig, overlay: EmbedderConfig) -> EmbedderConf
         } else {
             overlay.request_timeout_secs
         },
+        api_key: if overlay.api_key == def.api_key {
+            base.api_key
+        } else {
+            overlay.api_key
+        },
     }
 }
 
@@ -207,6 +212,14 @@ pub struct EmbedderConfig {
     /// Timeout in seconds for each HTTP request to the embeddings endpoint.
     /// Guards against a hanging llama.cpp server blocking the MCP tool call.
     pub request_timeout_secs: u64,
+    /// Bearer token for an authenticated embeddings endpoint (a llama.cpp server
+    /// started with `--api-key`, or an OpenAI-compatible router). Sent as
+    /// `Authorization: Bearer <key>`. `None`/absent → no auth header.
+    ///
+    /// A whole-string `${VAR}` or `$VAR` value is expanded from the environment
+    /// at connect time (errors if the var is unset), keeping the secret out of
+    /// the config file. Any other value is used literally.
+    pub api_key: Option<String>,
 }
 impl Default for EmbedderConfig {
     fn default() -> Self {
@@ -222,6 +235,7 @@ impl Default for EmbedderConfig {
             pooling: "last".into(),
             auto_start_timeout_secs: 600,
             request_timeout_secs: 30,
+            api_key: None,
         }
     }
 }
@@ -234,6 +248,12 @@ impl EmbedderConfig {
             max_chunks: self.max_batch_chunks.max(1),
             max_bytes: self.max_batch_bytes.max(1),
         }
+    }
+
+    /// Resolve `api_key` into the literal bearer token to send (see `resolve_key`).
+    /// Called once on the connect path; the expanded secret is never stored.
+    pub fn resolved_api_key(&self) -> Result<Option<String>> {
+        resolve_key(self.api_key.as_deref(), |n| std::env::var(n).ok())
     }
 }
 
@@ -279,6 +299,46 @@ impl Default for WatchConfig {
             debounce_ms: 200,
         }
     }
+}
+
+/// Parse the `api_key` form and produce the literal secret to send.
+/// Pure: env access is injected via `lookup` so the logic is testable without
+/// touching process env.
+///
+/// - `None` / blank: `Ok(None)` (no auth header)
+/// - whole-string `${NAME}`/`$NAME` (NAME = `[A-Za-z_][A-Za-z0-9_]*`): `lookup(NAME)`;
+///   `Err` if it returns `None`
+/// - anything else: `Ok(Some(literal))`
+fn resolve_key(
+    raw: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(name) = env_var_ref(val) {
+        return lookup(name).map(Some).ok_or_else(|| {
+            Error::Config(format!(
+                "embedder.api_key references ${{{name}}} but that environment variable is not set"
+            ))
+        });
+    }
+    Ok(Some(val.to_string()))
+}
+
+/// If `s` is a whole-string environment reference (`${NAME}` or `$NAME` with a
+/// valid shell-identifier `NAME`), return `NAME`; otherwise `None` (literal).
+fn env_var_ref(s: &str) -> Option<&str> {
+    let inner = s
+        .strip_prefix("${")
+        .and_then(|r| r.strip_suffix('}'))
+        .or_else(|| s.strip_prefix('$'))?;
+    let valid = inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(inner)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -983,6 +1043,91 @@ mod tests {
             vec!["vendor/**"],
             "global exclude preserved (repo didn't set it)"
         );
+    }
+
+    #[test]
+    fn resolve_key_none_and_empty() {
+        assert_eq!(resolve_key(None, |_| None).unwrap(), None);
+        assert_eq!(resolve_key(Some(""), |_| None).unwrap(), None);
+        assert_eq!(resolve_key(Some("   "), |_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_key_literal() {
+        assert_eq!(
+            resolve_key(Some("sk-abc123"), |_| None).unwrap(),
+            Some("sk-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_key_braced_env() {
+        let out = resolve_key(Some("${MY_KEY}"), |n| {
+            (n == "MY_KEY").then(|| "secret-val".to_string())
+        })
+        .unwrap();
+        assert_eq!(out, Some("secret-val".to_string()));
+    }
+
+    #[test]
+    fn resolve_key_unbraced_env() {
+        let out = resolve_key(Some("$MY_KEY"), |n| {
+            (n == "MY_KEY").then(|| "secret-val".to_string())
+        })
+        .unwrap();
+        assert_eq!(out, Some("secret-val".to_string()));
+    }
+
+    #[test]
+    fn resolve_key_referenced_but_unset_errors() {
+        let err = resolve_key(Some("${MISSING}"), |_| None).unwrap_err();
+        assert!(
+            matches!(&err, Error::Config(m) if m.contains("MISSING")),
+            "error must name the missing var, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_key_malformed_dollar_is_literal() {
+        // No valid var name after $ → treated as a literal key, not an env ref.
+        assert_eq!(
+            resolve_key(Some("${BAD-NAME}"), |_| None).unwrap(),
+            Some("${BAD-NAME}".to_string())
+        );
+        assert_eq!(
+            resolve_key(Some("$"), |_| None).unwrap(),
+            Some("$".to_string())
+        );
+    }
+
+    #[test]
+    fn api_key_defaults_none_and_parses() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(c.embedder.api_key, None, "api_key defaults to None");
+
+        let toml = r#"
+        [embedder]
+        api_key = "${OMNISCIENT_API_KEY}"
+    "#;
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.api_key.as_deref(), Some("${OMNISCIENT_API_KEY}"));
+    }
+
+    #[test]
+    fn merge_api_key_overlay_wins_and_inherits() {
+        // Overlay sets it → overlay wins.
+        let base = Config::default_for(PathBuf::from("/repo"));
+        let mut overlay = Config::default_for(PathBuf::from("/other"));
+        overlay.embedder.api_key = Some("repo-key".into());
+        let merged = merge(base, overlay);
+        assert_eq!(merged.embedder.api_key.as_deref(), Some("repo-key"));
+
+        // Overlay unset (None = default) → base value inherited.
+        let mut base = Config::default_for(PathBuf::from("/repo"));
+        base.embedder.api_key = Some("global-key".into());
+        let overlay = Config::default_for(PathBuf::from("/other"));
+        let merged = merge(base, overlay);
+        assert_eq!(merged.embedder.api_key.as_deref(), Some("global-key"));
     }
 
     #[test]
