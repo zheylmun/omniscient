@@ -6,6 +6,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Refuse to run as root. `cargo install --path .` installs into the *invoking*
+# user's $CARGO_HOME/bin (~/.cargo/bin) and reuses ./target for the build, so no
+# step here needs root. Running under sudo would instead build into /root/.cargo,
+# chown ./target to root, and leave your normal user unable to rebuild — the
+# binary then silently goes stale (reloading the MCP server can't fix it, since
+# it just re-launches the same unrebuilt binary). Set OMNISCIENT_ALLOW_ROOT=1 to
+# override on the rare system where root is your normal login user.
+if [ "$(id -u)" -eq 0 ] && [ "${OMNISCIENT_ALLOW_ROOT:-}" != "1" ]; then
+  echo "Error: don't run install.sh as root (no step needs it)." >&2
+  echo "       cargo installs to ~/.cargo/bin and builds in ./target as your user." >&2
+  echo "       Re-run without sudo. (Override: OMNISCIENT_ALLOW_ROOT=1)" >&2
+  echo "       If a prior sudo run left ./target root-owned, reclaim it with:" >&2
+  echo "         sudo chown -R \"\$(id -un)\" target" >&2
+  exit 1
+fi
+
 # Install the prek-managed git hooks (rustfmt + markdown on commit; clippy +
 # tests on push — see .pre-commit-config.yaml). Safe to re-run. Best-effort: this
 # requires a git checkout, and a failure here must never block `cargo install`.
