@@ -69,6 +69,18 @@ fn schema_for(dim: usize) -> Arc<Schema> {
     ]))
 }
 
+fn meta_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("file_hash", DataType::Utf8, false),
+    ]))
+}
+
+/// SQL predicate matching one file's rows, with single quotes escaped.
+fn path_eq_filter(path: &str) -> String {
+    format!("path = '{}'", path.replace('\'', "''"))
+}
+
 impl Index {
     pub async fn open(
         dir: &Path,
@@ -136,17 +148,13 @@ impl Index {
         // Lightweight metadata table: one row per file (path, file_hash).
         // file_hashes() reads from this instead of scanning every chunk row,
         // so it scales O(files) not O(chunks).
-        let meta_schema = Arc::new(Schema::new(vec![
-            Field::new("path", DataType::Utf8, false),
-            Field::new("file_hash", DataType::Utf8, false),
-        ]));
         let meta = if has_table(&names, "file_meta") {
             conn.open_table("file_meta")
                 .execute()
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?
         } else {
-            conn.create_empty_table("file_meta", meta_schema)
+            conn.create_empty_table("file_meta", meta_schema())
                 .execute()
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?
@@ -175,7 +183,7 @@ impl Index {
     }
 
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let filter = format!("path = '{}'", path.replace('\'', "''"));
+        let filter = path_eq_filter(path);
         self.table
             .delete(&filter)
             .await
@@ -189,12 +197,8 @@ impl Index {
 
     /// Upsert a single (path, `file_hash`) row into the lightweight metadata table.
     pub async fn upsert_file_meta(&self, path: &str, file_hash: &str) -> Result<()> {
-        let meta_schema = Arc::new(Schema::new(vec![
-            Field::new("path", DataType::Utf8, false),
-            Field::new("file_hash", DataType::Utf8, false),
-        ]));
         let batch = RecordBatch::try_new(
-            meta_schema,
+            meta_schema(),
             vec![
                 Arc::new(StringArray::from(vec![path.to_string()])),
                 Arc::new(StringArray::from(vec![file_hash.to_string()])),
@@ -203,7 +207,7 @@ impl Index {
         .map_err(|e| Error::Index(e.to_string()))?;
         // Delete old row for this path first, then add — ensures at most one row.
         self.meta
-            .delete(&format!("path = '{}'", path.replace('\'', "''")))
+            .delete(&path_eq_filter(path))
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
         self.meta
@@ -237,8 +241,8 @@ impl Index {
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
         let pred = format!(
-            "path = '{}' AND file_hash <> '{}'",
-            path.replace('\'', "''"),
+            "{} AND file_hash <> '{}'",
+            path_eq_filter(path),
             new_hash.replace('\'', "''"),
         );
         self.table
