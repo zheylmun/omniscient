@@ -216,37 +216,42 @@ impl Engine {
         Ok(vs.remove(0))
     }
 
+    fn query_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.search.search_timeout_secs.max(1))
+    }
+
+    fn query_timeout_err(&self) -> Error {
+        Error::Timeout(format!(
+            "query timed out after {}s — embed + index query exceeded the limit \
+             (set [search] search_timeout_secs)",
+            self.config.search.search_timeout_secs
+        ))
+    }
+
     pub async fn search(&self, query: &str, k: Option<usize>) -> Result<Vec<ContextEntry>> {
-        let timeout = std::time::Duration::from_secs(self.config.search.search_timeout_secs.max(1));
-        tokio::time::timeout(timeout, async {
-            self.ensure_fresh().await?;
-            // `k` is the candidate ceiling, not a target: relevance-shape selection in
-            // `distill_context` trims this pool down to results of similar relevance.
-            let k = k.unwrap_or(self.config.search.max_results).max(1);
+        // ensure_fresh may run a legitimately slow reconcile (cold/large index); it is NOT
+        // under the timeout. Its hang guard is the per-request embedder timeout. The timeout
+        // here bounds only the interactive query so a hung endpoint can't block the tool.
+        self.ensure_fresh().await?;
+        let k = k.unwrap_or(self.config.search.max_results).max(1);
+        let hits = tokio::time::timeout(self.query_timeout(), async {
             let qv = self.embed_one(query).await?;
-            let hits = self.index.search(&qv, k).await?;
-            // Enforce the exclude policy at read time too: even if the index hasn't
-            // reconciled away an excluded file yet (lag window — embedder was down,
-            // mid-reconcile on a large repo, watcher not caught up), never surface it.
-            let hits: Vec<_> = hits
-                .into_iter()
-                .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
-                .collect();
-            Ok(distill_context(
-                hits,
-                self.config.strip_banner_comments,
-                self.config.search.token_budget,
-                self.config.search.relevance_ratio,
-            ))
+            self.index.search(&qv, k).await
         })
         .await
-        .map_err(|_| {
-            Error::Timeout(format!(
-                "search timed out after {}s — ensure_fresh + embed + index query exceeded the \
-                 limit (set [search] search_timeout_secs)",
-                self.config.search.search_timeout_secs
-            ))
-        })?
+        .map_err(|_| self.query_timeout_err())??;
+        // Enforce the exclude policy at read time too: even if the index hasn't reconciled
+        // away an excluded file yet (lag window), never surface it.
+        let hits: Vec<_> = hits
+            .into_iter()
+            .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
+            .collect();
+        Ok(distill_context(
+            hits,
+            self.config.strip_banner_comments,
+            self.config.search.token_budget,
+            self.config.search.relevance_ratio,
+        ))
     }
 
     pub async fn read_file(&self, path: &str, focus: Option<&str>) -> Result<Vec<ContextEntry>> {
@@ -272,11 +277,16 @@ impl Engine {
                     return Ok(vec![]);
                 }
                 let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-                let fv = self.embed_one(f).await?;
-                let cvs = self
-                    .embedder
-                    .embed_batched(&texts, self.config.embedder.batch_limits())
-                    .await?;
+                let (fv, cvs) = tokio::time::timeout(self.query_timeout(), async {
+                    let fv = self.embed_one(f).await?;
+                    let cvs = self
+                        .embedder
+                        .embed_batched(&texts, self.config.embedder.batch_limits())
+                        .await?;
+                    Ok::<_, Error>((fv, cvs))
+                })
+                .await
+                .map_err(|_| self.query_timeout_err())??;
                 if cvs.len() != texts.len() {
                     return Err(Error::Embed(format!(
                         "embedder returned {} vectors for {} inputs",
@@ -903,6 +913,30 @@ mod tests {
         assert!(
             matches!(err, Error::Timeout(_)),
             "expected Error::Timeout, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_focus_times_out_when_embedder_is_slow() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.search_timeout_secs = 1;
+        let engine = Engine::new_with_embedder(
+            cfg,
+            Arc::new(SlowEmbedder {
+                inner: MockEmbedder::new("mock-v1", 64),
+            }),
+        )
+        .await
+        .unwrap();
+        let err = engine
+            .read_file("a.rs", Some("anything"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Timeout(_)),
+            "read_file focus must honor the query timeout, got {err:?}"
         );
     }
 }
