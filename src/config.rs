@@ -228,7 +228,7 @@ impl Default for EmbedderConfig {
             model: "qwen3-embedding-4b".into(),
             max_batch_chunks: 64,
             max_batch_bytes: 32000,
-            embed_concurrency: 4,
+            embed_concurrency: 1,
             auto_start: false,
             llama_bin: "llama".into(),
             hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
@@ -1126,5 +1126,14 @@ mod tests {
         let path = p.unwrap();
         assert_eq!(path.file_name().unwrap(), "omniscient.toml");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "omniscient");
+    }
+
+    #[test]
+    fn embed_concurrency_defaults_to_one() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(
+            c.embedder.embed_concurrency, 1,
+            "default must match a single-slot llama.cpp server"
+        );
     }
 }
