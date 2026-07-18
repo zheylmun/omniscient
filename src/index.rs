@@ -81,6 +81,48 @@ fn path_eq_filter(path: &str) -> String {
     format!("path = '{}'", path.replace('\'', "''"))
 }
 
+/// One-time upgrade migration: an index built before `file_meta` existed has populated
+/// `chunks` but empty meta. Rebuild meta from the distinct `(path, file_hash)` pairs in
+/// the chunks table so `file_hashes()` doesn't report every file as new.
+async fn backfill_meta_from_chunks(table: &Table, meta: &Table) -> Result<()> {
+    use lancedb::query::Select;
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .select(Select::columns(&["path", "file_hash"]))
+        .execute()
+        .await
+        .map_err(|e| Error::Index(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| Error::Index(e.to_string()))?;
+    let mut map: HashMap<String, String> = HashMap::new();
+    for b in &batches {
+        let paths = str_col(b, "path")?;
+        let hashes = str_col(b, "file_hash")?;
+        for i in 0..b.num_rows() {
+            map.insert(paths.value(i).to_string(), hashes.value(i).to_string());
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    let (paths, hashes): (Vec<String>, Vec<String>) = map.into_iter().unzip();
+    let schema = meta_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(StringArray::from(hashes)),
+        ],
+    )
+    .map_err(|e| Error::Index(e.to_string()))?;
+    meta.add(vec![batch])
+        .execute()
+        .await
+        .map_err(|e| Error::Index(e.to_string()))?;
+    Ok(())
+}
+
 impl Index {
     pub async fn open(
         dir: &Path,
@@ -159,6 +201,23 @@ impl Index {
                 .await
                 .map_err(|e| Error::Index(e.to_string()))?
         };
+
+        // Upgrade migration: if meta is empty but chunks exist (index predates the
+        // file_meta table), backfill so every file isn't re-embedded on first reconcile.
+        if !rebuilt
+            && meta
+                .count_rows(None)
+                .await
+                .map_err(|e| Error::Index(e.to_string()))?
+                == 0
+            && table
+                .count_rows(None)
+                .await
+                .map_err(|e| Error::Index(e.to_string()))?
+                > 0
+        {
+            backfill_meta_from_chunks(&table, &meta).await?;
+        }
 
         std::fs::write(
             &meta_path,
@@ -571,6 +630,36 @@ mod tests {
             .unwrap();
         assert!(idx.rebuilt());
         assert!(idx.file_hashes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_backfills_meta_from_chunks_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+            idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
+                .await
+                .unwrap();
+        }
+        // Simulate an index written before file_meta existed: drop the meta table.
+        let conn = lancedb::connect(dir.path().join("lance").to_string_lossy().as_ref())
+            .execute()
+            .await
+            .unwrap();
+        conn.drop_table("file_meta", &[]).await.unwrap();
+        // Reopen: backfill must repopulate meta so the file isn't seen as new.
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        let hashes = idx.file_hashes().await.unwrap();
+        assert_eq!(
+            hashes.get("a.rs"),
+            Some(&"h1".to_string()),
+            "meta must be backfilled from the chunks table on open"
+        );
+        assert_eq!(
+            idx.chunk_count().await.unwrap(),
+            1,
+            "backfill must not touch chunks"
+        );
     }
 
     #[tokio::test]
