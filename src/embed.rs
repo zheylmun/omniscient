@@ -348,6 +348,35 @@ fn apply_auth(rb: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::Re
     }
 }
 
+/// Build a helpful error for a non-success embeddings response. A `401`/`403`
+/// means the request reached the server but was *rejected* — an auth problem,
+/// not connectivity — so point at `[embedder] api_key` rather than the
+/// "is it serving the model?" hint that fits a transport failure. Factored out
+/// so the status→message mapping is unit-testable without a live server.
+fn embed_http_error(status: reqwest::StatusCode, url: &str, body: &str) -> Error {
+    use reqwest::StatusCode;
+    // Bound the body: an OpenAI-compatible router may answer with a full HTML
+    // error page, not the small JSON llama.cpp returns.
+    let body = body.trim();
+    let detail = if body.is_empty() {
+        String::new()
+    } else {
+        let mut b = body.chars().take(300).collect::<String>();
+        if body.chars().count() > 300 {
+            b.push('…');
+        }
+        format!(": {b}")
+    };
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::Embed(format!(
+            "POST {url} rejected with {status}{detail}. The embeddings endpoint requires \
+             authentication — set `[embedder] api_key` in omniscient.toml (a literal token, \
+             or `${{VAR}}` to read one from the environment) to a valid key."
+        )),
+        _ => Error::Embed(format!("POST {url} failed with {status}{detail}")),
+    }
+}
+
 impl LlamaCppEmbedder {
     pub async fn connect(
         base_url: String,
@@ -409,9 +438,15 @@ impl LlamaCppEmbedder {
                 Error::Embed(format!(
                     "POST {url} failed: {e}. Is llama.cpp serving the embedding model?"
                 ))
-            })?
-            .error_for_status()
-            .map_err(|e| Error::Embed(e.to_string()))?
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Read the body before erroring: llama.cpp/OpenAI-compatible servers
+            // put the real reason (e.g. "Invalid API Key") in the response body.
+            let body = resp.text().await.unwrap_or_default();
+            return Err(embed_http_error(status, &url, &body));
+        }
+        let resp = resp
             .json::<Resp>()
             .await
             .map_err(|e| Error::Embed(e.to_string()))?;
@@ -684,6 +719,54 @@ mod tests {
             .build()
             .unwrap();
         assert!(req.headers().get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn http_error_401_points_at_api_key_and_includes_body() {
+        let Error::Embed(m) = embed_http_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "http://host:8080/v1/embeddings",
+            "{\"error\":{\"message\":\"Invalid API Key\"}}",
+        ) else {
+            unreachable!("embed_http_error always returns Error::Embed")
+        };
+        assert!(m.contains("401"), "message should name the status: {m}");
+        assert!(
+            m.contains("api_key"),
+            "message should point at api_key: {m}"
+        );
+        assert!(
+            m.contains("Invalid API Key"),
+            "message should include the server body: {m}"
+        );
+    }
+
+    #[test]
+    fn http_error_403_also_points_at_api_key() {
+        let Error::Embed(m) = embed_http_error(
+            reqwest::StatusCode::FORBIDDEN,
+            "http://host:8080/v1/embeddings",
+            "",
+        ) else {
+            unreachable!("embed_http_error always returns Error::Embed")
+        };
+        assert!(m.contains("api_key"), "403 should point at api_key: {m}");
+    }
+
+    #[test]
+    fn http_error_500_is_generic_not_auth() {
+        let Error::Embed(m) = embed_http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "http://host:8080/v1/embeddings",
+            "boom",
+        ) else {
+            unreachable!("embed_http_error always returns Error::Embed")
+        };
+        assert!(m.contains("500"), "message should name the status: {m}");
+        assert!(
+            !m.contains("api_key"),
+            "a non-auth failure must not mislead toward api_key: {m}"
+        );
     }
 
     #[tokio::test]
