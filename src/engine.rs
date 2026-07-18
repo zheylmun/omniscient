@@ -22,6 +22,32 @@ struct WorkItem {
     file_hash: String,
 }
 
+/// Restores the `dirty` flag on drop unless disarmed. A reconcile clears `dirty` before
+/// scanning; if it is then cancelled (dropped tool future, panic) or errors, the guard
+/// re-marks `dirty` so the next search re-scans instead of serving a clean+partial index.
+struct DirtyGuard<'a> {
+    state: &'a RefreshState,
+    armed: bool,
+}
+
+impl<'a> DirtyGuard<'a> {
+    fn new(state: &'a RefreshState) -> Self {
+        state.clear_dirty();
+        Self { state, armed: true }
+    }
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DirtyGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.mark_dirty();
+        }
+    }
+}
+
 pub struct Engine {
     config: Config,
     embedder: Arc<dyn Embedder>,
@@ -95,26 +121,27 @@ impl Engine {
 
     /// Single-flight reconcile. Clears `dirty` BEFORE scanning so an event arriving
     /// mid-scan re-sets it (costing at most one redundant reconcile, never a lost update).
-    /// If `reconcile_inner` fails, `dirty` is restored — otherwise a failed reconcile
+    /// `DirtyGuard` restores `dirty` if `reconcile_inner` errors OR the future is
+    /// cancelled (dropped) before it finishes — otherwise a failed/cancelled reconcile
     /// would leave the state clean+active and let `search` skip the scan and serve stale.
     pub async fn reconcile(&self) -> Result<()> {
         let _guard = self.refresh.lock.lock().await;
         if self.refresh.can_skip_scan() {
             return Ok(());
         } // another reconcile beat us
-        self.refresh.clear_dirty();
-        self.reconcile_inner()
-            .await
-            .inspect_err(|_| self.refresh.mark_dirty())
+        let dirty_guard = DirtyGuard::new(&self.refresh);
+        self.reconcile_inner().await?;
+        dirty_guard.disarm();
+        Ok(())
     }
 
     /// Force a full reconcile regardless of flags (used by `reindex` and tests).
     pub async fn refresh(&self) -> Result<()> {
         let _guard = self.refresh.lock.lock().await;
-        self.refresh.clear_dirty();
-        self.reconcile_inner()
-            .await
-            .inspect_err(|_| self.refresh.mark_dirty())
+        let dirty_guard = DirtyGuard::new(&self.refresh);
+        self.reconcile_inner().await?;
+        dirty_guard.disarm();
+        Ok(())
     }
 
     async fn reconcile_inner(&self) -> Result<()> {
@@ -913,6 +940,28 @@ mod tests {
         assert!(
             matches!(err, Error::Timeout(_)),
             "expected Error::Timeout, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconcile_leaves_dirty_set() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(
+            cfg,
+            Arc::new(SlowEmbedder {
+                inner: MockEmbedder::new("mock-v1", 64),
+            }),
+        )
+        .await
+        .unwrap();
+        // Drop the reconcile future while it is mid-embed (SlowEmbedder sleeps 10s).
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(50), engine.reconcile()).await;
+        assert!(
+            engine.refresh_state().is_dirty(),
+            "a cancelled reconcile must leave the index marked dirty"
         );
     }
 
