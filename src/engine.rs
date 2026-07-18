@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::freshness::{diff, exclude_matcher, is_excluded, resolve_excludes, scan};
 use crate::index::{Index, StoredChunk};
 use crate::refresh::RefreshState;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use ignore::gitignore::Gitignore;
 use std::path::Path;
 use std::sync::Arc;
@@ -154,49 +154,49 @@ impl Engine {
             });
         }
 
-        // Phase 2: embed + upsert in parallel with bounded concurrency.
+        // Phase 2: embed in parallel (bounded), write serially. buffer_unordered runs up
+        // to `concurrency` embeds at once but yields to a single serial consumer, so index
+        // commits never overlap (no LanceDB commit conflicts) and only `concurrency` files
+        // are held in flight (O(concurrency) memory, not O(repo)).
         let concurrency = self.config.embedder.embed_concurrency.max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut tasks = FuturesUnordered::new();
-        for item in work {
-            let semaphore = semaphore.clone();
-            let embedder = self.embedder.clone();
-            let index = self.index.clone();
-            let batch_limits = self.config.embedder.batch_limits();
-            tasks.push(async move {
-                let _permit = semaphore.acquire_owned().await.unwrap();
-                let texts: Vec<String> = item.chunks.iter().map(|c| c.text.clone()).collect();
+        let batch_limits = self.config.embedder.batch_limits();
+        let embedder = &self.embedder;
+        let index = &self.index;
+        stream::iter(work)
+            .map(|item| async move {
+                let WorkItem {
+                    path,
+                    chunks,
+                    file_hash,
+                } = item;
+                let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
                 let vectors = embedder.embed_batched(&texts, batch_limits).await?;
                 if vectors.len() != texts.len() {
                     return Err(Error::Embed(format!(
-                        "embedder returned {} vectors for {} inputs (file {})",
+                        "embedder returned {} vectors for {} inputs (file {path})",
                         vectors.len(),
                         texts.len(),
-                        item.path
                     )));
                 }
-                let stored_chunks: Vec<StoredChunk> = item
-                    .chunks
+                let stored: Vec<StoredChunk> = chunks
                     .into_iter()
                     .zip(vectors)
                     .map(|(c, v)| StoredChunk {
-                        path: item.path.clone(),
+                        path: path.clone(),
                         start_line: c.start_line,
                         end_line: c.end_line,
                         language: c.language,
                         symbol: c.symbol,
                         text: c.text,
-                        file_hash: item.file_hash.clone(),
+                        file_hash: file_hash.clone(),
                         vector: v,
                     })
                     .collect();
-                index.upsert_file(&item.path, stored_chunks).await
-            });
-        }
-        // Drive futures to completion, returning first error.
-        while let Some(res) = tasks.next().await {
-            res?;
-        }
+                Ok::<(String, Vec<StoredChunk>), Error>((path, stored))
+            })
+            .buffer_unordered(concurrency)
+            .try_for_each(|(path, stored)| async move { index.upsert_file(&path, stored).await })
+            .await?;
         for path in &delta.deleted {
             self.index.delete_file(path).await?;
         }
@@ -667,7 +667,7 @@ mod tests {
     async fn reconcile_embeds_multiple_files_in_parallel() {
         let repo = tempdir().unwrap();
         // Create several files that will all need embedding on first reconcile.
-        for i in 0..5 {
+        for i in 0..12 {
             fs::write(
                 repo.path().join(format!("mod_{i}.rs")),
                 format!("pub fn func_{i}() {{ /* body {i} */ }}\n"),
@@ -680,14 +680,22 @@ mod tests {
             .unwrap();
         engine.refresh().await.unwrap();
         let hashes = engine.index.file_hashes().await.unwrap();
-        for i in 0..5 {
+        for i in 0..12 {
             assert!(
                 hashes.contains_key(&format!("mod_{i}.rs")),
                 "mod_{i}.rs should be indexed"
             );
         }
         let count = engine.index.chunk_count().await.unwrap();
-        assert_eq!(count, 5, "exactly 5 chunks from 5 files");
+        assert_eq!(count, 12, "exactly 12 chunks from 12 files");
+
+        // A second reconcile with no changes must not duplicate anything (idempotency).
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.index.chunk_count().await.unwrap(),
+            12,
+            "re-reconcile must not duplicate chunks"
+        );
     }
 
     #[tokio::test]
