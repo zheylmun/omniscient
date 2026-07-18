@@ -398,7 +398,6 @@ impl LazyEngine {
             })
             .await
             .map(Arc::clone)
-            .map_err(|e| e.as_str().into())
     }
 }
 
