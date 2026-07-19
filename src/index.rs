@@ -54,6 +54,10 @@ fn schema_for(dim: usize) -> Arc<Schema> {
         Field::new("path", DataType::Utf8, false),
         Field::new("start_line", DataType::UInt32, false),
         Field::new("end_line", DataType::UInt32, false),
+        // Per-file ordinal (0-based, tree-walk order). Part of the merge key so two
+        // chunks that share a physical line range (e.g. `type A=u8; type B=u16;` or
+        // minified TS) stay distinct — line ranges alone are not unique.
+        Field::new("chunk_index", DataType::UInt32, false),
         Field::new("language", DataType::Utf8, false),
         Field::new("symbol", DataType::Utf8, true),
         Field::new("text", DataType::Utf8, false),
@@ -175,7 +179,9 @@ impl Index {
             .execute()
             .await
             .map_err(|e| Error::Index(e.to_string()))?;
-        let table = if has_table(&names, "chunks") {
+        let chunks_existed = has_table(&names, "chunks");
+        let meta_existed = has_table(&names, "file_meta");
+        let table = if chunks_existed {
             conn.open_table("chunks")
                 .execute()
                 .await
@@ -190,7 +196,7 @@ impl Index {
         // Lightweight metadata table: one row per file (path, file_hash).
         // file_hashes() reads from this instead of scanning every chunk row,
         // so it scales O(files) not O(chunks).
-        let meta = if has_table(&names, "file_meta") {
+        let meta = if meta_existed {
             conn.open_table("file_meta")
                 .execute()
                 .await
@@ -202,20 +208,11 @@ impl Index {
                 .map_err(|e| Error::Index(e.to_string()))?
         };
 
-        // Upgrade migration: if meta is empty but chunks exist (index predates the
-        // file_meta table), backfill so every file isn't re-embedded on first reconcile.
-        if !rebuilt
-            && meta
-                .count_rows(None)
-                .await
-                .map_err(|e| Error::Index(e.to_string()))?
-                == 0
-            && table
-                .count_rows(None)
-                .await
-                .map_err(|e| Error::Index(e.to_string()))?
-                > 0
-        {
+        // Upgrade migration: an index that predates the file_meta table has chunks but
+        // no meta table, so backfill it (once) to avoid re-embedding every file on the
+        // first reconcile. Gating on table existence — not row counts — keeps the happy
+        // path (already-migrated or brand-new index) free of full-table count scans.
+        if !rebuilt && chunks_existed && !meta_existed {
             backfill_meta_from_chunks(&table, &meta).await?;
         }
 
@@ -278,11 +275,14 @@ impl Index {
     }
 
     /// Replace all rows for `path` with `chunks` in a single atomic `merge_insert`
-    /// keyed on `(path, start_line, end_line)`: matching chunks are updated, new ones
-    /// inserted, and stale chunks for this path deleted. A concurrent `search` therefore
-    /// sees all-old or all-new, never a gap or a superset. The operation is idempotent,
-    /// so an interrupted reconcile that re-upserts the same content self-heals instead of
-    /// duplicating rows. `file_meta` is updated in the same call and kept in lockstep.
+    /// keyed on `(path, chunk_index)`: matching chunks are updated, new ones inserted,
+    /// and stale chunks for this path deleted. The key uses the per-file ordinal rather
+    /// than the line range because two top-level defs can share a physical line (e.g.
+    /// minified TS, or `type A=u8; type B=u16;`), which would collide as merge keys and
+    /// abort the whole operation. A concurrent `search` therefore sees all-old or all-new,
+    /// never a gap or a superset. The operation is idempotent, so an interrupted reconcile
+    /// that re-upserts the same content self-heals instead of duplicating rows. `file_meta`
+    /// is updated in the same call and kept in lockstep.
     pub async fn upsert_file(&self, path: &str, chunks: Vec<StoredChunk>) -> Result<()> {
         if chunks.is_empty() {
             // File now yields no chunks (e.g. deleted/emptied): just drop its rows.
@@ -295,7 +295,7 @@ impl Index {
         // Single atomic commit: update matching chunks, insert new ones, and delete
         // this file's stale chunks (scoped by path) that the new set no longer covers.
         // Idempotent — re-running with identical content converges to one set of rows.
-        let mut op = self.table.merge_insert(&["path", "start_line", "end_line"]);
+        let mut op = self.table.merge_insert(&["path", "chunk_index"]);
         op.when_matched_update_all(None);
         op.when_not_matched_insert_all();
         op.when_not_matched_by_source_delete(Some(path_eq_filter(path)));
@@ -421,6 +421,12 @@ fn build_batch(schema: &Arc<Schema>, chunks: &[StoredChunk], dim: usize) -> Resu
             .map(|c| u32::try_from(c.end_line).unwrap_or(u32::MAX))
             .collect::<Vec<_>>(),
     );
+    // Position within the file's chunk list — the disambiguator in the merge key.
+    let indices = UInt32Array::from(
+        (0..chunks.len())
+            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+            .collect::<Vec<_>>(),
+    );
     let langs = StringArray::from(
         chunks
             .iter()
@@ -452,6 +458,7 @@ fn build_batch(schema: &Arc<Schema>, chunks: &[StoredChunk], dim: usize) -> Resu
             Arc::new(paths),
             Arc::new(starts),
             Arc::new(ends),
+            Arc::new(indices),
             Arc::new(langs),
             Arc::new(syms),
             Arc::new(texts),
@@ -569,6 +576,47 @@ mod tests {
         );
         let hashes = idx.file_hashes().await.unwrap();
         assert_eq!(hashes.get("a.rs"), Some(&"h1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn upsert_handles_two_chunks_on_the_same_line() {
+        // Two top-level defs can share a physical line (minified TS, `type A=u8; type B=u16;`),
+        // yielding chunks with identical (start_line, end_line). Keying merge_insert on the
+        // line range would make those collide and abort the whole upsert (leaving the file
+        // unindexed and reconcile stuck); the chunk_index key must keep them distinct.
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        let mut a = chunk("a.rs", "h1", 5, vec![1.0, 0.0, 0.0]);
+        let mut b = chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]);
+        a.symbol = Some("A".into());
+        b.symbol = Some("B".into());
+        assert_eq!(
+            (a.start_line, a.end_line),
+            (b.start_line, b.end_line),
+            "test premise: both chunks share the same line range"
+        );
+        idx.upsert_file("a.rs", vec![a, b]).await.unwrap();
+        assert_eq!(
+            idx.chunk_count().await.unwrap(),
+            2,
+            "both same-line chunks are stored, not collapsed"
+        );
+        // A second upsert of identical content must still converge (idempotent).
+        let mut a2 = chunk("a.rs", "h1", 5, vec![1.0, 0.0, 0.0]);
+        let mut b2 = chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]);
+        a2.symbol = Some("A".into());
+        b2.symbol = Some("B".into());
+        idx.upsert_file("a.rs", vec![a2, b2]).await.unwrap();
+        assert_eq!(
+            idx.chunk_count().await.unwrap(),
+            2,
+            "re-upsert of same-line chunks must not duplicate"
+        );
+        let hits = idx.search(&[0.0, 1.0, 0.0], 5).await.unwrap();
+        assert!(
+            hits.iter().any(|h| h.chunk.symbol.as_deref() == Some("B")),
+            "the second same-line chunk is queryable"
+        );
     }
 
     #[tokio::test]

@@ -710,7 +710,11 @@ mod tests {
             )
             .unwrap();
         }
-        let cfg = Config::default_for(repo.path().to_path_buf());
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        // The default embed_concurrency is 1 (serial); force >1 so this test actually
+        // drives the concurrent embed path (buffer_unordered with overlapping embeds
+        // feeding a single serial index writer) rather than silently running serially.
+        cfg.embedder.embed_concurrency = 4;
         let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
@@ -920,8 +924,12 @@ mod tests {
 
     #[tokio::test]
     async fn search_times_out_when_embedder_is_slow() {
+        // Empty repo on purpose: ensure_fresh's reconcile finds no files to embed and
+        // returns fast (it is deliberately NOT under the query timeout), so the only slow
+        // embed is embed_one(query) — which is what the query timeout must bound. With an
+        // indexed file here, the reconcile itself would sleep 10s before the timeout path
+        // was ever reached, and the test would no longer isolate the query timeout.
         let repo = tempdir().unwrap();
-        fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
 
         let mut cfg = Config::default_for(repo.path().to_path_buf());
         cfg.search.search_timeout_secs = 1; // very short timeout
@@ -933,8 +941,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // Index is empty and clean, so ensure_fresh returns Ok fast; embed_one(query)
-        // will sleep 10s but the overall search timeout is 1s.
+        // ensure_fresh returns Ok fast (nothing to embed); embed_one(query) then sleeps
+        // 10s but the overall query timeout is 1s.
         let err = engine.search("anything", Some(3)).await.unwrap_err();
         assert!(
             matches!(err, Error::Timeout(_)),
