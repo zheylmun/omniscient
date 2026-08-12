@@ -97,10 +97,8 @@ surface as low-relevance noise."
     }
 
     #[tool(
-        description = "View of one file, read live from disk. Leading banner comments (license \
-headers, module doc comments) are stripped from search results when configured; inline comments \
-are preserved. Without `focus`: a structural outline — every type/impl/fn signature with its \
-line range, bodies elided — a cheap way to grasp a large file's shape before reading it in \
+        description = "View of one file, read live from disk. Without `focus`: a structural \
+outline — every type/impl/fn signature with its line range, bodies elided — a cheap way to grasp a large file's shape before reading it in \
 full. With `focus` (a natural-language description): returns only the parts relevant to it.\n\
 \n\
 Use when: orienting in an unfamiliar or large file (outline), or extracting the relevant slice \
