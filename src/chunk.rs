@@ -10,7 +10,10 @@ use std::path::Path;
 /// same way a changed embedder id does — otherwise already-indexed files keep
 /// their pre-change chunks until their content hash happens to change.
 /// v3: added the `chunk_index` column to the chunks table.
-pub const CHUNKER_VERSION: u32 = 3;
+/// v4: chunks are split to fit the embedding endpoint's context window.
+/// 5: byte-budget splitting moved off the read path onto the embedding path,
+/// and sub-line pieces are now identified by `chunk_index`.
+pub const CHUNKER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -36,22 +39,46 @@ pub fn chunk_file(path: &Path, source: &str, max_window_lines: usize) -> Result<
     chunk_source(language_for_path(path), source, max_window_lines)
 }
 
+/// Chunk `source` into structural pieces: one chunk per top-level definition
+/// (tree-sitter), or line windows for unsupported languages. Purely structural
+/// — no size budget is applied here, so a single oversized definition stays one
+/// chunk. Splitting to fit an embedding endpoint's context window is a separate
+/// concern; see `split_for_embedding`.
 pub fn chunk_source(
     language: Option<&str>,
     source: &str,
     max_window_lines: usize,
 ) -> Result<Vec<Chunk>> {
-    if let Some(lang) = language {
+    let chunks = if let Some(lang) = language {
         match treesitter_chunks(lang, source) {
-            Ok(chunks) if !chunks.is_empty() => return Ok(chunks),
-            Ok(_) => {}
+            Ok(c) if !c.is_empty() => c,
+            Ok(_) => line_windows(source, lang, max_window_lines),
             Err(e) => {
                 tracing::warn!("tree-sitter parse failed for {lang}: {e}; using line windows");
+                line_windows(source, lang, max_window_lines)
             }
         }
-        return Ok(line_windows(source, lang, max_window_lines));
-    }
-    Ok(line_windows(source, "text", max_window_lines))
+    } else {
+        line_windows(source, "text", max_window_lines)
+    };
+    Ok(chunks)
+}
+
+/// Split chunks so none exceeds the endpoint's per-input byte budget.
+///
+/// This is an *embedding* concern, not a chunking one: only the indexing path
+/// calls it. Keeping it off `chunk_file` is what stops `read_file`'s outline
+/// from being broken into body fragments.
+///
+/// Covers all three ways a chunk gets too big — an oversized tree-sitter
+/// definition (emitted whole, never recursed into), an oversized line window,
+/// and a single oversized line (minified/generated files have no newline to
+/// split on, so only a UTF-8 char-boundary split handles them).
+pub fn split_for_embedding(chunks: Vec<Chunk>, max_bytes: usize) -> Vec<Chunk> {
+    chunks
+        .into_iter()
+        .flat_map(|c| enforce_byte_budget(c, max_bytes))
+        .collect()
 }
 
 fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Chunk> {
@@ -78,6 +105,85 @@ fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Ch
         start += step;
     }
     chunks
+}
+
+/// One piece of a split chunk. Pieces inherit the parent's language and symbol
+/// so a split definition still retrieves under its own name.
+fn piece(parent: &Chunk, text: String, start_line: usize, end_line: usize) -> Chunk {
+    Chunk {
+        text,
+        start_line,
+        end_line: end_line.max(start_line),
+        language: parent.language.clone(),
+        symbol: parent.symbol.clone(),
+    }
+}
+
+/// Split a single line that is itself over budget, on UTF-8 char boundaries.
+/// This is the only thing that handles minified/generated files, where the whole
+/// file can be one line and there is no newline to split on.
+fn split_long_line(line: &str, max: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let mut end = (start + max).min(line.len());
+        while end > start && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // The budget is narrower than a single char; emit that whole char so
+            // the loop always advances. Over budget by design — better than
+            // slicing mid-codepoint or spinning forever.
+            end = line[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(line.len(), |(i, _)| start + i);
+        }
+        parts.push(&line[start..end]);
+        start = end;
+    }
+    parts
+}
+
+/// Split `chunk` so no piece exceeds `max_bytes`, preserving the text exactly
+/// (concatenating the pieces reproduces the input). This is the single mechanism
+/// covering all three ways a chunk gets too big: an oversized tree-sitter
+/// definition, an oversized line window, and a single oversized line.
+fn enforce_byte_budget(chunk: Chunk, max_bytes: usize) -> Vec<Chunk> {
+    let max = max_bytes.max(1);
+    if chunk.text.len() <= max {
+        return vec![chunk];
+    }
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_start = chunk.start_line;
+    let mut line_no = chunk.start_line;
+    // split_inclusive keeps the trailing newline, so the pieces rejoin losslessly.
+    for line in chunk.text.split_inclusive('\n') {
+        if line.len() > max {
+            if !buf.is_empty() {
+                let text = std::mem::take(&mut buf);
+                out.push(piece(&chunk, text, buf_start, line_no.saturating_sub(1)));
+            }
+            for part in split_long_line(line, max) {
+                out.push(piece(&chunk, part.to_string(), line_no, line_no));
+            }
+            line_no += 1;
+            buf_start = line_no;
+            continue;
+        }
+        if !buf.is_empty() && buf.len() + line.len() > max {
+            let text = std::mem::take(&mut buf);
+            out.push(piece(&chunk, text, buf_start, line_no.saturating_sub(1)));
+            buf_start = line_no;
+        }
+        buf.push_str(line);
+        line_no += 1;
+    }
+    if !buf.is_empty() {
+        out.push(piece(&chunk, buf, buf_start, line_no.saturating_sub(1)));
+    }
+    out
 }
 
 fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
@@ -284,6 +390,202 @@ mod tests {
     use std::path::Path;
     fn read(p: &str) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    fn parent(text: &str) -> Chunk {
+        Chunk {
+            text: text.to_string(),
+            start_line: 10,
+            end_line: 10 + text.lines().count().saturating_sub(1),
+            language: "rust".into(),
+            symbol: Some("big_fn".into()),
+        }
+    }
+
+    #[test]
+    fn chunk_file_does_not_split_on_size() {
+        // The chunker's job is structure. A single oversized definition stays one
+        // chunk; only the embedding path is allowed to break it up.
+        let src = format!("fn big() {{\n{}}}\n", "    let x = 1;\n".repeat(500));
+        let chunks = chunk_file(Path::new("big.rs"), &src, 80).unwrap();
+        assert_eq!(chunks.len(), 1, "one definition is one structural chunk");
+        assert!(chunks[0].text.len() > 5000);
+    }
+
+    #[test]
+    fn split_for_embedding_is_lossless() {
+        // Concatenating the pieces must reproduce the input exactly, or the index
+        // would hold text that does not appear in the file.
+        let src = format!("fn big() {{\n{}}}\n", "    let x = 1;\n".repeat(500));
+        let chunks = chunk_file(Path::new("big.rs"), &src, 80).unwrap();
+        let original: String = chunks.iter().map(|c| c.text.clone()).collect();
+        let pieces = split_for_embedding(chunks, 512);
+        assert!(pieces.len() > 1, "an oversized chunk must actually split");
+        assert!(pieces.iter().all(|p| p.text.len() <= 512));
+        let rejoined: String = pieces.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(rejoined, original);
+    }
+
+    #[test]
+    fn split_for_embedding_handles_a_single_long_line() {
+        // Minified/generated files have no newline to split on; only a UTF-8
+        // char-boundary split handles them.
+        //
+        // Deviation from the brief: compare against the chunker's own output
+        // (as `split_for_embedding_is_lossless` above does) rather than the raw
+        // `src` literal. tree-sitter node byte ranges never include the file's
+        // trailing newline after the matched top-level statement, so a chunk_file
+        // + split_for_embedding round trip does not reproduce `src` exactly when
+        // `src` ends in "\n" — a pre-existing property of the structural chunker,
+        // unrelated to this task's change, confirmed present before it too.
+        let src = format!("const D=\"{}\";\n", "x".repeat(4000));
+        let chunks = chunk_file(Path::new("bundle.min.js"), &src, 80).unwrap();
+        let original: String = chunks.iter().map(|c| c.text.clone()).collect();
+        let pieces = split_for_embedding(chunks, 256);
+        assert!(pieces.iter().all(|p| p.text.len() <= 256));
+        let rejoined: String = pieces.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(rejoined, original);
+    }
+
+    #[test]
+    fn oversized_definition_is_split_by_split_for_embedding() {
+        // One top-level fn far larger than the budget. tree-sitter emits it as a
+        // single chunk and does not recurse into it, so without splitting this
+        // would be one enormous chunk headed to the embedder.
+        let body = "    let x = 1;\n".repeat(2000);
+        let source = format!("fn huge() {{\n{body}}}\n");
+        let structural = chunk_file(Path::new("a.rs"), &source, 80).unwrap();
+        let out = split_for_embedding(structural, 1000);
+        assert!(out.len() > 1, "oversized definition must be split");
+        for c in &out {
+            assert!(c.text.len() <= 1000, "chunk of {} bytes", c.text.len());
+        }
+        assert!(
+            out.iter().any(|c| c.symbol.as_deref() == Some("huge")),
+            "split pieces must keep the definition's symbol"
+        );
+    }
+
+    #[test]
+    fn minified_single_line_file_is_split_by_split_for_embedding() {
+        // No newlines at all: the case line-window fallback cannot handle.
+        let source = format!("const DATA=\"{}\";", "a".repeat(50_000));
+        let structural = chunk_file(Path::new("data.ts"), &source, 80).unwrap();
+        let out = split_for_embedding(structural, 1000);
+        for c in &out {
+            assert!(c.text.len() <= 1000, "chunk of {} bytes", c.text.len());
+        }
+    }
+
+    #[test]
+    fn generous_budget_leaves_normal_files_unsplit() {
+        let source = "fn a() {}\nfn b() {}\n";
+        let structural = chunk_file(Path::new("a.rs"), source, 80).unwrap();
+        let out = split_for_embedding(structural, 100_000);
+        assert_eq!(out.len(), 2, "normal code must not be split by this change");
+    }
+
+    #[test]
+    fn under_budget_chunk_passes_through_untouched() {
+        let c = parent("fn a() {}\n");
+        let out = enforce_byte_budget(c, 1000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "fn a() {}\n");
+        assert_eq!(out[0].start_line, 10);
+    }
+
+    #[test]
+    fn oversized_chunk_splits_on_line_boundaries_within_budget() {
+        // 100 lines x 10 bytes = 1000 bytes, budget 100 -> ~10 pieces.
+        let text = "0123456789\n".repeat(100);
+        let out = enforce_byte_budget(parent(&text), 100);
+        assert!(out.len() > 1, "must split");
+        for p in &out {
+            assert!(
+                p.text.len() <= 100,
+                "piece of {} bytes exceeds the budget",
+                p.text.len()
+            );
+        }
+        // Reassembly is lossless: split_inclusive keeps the newlines.
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn split_pieces_inherit_symbol_and_language() {
+        let out = enforce_byte_budget(parent(&"x\n".repeat(500)), 100);
+        assert!(out.len() > 1);
+        for p in &out {
+            assert_eq!(p.symbol.as_deref(), Some("big_fn"));
+            assert_eq!(p.language, "rust");
+        }
+    }
+
+    #[test]
+    fn split_pieces_have_ascending_nonoverlapping_line_ranges() {
+        let out = enforce_byte_budget(parent(&"x\n".repeat(500)), 100);
+        assert_eq!(
+            out[0].start_line, 10,
+            "first piece starts at the parent line"
+        );
+        for w in out.windows(2) {
+            assert!(w[0].end_line >= w[0].start_line, "range must not invert");
+            assert!(
+                w[1].start_line > w[0].end_line,
+                "pieces must not overlap: {:?} then {:?}",
+                (w[0].start_line, w[0].end_line),
+                (w[1].start_line, w[1].end_line)
+            );
+        }
+    }
+
+    #[test]
+    fn single_enormous_line_is_split_on_byte_boundaries() {
+        // The minified/generated case: one line, no newline to split on. This is
+        // the input that line-based splitting cannot handle at all.
+        let text = "a".repeat(10_000);
+        let out = enforce_byte_budget(parent(&text), 100);
+        assert!(out.len() >= 100, "expected many pieces, got {}", out.len());
+        for p in &out {
+            assert!(p.text.len() <= 100);
+            assert_eq!(p.start_line, p.end_line, "a sub-line piece spans one line");
+        }
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn multibyte_line_splits_on_char_boundaries() {
+        // Every char is 4 bytes; a naive byte slice would panic mid-codepoint.
+        let text = "😀".repeat(1000);
+        let out = enforce_byte_budget(parent(&text), 10);
+        for p in &out {
+            assert!(p.text.len() <= 10);
+        }
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, text, "no codepoint may be lost or corrupted");
+    }
+
+    #[test]
+    fn budget_smaller_than_one_char_still_terminates() {
+        // A 4-byte char against a 1-byte budget: the piece must exceed the budget
+        // rather than loop forever producing empty slices.
+        let out = enforce_byte_budget(parent("😀😀"), 1);
+        assert_eq!(out.len(), 2);
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, "😀😀");
+    }
+
+    #[test]
+    fn mixed_long_and_short_lines_all_fit() {
+        let text = format!("short\n{}\nshort\n", "z".repeat(5000));
+        let out = enforce_byte_budget(parent(&text), 200);
+        for p in &out {
+            assert!(p.text.len() <= 200, "piece of {} bytes", p.text.len());
+        }
+        let rejoined: String = out.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(rejoined, text);
     }
 
     #[test]
