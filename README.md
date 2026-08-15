@@ -22,11 +22,12 @@ never stale outside that narrow window.
 
 omniscient does **not** do in-process inference. Embeddings are served by a local [llama.cpp](https://github.com/ggml-org/llama.cpp) instance via its `/v1/embeddings` endpoint. You point omniscient at it with `base_url` in your config.
 
-To start llama.cpp serving an embedding model (for example Qwen3-Embedding-4B), letting it download the GGUF from Hugging Face:
+To start llama.cpp serving the default embedding model, letting it download the GGUF from Hugging Face:
 
 ```bash
 llama serve \
-  -hf Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M \
+  -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 \
+  --alias Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 \
   --port 8080 \
   --embedding \
   --pooling last \
@@ -35,16 +36,36 @@ llama serve \
   --ubatch-size 32000
 ```
 
+> **The model id must match.** `llama serve` is a router: it registers a
+> `-hf`-loaded model under the repo id and answers any other id with
+> `400 model '<id>' not found` — on `/v1/embeddings` and on the `/props?model=`
+> capability probe alike. So `[embedder] model` has to be a string the server
+> actually serves. The defaults are set up for this (`model` and `hf_repo` are the
+> same string, and the `--alias` above is what pins it), but if you point
+> omniscient at a server you started yourself, check `curl localhost:8080/v1/models`
+> and use an `id` from that list. `omniscient doctor` reports the id it connected as.
+
+**Scaling up.** The default is Qwen3-Embedding-**0.6B** (~640 MB, runs on CPU or an
+integrated GPU) so that omniscient works out of the box on an ordinary machine. If
+you have GPU memory to spare, the 4B and 8B models in the same family retrieve
+noticeably better — swap **both** `model` and `hf_repo` to
+`Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M` or `Qwen/Qwen3-Embedding-8B-GGUF:Q8_0`
+(`pooling = "last"` is correct for all three). Changing the model changes the
+embedder id, which keys the index, so the next run rebuilds it from scratch.
+
 > **Pooling:** Qwen3-Embedding is a decoder/LLM-based embedder and uses **last-token** pooling (`--pooling last`), not mean pooling. BERT-family embedders (BGE, jina, nomic) use `--pooling mean`. If you omit `--pooling`, llama.cpp falls back to the model's metadata default. Wrong pooling produces degenerate embeddings, so it's the first thing to check if search quality looks off.
 
-> **Context/batch size:** llama.cpp's defaults (context ~4096, `--ubatch-size` 512)
-> are far smaller than the embedding requests omniscient sends — it batches up to
-> `max_batch_bytes` (32000) of text per request. A pooled embedding model must fit
-> each sequence whole in one ubatch and within the context, so an under-sized server
-> answers the startup probe and then **aborts on the first real batch** — the server
-> looks healthy, then "silently" dies mid-use. Size `--ctx-size`/`--batch-size`/`--ubatch-size`
-> to your `max_batch_bytes` (a token is always ≥ 1 byte, so that's a safe ceiling).
-> The `auto_start` path does this for you automatically.
+> **Context/batch size:** what llama.cpp actually enforces is the size of a single
+> *input*, not the total of a batch. Sizing `--ctx-size` to your `max_batch_bytes`
+> (32000) is therefore a deliberately generous ceiling — a token is always ≥ 1 byte,
+> so no single chunk omniscient sends can exceed it — rather than a hard requirement.
+> `--batch-size`/`--ubatch-size` are matched to it for simplicity; they can be left
+> at llama.cpp's defaults if you would rather save the memory, since llama.cpp splits
+> a pooled embedding sequence across ubatches on its own. omniscient additionally
+> discovers the server's real limit at startup and splits chunks to fit, correcting
+> itself from the server's own rejections, so a smaller context is safe — it just
+> means larger definitions get split more. The `auto_start` path applies the
+> generous sizing for you.
 
 ### Let omniscient start the server for you
 
@@ -55,6 +76,10 @@ the port from `base_url`, and context/batch sizes from `max_batch_bytes`). It wa
 downloads the GGUF, which can take a while) and shuts it down when omniscient
 exits. An endpoint you started yourself is always reused as-is and never spawned
 over.
+
+The spawned server is always started with `--alias <model>`, so it registers under
+whatever `[embedder] model` says regardless of `hf_repo`. On this path the two
+therefore cannot drift: change either one and auto-start still connects.
 
 This is opt-in and off by default. It requires the unified `llama` CLI on your
 `PATH` (set `llama_bin` to an absolute path otherwise); if the binary is missing
@@ -83,14 +108,14 @@ exclude = []   # e.g. ["vendor/**", "**/*.generated.rs"]
 
 [embedder]
 base_url = "http://localhost:8080"
-model = "qwen3-embedding-4b"
+model = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"   # must be an id the server serves (see /v1/models)
 max_batch_chunks = 64     # max chunks per embed request
 max_batch_bytes = 32000   # max total bytes per embed request (~8k tokens)
 
 # Optionally let omniscient launch llama.cpp itself when base_url is unreachable.
 auto_start = false                                  # opt-in; off by default
 llama_bin = "llama"                                 # the unified llama.cpp CLI (PATH or absolute path)
-hf_repo = "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M"     # passed to `llama serve -hf`
+hf_repo = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"    # passed to `llama serve -hf`; aliased to `model`
 pooling = "last"                                    # last for Qwen3-Embedding, mean for BERT-family
 auto_start_timeout_secs = 600                       # max wait for readiness (first run downloads the model)
 
