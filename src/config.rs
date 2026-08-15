@@ -188,10 +188,31 @@ fn merge_watch(base: &WatchConfig, overlay: &WatchConfig) -> WatchConfig {
 /// Also the value `chunk_budget_tokens()` falls back to for a configured `0`.
 const DEFAULT_MAX_CHUNK_TOKENS: usize = 2048;
 
+/// The default embedding model, used as BOTH the served model id (`model`) and
+/// the GGUF to fetch (`hf_repo`) — they must agree or `llama serve` rejects
+/// every request with `400 model '<id>' not found`.
+///
+/// Qwen3-Embedding-0.6B at `Q8_0` is ~640 MB and runs on CPU or an integrated GPU,
+/// so the out-of-the-box configuration works on an ordinary developer machine
+/// rather than requiring a large discrete GPU. It is the same family as the
+/// larger Qwen3-Embedding models, so `pooling = "last"` stays correct if a user
+/// scales up to 4B/8B by changing these two values.
+const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EmbedderConfig {
     pub base_url: String,
+    /// The model id sent as `model` on every embeddings request, and the id the
+    /// `/props?model=` capability probe is scoped to.
+    ///
+    /// This must be an id the endpoint actually serves. A bare `llama-server`
+    /// ignores the field, but `llama serve` routes by it and answers an unknown
+    /// id with `400 model '<id>' not found` — so the default matches `hf_repo`,
+    /// which is the id `llama serve` registers a `-hf`-loaded model under. The
+    /// `auto_start` path additionally passes `--alias <model>`, which makes the
+    /// spawned server register under *this* id whatever `hf_repo` says, so the
+    /// two can never drift out from under a user who changes only one of them.
     pub model: String,
     pub max_batch_chunks: usize,
     pub max_batch_bytes: usize,
@@ -217,6 +238,11 @@ pub struct EmbedderConfig {
     pub llama_bin: String,
     /// The `-hf` argument passed to `llama serve`: a Hugging Face GGUF repo with
     /// an optional `:QUANT` tag. The GGUF is downloaded on first run.
+    ///
+    /// Defaults to the same string as `model` so the documented manual command
+    /// and the `auto_start` command produce an endpoint the default `model`
+    /// resolves against. Changing only this one is safe — `auto_start` aliases
+    /// the spawned server to `model` regardless.
     pub hf_repo: String,
     /// The `--pooling` strategy for the spawned server. Qwen3-Embedding (a
     /// decoder LLM) needs `last`; BERT-family embedders need `mean`.
@@ -241,14 +267,14 @@ impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:8080".into(),
-            model: "qwen3-embedding-4b".into(),
+            model: DEFAULT_MODEL.into(),
             max_batch_chunks: 64,
             max_batch_bytes: 32000,
             max_chunk_tokens: DEFAULT_MAX_CHUNK_TOKENS,
             embed_concurrency: None,
             auto_start: false,
             llama_bin: "llama".into(),
-            hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
+            hf_repo: DEFAULT_MODEL.into(),
             pooling: "last".into(),
             auto_start_timeout_secs: 600,
             request_timeout_secs: 30,
@@ -534,7 +560,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = Config::default_for(PathBuf::from("/repo"));
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
         assert_eq!(c.embedder.base_url, "http://localhost:8080");
         assert_eq!(c.search.max_results, 25);
         assert!((c.search.relevance_ratio - 0.75).abs() < 1e-6);
@@ -588,7 +614,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -640,7 +666,7 @@ mod tests {
         assert_eq!(c.embedder.max_batch_chunks, 16);
         assert_eq!(c.embedder.max_batch_bytes, 8000);
         // unspecified embedder fields keep their defaults
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -648,7 +674,11 @@ mod tests {
         let c = Config::default_for(PathBuf::from("/repo"));
         assert!(!c.embedder.auto_start, "auto_start defaults to off");
         assert_eq!(c.embedder.llama_bin, "llama");
-        assert_eq!(c.embedder.hf_repo, "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M");
+        assert_eq!(c.embedder.hf_repo, DEFAULT_MODEL);
+        assert_eq!(
+            c.embedder.hf_repo, c.embedder.model,
+            "the GGUF we fetch must register under the id we send as `model`"
+        );
         assert_eq!(c.embedder.pooling, "last");
         assert_eq!(c.embedder.auto_start_timeout_secs, 600);
 
@@ -667,7 +697,7 @@ mod tests {
         assert_eq!(c.embedder.pooling, "mean");
         assert_eq!(c.embedder.auto_start_timeout_secs, 120);
         // unspecified embedder fields keep their defaults
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -956,7 +986,7 @@ mod tests {
         )
         .unwrap();
         assert!(c.cascade.is_empty(), "no files → no cascade levels");
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]

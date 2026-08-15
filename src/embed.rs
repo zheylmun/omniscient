@@ -212,6 +212,15 @@ fn server_ctx_size(cfg: &EmbedderConfig) -> usize {
 
 /// The argument vector for `llama serve …`, mirroring the documented manual
 /// command. Factored out so it can be unit-tested without spawning.
+///
+/// `--alias <model>` is what keeps the spawned server addressable. `llama serve`
+/// is a router: it registers a `-hf`-loaded model under the repo id and answers
+/// any *other* id with `400 model '<id>' not found`, including on `/props?model=`.
+/// Without the alias, a `model` that differs from `hf_repo` — for any reason, a
+/// typo included — makes every embeddings request fail against a server we just
+/// started ourselves, and because that 400 never resolves by waiting, the
+/// readiness poll would sit there until `auto_start_timeout_secs`. Aliasing the
+/// server to the id we are going to ask for makes the two agree by construction.
 fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
     // ctx == batch == ubatch: one conservative bound for all three, for the
     // reasons (and with the caveats) in `server_ctx_size`.
@@ -220,6 +229,8 @@ fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
         "serve".into(),
         "-hf".into(),
         cfg.hf_repo.clone(),
+        "--alias".into(),
+        cfg.model.clone(),
         "--port".into(),
         port.to_string(),
         "--embedding".into(),
@@ -282,6 +293,20 @@ impl ManagedServer {
 /// Poll the endpoint until the spawned server answers (or `auto_start_timeout_secs`
 /// elapses), then hand the server's lifetime to the returned embedder. Bails early
 /// if the child exits before becoming ready (bad flags, missing model, …).
+///
+/// Two things keep a misconfiguration from masquerading as a slow first-run
+/// download, which is the failure this generous timeout exists to tolerate:
+///
+/// - **A rejected API key aborts immediately.** `EmbedAuth` is the one error that
+///   provably never resolves by waiting — the server is up and answering, it just
+///   refuses us — so polling it for ten minutes only delays a message the user
+///   needs now.
+/// - **Every other error is still polled, but no longer silently.** A 400 from
+///   the router *can* be a startup race (the model is registered only once its
+///   GGUF has been fetched and loaded), so treating non-retryable errors as fatal
+///   would trade a slow failure for a flaky one. Instead the actual error is
+///   logged alongside the "still waiting" line, so a wait that is never going to
+///   end says why on its face.
 async fn connect_managed(
     mut server: ManagedServer,
     cfg: &EmbedderConfig,
@@ -310,6 +335,8 @@ async fn connect_managed(
                 tracing::info!("llama.cpp embeddings server is ready");
                 return Ok(e.with_server(server));
             }
+            // A rejected key is the one failure that waiting cannot fix.
+            Err(e) if e.is_fatal_for_run() => return Err(e),
             Err(e) => {
                 if Instant::now() >= deadline {
                     return Err(Error::Embed(format!(
@@ -319,6 +346,7 @@ async fn connect_managed(
                 }
                 if waited_secs.is_multiple_of(10) {
                     tracing::info!(
+                        error = %e,
                         "waiting for llama.cpp to become ready (the model is downloaded on first run, which can take a while)…"
                     );
                 }
@@ -835,7 +863,9 @@ mod tests {
             vec![
                 "serve",
                 "-hf",
-                "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M",
+                "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
+                "--alias",
+                "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
                 "--port",
                 "8080",
                 "--embedding",
@@ -848,6 +878,55 @@ mod tests {
                 "--ubatch-size",
                 "32000",
             ]
+        );
+    }
+
+    #[test]
+    fn the_spawned_server_is_aliased_to_the_configured_model_id() {
+        // `llama serve` routes by model id and answers an unknown one with
+        // `400 model '<id>' not found` — on /v1/embeddings AND on /props?model=.
+        // A `model` that differs from `hf_repo` would therefore make every request
+        // to a server we just started ourselves fail, and since that 400 never
+        // resolves by waiting, the readiness poll would burn the whole
+        // auto_start_timeout_secs before saying so. `--alias` must carry `model`,
+        // not `hf_repo`, so the id we ask for is the id the server registers.
+        let cfg = EmbedderConfig {
+            model: "my-embedder".into(),
+            hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
+            ..Default::default()
+        };
+        let args = server_args(&cfg, 8080);
+        let alias = args
+            .iter()
+            .position(|a| a == "--alias")
+            .map(|i| args[i + 1].clone());
+        assert_eq!(
+            alias.as_deref(),
+            Some("my-embedder"),
+            "--alias must carry `model` so the server registers under the id we send"
+        );
+        let hf = args
+            .iter()
+            .position(|a| a == "-hf")
+            .map(|i| args[i + 1].clone());
+        assert_eq!(
+            hf.as_deref(),
+            Some("Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M"),
+            "-hf still selects which GGUF to fetch"
+        );
+    }
+
+    #[test]
+    fn the_default_model_id_matches_the_default_gguf() {
+        // The out-of-the-box config must work against the documented
+        // `llama serve -hf <hf_repo>` command. `llama serve` registers a
+        // -hf-loaded model under the repo id, so a `model` that differs from
+        // `hf_repo` 400s on the very first connect probe — which is exactly what
+        // the previous default ("qwen3-embedding-4b") did.
+        let cfg = EmbedderConfig::default();
+        assert_eq!(
+            cfg.model, cfg.hf_repo,
+            "the default model id must be the id the default hf_repo registers as"
         );
     }
 
