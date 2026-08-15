@@ -185,7 +185,7 @@ impl Engine {
         // to `concurrency` embeds at once but yields to a single serial consumer, so index
         // commits never overlap (no LanceDB commit conflicts) and only `concurrency` files
         // are held in flight (O(concurrency) memory, not O(repo)).
-        let concurrency = self.config.embedder.embed_concurrency.max(1);
+        let concurrency = self.config.embedder.embed_concurrency.unwrap_or(1).max(1);
         let batch_limits = self.config.embedder.batch_limits();
         let embedder = &self.embedder;
         let index = &self.index;
@@ -714,7 +714,7 @@ mod tests {
         // The default embed_concurrency is 1 (serial); force >1 so this test actually
         // drives the concurrent embed path (buffer_unordered with overlapping embeds
         // feeding a single serial index writer) rather than silently running serially.
-        cfg.embedder.embed_concurrency = 4;
+        cfg.embedder.embed_concurrency = Some(4);
         let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();

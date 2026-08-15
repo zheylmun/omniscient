@@ -1,4 +1,5 @@
 //! Embeddings: Embedder trait + llama.cpp HTTP backend (/v1/embeddings) + mock.
+use crate::caps::{CapsSource, ServerCaps, parse_models, parse_props};
 use crate::config::EmbedderConfig;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
@@ -21,6 +22,23 @@ pub trait Embedder: Send + Sync {
     fn id(&self) -> &str;
     fn dim(&self) -> usize;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Tokens the endpoint accepts in a single input, when it told us. `None`
+    /// means unknown — callers fall back to configuration rather than guessing.
+    fn max_input_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// How many embedding requests the endpoint can serve concurrently, when it
+    /// says. `None` means unknown — callers stay serial rather than guessing.
+    fn max_concurrent_requests(&self) -> Option<usize> {
+        None
+    }
+
+    /// Which probe produced `max_input_tokens`, for diagnostics reporting.
+    fn caps_source(&self) -> CapsSource {
+        CapsSource::None
+    }
 
     /// Embed `texts` in order, splitting into batches bounded by `limits`, calling
     /// `embed()` once per batch. Returns exactly `texts.len()` vectors in input order.
@@ -111,6 +129,22 @@ pub async fn build_embedder(cfg: &EmbedderConfig) -> Result<Arc<dyn Embedder>> {
     Ok(Arc::new(connect_managed(server, cfg, api_key).await?))
 }
 
+/// Build a capability-probe URL, optionally scoping it to a model id.
+///
+/// The id is appended as a real query parameter rather than interpolated, because
+/// llama.cpp ids routinely contain `/` and `:` (`Qwen/Qwen3-Embedding-8B-GGUF:Q8_0`)
+/// and must be percent-encoded to survive the query string. `None` when `base_url`
+/// does not parse, so a malformed config degrades to "no caps" like every other
+/// probe failure.
+fn probe_url(base_url: &str, path: &str, model: Option<&str>) -> Option<String> {
+    let raw = format!("{}{path}", base_url.trim_end_matches('/'));
+    let mut url = reqwest::Url::parse(&raw).ok()?;
+    if let Some(m) = model {
+        url.query_pairs_mut().append_pair("model", m);
+    }
+    Some(url.into())
+}
+
 /// Whether something is accepting TCP connections at `base_url`'s host:port. Used
 /// to distinguish "nothing is bound here" (safe to spawn) from "a server is up but
 /// answered badly" (must not spawn over it). A malformed URL or DNS failure counts
@@ -158,13 +192,20 @@ fn is_local_host(host: &str) -> bool {
 const MIN_SERVER_CTX: usize = 2048;
 
 /// Context/batch size for the spawned server, derived from our own batching budget.
-/// llama.cpp defaults (ctx ~4096, ubatch 512) are far smaller than the requests we
-/// send — for a pooled embedding model every sequence must fit whole in one ubatch
-/// and within `n_ctx`, so an under-sized server accepts the readiness probe and then
-/// aborts on the first real reconcile batch. A token is always ≥ 1 byte, so
-/// `max_batch_bytes` is a safe upper bound on the tokens in any single request
-/// (including a lone oversized chunk sent on its own). Tying it to the same knob
-/// that bounds our batches means the two can't drift apart.
+///
+/// Only **per-item** size is actually enforced by llama.cpp, and that is what
+/// `enforce_byte_budget` bounds. Two constraints once documented here were
+/// measured false against build `b9821` (4B and 8B): a pooled embedding sequence
+/// does *not* have to fit whole in one ubatch (llama.cpp splits it across
+/// ubatches), and batch *totals* are not bounded by `n_ctx` (20 inputs totalling
+/// 60020 tokens succeeded on a server reporting `n_ctx: 40960`).
+///
+/// So this sizing is deliberately over-conservative rather than load-bearing: a
+/// token is always ≥ 1 byte, which makes `max_batch_bytes` a safe upper bound on
+/// the tokens in any single request, and tying the two to one knob means they
+/// cannot drift. It costs KV/compute memory on a spawned server but cannot cause
+/// the "starts fine, dies mid-use" failure. Right-sizing it is a perf change, not
+/// a correctness one.
 fn server_ctx_size(cfg: &EmbedderConfig) -> usize {
     cfg.max_batch_bytes.max(MIN_SERVER_CTX)
 }
@@ -172,8 +213,8 @@ fn server_ctx_size(cfg: &EmbedderConfig) -> usize {
 /// The argument vector for `llama serve …`, mirroring the documented manual
 /// command. Factored out so it can be unit-tested without spawning.
 fn server_args(cfg: &EmbedderConfig, port: u16) -> Vec<String> {
-    // ctx == batch == ubatch: the whole request must fit, and for pooled embeddings
-    // a sequence can't be split across ubatches, so all three share one bound.
+    // ctx == batch == ubatch: one conservative bound for all three, for the
+    // reasons (and with the caveats) in `server_ctx_size`.
     let ctx = server_ctx_size(cfg).to_string();
     vec![
         "serve".into(),
@@ -292,10 +333,78 @@ async fn connect_managed(
 pub struct MockEmbedder {
     id: String,
     dim: usize,
+    max_input_tokens: Option<usize>,
+    /// Simulated context window. When set, oversized inputs fail with the same
+    /// structured error llama.cpp returns, so the adaptive budget loop is
+    /// exercisable offline.
+    context_limit: Option<usize>,
+    /// Bytes per simulated token, so a test can pick a ratio the budget must
+    /// discover.
+    mock_bytes_per_token: usize,
+    /// Remaining simulated transport blips. Shared + atomic so `&self` can
+    /// decrement it.
+    fail_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Total `embed` calls made, so a test can assert that a caller gave up
+    /// early rather than grinding through every file.
+    calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl MockEmbedder {
     pub fn new(id: &str, dim: usize) -> Self {
-        Self { id: id.into(), dim }
+        Self {
+            id: id.into(),
+            dim,
+            max_input_tokens: None,
+            context_limit: None,
+            mock_bytes_per_token: 1,
+            fail_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Fail the next `n` embed calls with a retryable transport error, then
+    /// succeed. Exercises the retry ladder without a server.
+    #[must_use]
+    pub fn failing_times(mut self, n: usize) -> Self {
+        self.fail_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(n));
+        self
+    }
+
+    /// Fail *every* embed call with a retryable transport error — a wholly-down
+    /// endpoint, as opposed to `failing_times`' recoverable blip. The two are
+    /// indistinguishable per-request, which is the whole reason the reconcile
+    /// loop needs a consecutive-failure circuit breaker.
+    #[must_use]
+    pub fn always_transiently_failing(self) -> Self {
+        self.failing_times(usize::MAX)
+    }
+
+    /// How many `embed` calls have been made against this embedder.
+    pub fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A handle sharing this embedder's call counter, for reading the count after
+    /// the embedder itself has been moved into an `Engine`.
+    #[must_use]
+    pub fn call_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.calls)
+    }
+
+    /// Declare a per-input token budget, as a probed real server would.
+    #[must_use]
+    pub fn with_max_input_tokens(mut self, tokens: usize) -> Self {
+        self.max_input_tokens = Some(tokens);
+        self
+    }
+
+    /// Simulate a real context window: inputs whose byte length implies more
+    /// than `n_ctx` tokens (at `bytes_per_token` bytes/token) fail with
+    /// `Error::EmbedContextExceeded`, matching llama.cpp's structured 400.
+    #[must_use]
+    pub fn with_context_limit(mut self, n_ctx: usize, bytes_per_token: usize) -> Self {
+        self.context_limit = Some(n_ctx);
+        self.mock_bytes_per_token = bytes_per_token.max(1);
+        self
     }
 }
 #[async_trait]
@@ -306,7 +415,28 @@ impl Embedder for MockEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
+    fn max_input_tokens(&self) -> Option<usize> {
+        self.max_input_tokens
+    }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_remaining.load(Ordering::Relaxed) > 0 {
+            self.fail_remaining.fetch_sub(1, Ordering::Relaxed);
+            return Err(Error::EmbedTransient("simulated blip".into()));
+        }
+        if let Some(n_ctx) = self.context_limit {
+            for t in texts {
+                // Ceiling division: a partial token still counts.
+                let n_prompt_tokens = t.len().div_ceil(self.mock_bytes_per_token);
+                if n_prompt_tokens > n_ctx {
+                    return Err(Error::EmbedContextExceeded {
+                        n_prompt_tokens,
+                        n_ctx,
+                    });
+                }
+            }
+        }
         Ok(texts
             .iter()
             .map(|t| {
@@ -328,6 +458,10 @@ pub struct LlamaCppEmbedder {
     base_url: String,
     model: String,
     dim: usize,
+    /// Limits the server reported at connect time. Empty when neither `/props`
+    /// nor `/v1/models` was informative — a non-llama.cpp endpoint exposes
+    /// neither, and a `llama serve` supervisor answers `/props` about itself.
+    caps: ServerCaps,
     client: reqwest::Client,
     /// Bearer token for the embeddings endpoint, resolved once at connect time.
     /// `None` for an unauthenticated endpoint.
@@ -346,6 +480,32 @@ fn apply_auth(rb: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::Re
         Some(key) => rb.bearer_auth(key),
         None => rb,
     }
+}
+
+/// llama.cpp's oversize rejection, which is machine-readable rather than prose:
+/// `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":N,"n_ctx":M}}`.
+/// Returns `(n_prompt_tokens, n_ctx)` only when the type matches AND `n_ctx` is
+/// usable — a body without real numbers gives us nothing to retry against, so it
+/// stays a generic error.
+fn context_exceeded(body: &str) -> Option<(usize, usize)> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        error: Body,
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        #[serde(default, rename = "type")]
+        kind: String,
+        #[serde(default)]
+        n_prompt_tokens: usize,
+        #[serde(default)]
+        n_ctx: usize,
+    }
+    let env: Envelope = serde_json::from_str(body).ok()?;
+    if env.error.kind != "exceed_context_size_error" || env.error.n_ctx == 0 {
+        return None;
+    }
+    Some((env.error.n_prompt_tokens, env.error.n_ctx))
 }
 
 /// Build a helpful error for a non-success embeddings response. A `401`/`403`
@@ -367,12 +527,24 @@ fn embed_http_error(status: reqwest::StatusCode, url: &str, body: &str) -> Error
         }
         format!(": {b}")
     };
+    if let Some((n_prompt_tokens, n_ctx)) = context_exceeded(body) {
+        return Error::EmbedContextExceeded {
+            n_prompt_tokens,
+            n_ctx,
+        };
+    }
     match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::Embed(format!(
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::EmbedAuth(format!(
             "POST {url} rejected with {status}{detail}. The embeddings endpoint requires \
              authentication — set `[embedder] api_key` in omniscient.toml (a literal token, \
              or `${{VAR}}` to read one from the environment) to a valid key."
         )),
+        StatusCode::TOO_MANY_REQUESTS => {
+            Error::EmbedTransient(format!("POST {url} rate-limited with {status}{detail}"))
+        }
+        s if s.is_server_error() => {
+            Error::EmbedTransient(format!("POST {url} failed with {status}{detail}"))
+        }
         _ => Error::Embed(format!("POST {url} failed with {status}{detail}")),
     }
 }
@@ -392,6 +564,7 @@ impl LlamaCppEmbedder {
             base_url,
             model,
             dim: 0,
+            caps: ServerCaps::default(),
             client,
             api_key,
             server: None,
@@ -403,7 +576,71 @@ impl LlamaCppEmbedder {
                 "embeddings endpoint returned an empty vector (dim 0)".into(),
             ));
         }
+        e.caps = e.probe_caps().await;
+        if let Some(t) = e.caps.max_input_tokens {
+            tracing::debug!("embeddings endpoint reports a {t}-token context window");
+        } else {
+            tracing::debug!(
+                "embeddings endpoint did not report a context window; \
+                 falling back to [embedder] max_chunk_tokens"
+            );
+        }
         Ok(e)
+    }
+
+    /// Best-effort capability discovery, tried in order of how much each probe
+    /// can tell us, and accumulated rather than replaced.
+    ///
+    /// 1. `GET /props?model=<id>` — the best answer, and the one that works in
+    ///    both deployment shapes. A bare `llama-server` ignores the unknown query
+    ///    parameter; a `llama serve` supervisor uses it to proxy through to the
+    ///    backend process instead of describing itself. It is the only probe that
+    ///    reports `total_slots` *and* the context window together.
+    /// 2. `GET /props` — the unscoped form, for a server that rejects the
+    ///    parameter outright.
+    /// 3. `GET /v1/models` — `meta.n_ctx` on the loaded model. Never carries a
+    ///    slot count, which is why the results are merged with `or` rather than
+    ///    replacing one another: discarding a discovered `total_slots` here would
+    ///    silently drop embed concurrency to serial.
+    ///
+    /// Each step runs only while something is still unknown. Every failure path —
+    /// transport error, non-2xx, unreadable or unexpected body — contributes empty
+    /// caps: a server that cannot describe itself must still be usable.
+    async fn probe_caps(&self) -> ServerCaps {
+        let mut caps = self.props_caps(Some(&self.model)).await;
+        if caps.max_input_tokens.is_none() || caps.total_slots.is_none() {
+            caps = caps.or(self.props_caps(None).await);
+        }
+        if caps.max_input_tokens.is_none() {
+            caps = caps.or(self
+                .get_text("/v1/models", None)
+                .await
+                .map(|b| parse_models(&b, &self.model))
+                .unwrap_or_default());
+        }
+        caps
+    }
+
+    /// `GET /props`, optionally scoped to a model id.
+    async fn props_caps(&self, model: Option<&str>) -> ServerCaps {
+        self.get_text("/props", model)
+            .await
+            .map(|b| parse_props(&b))
+            .unwrap_or_default()
+    }
+
+    /// `GET {base_url}{path}`, returning the body only on a 2xx. `None` for any
+    /// failure, so callers can treat "absent" and "unparseable" identically.
+    async fn get_text(&self, path: &str, model: Option<&str>) -> Option<String> {
+        let url = probe_url(&self.base_url, path, model)?;
+        let resp = apply_auth(self.client.get(&url), self.api_key.as_deref())
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.text().await.ok()
     }
 
     /// Attach a spawned server so its lifetime is tied to this embedder.
@@ -435,7 +672,10 @@ impl LlamaCppEmbedder {
             .send()
             .await
             .map_err(|e| {
-                Error::Embed(format!(
+                // A `send()` failure is transport-level — a reset, refused
+                // connection or timeout — so it is worth retrying rather than
+                // costing the file its place in the index.
+                Error::EmbedTransient(format!(
                     "POST {url} failed: {e}. Is llama.cpp serving the embedding model?"
                 ))
             })?;
@@ -461,6 +701,15 @@ impl Embedder for LlamaCppEmbedder {
     }
     fn dim(&self) -> usize {
         self.dim
+    }
+    fn max_input_tokens(&self) -> Option<usize> {
+        self.caps.max_input_tokens
+    }
+    fn max_concurrent_requests(&self) -> Option<usize> {
+        self.caps.total_slots
+    }
+    fn caps_source(&self) -> CapsSource {
+        self.caps.source
     }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
@@ -501,6 +750,36 @@ mod tests {
         let e = MockEmbedder::new("mock-v1", 16);
         assert_eq!(e.id(), "mock-v1");
         assert_eq!(e.dim(), 16);
+    }
+
+    #[test]
+    fn probe_url_percent_encodes_the_model_id() {
+        // Real llama.cpp model ids carry '/' and ':'. Interpolated raw they would
+        // corrupt the query string, and the router would fall back to describing
+        // itself — the exact failure the scoped probe exists to avoid.
+        let u = probe_url(
+            "http://127.0.0.1:8080",
+            "/props",
+            Some("Qwen/Qwen3-Embedding-8B-GGUF:Q8_0"),
+        )
+        .unwrap();
+        assert_eq!(
+            u,
+            "http://127.0.0.1:8080/props?model=Qwen%2FQwen3-Embedding-8B-GGUF%3AQ8_0"
+        );
+    }
+
+    #[test]
+    fn probe_url_without_a_model_is_unscoped() {
+        assert_eq!(
+            probe_url("http://127.0.0.1:8080/", "/props", None).unwrap(),
+            "http://127.0.0.1:8080/props"
+        );
+    }
+
+    #[test]
+    fn probe_url_rejects_an_unparseable_base() {
+        assert_eq!(probe_url("not a url", "/props", None), None);
     }
 
     #[test]
@@ -723,12 +1002,12 @@ mod tests {
 
     #[test]
     fn http_error_401_points_at_api_key_and_includes_body() {
-        let Error::Embed(m) = embed_http_error(
+        let Error::EmbedAuth(m) = embed_http_error(
             reqwest::StatusCode::UNAUTHORIZED,
             "http://host:8080/v1/embeddings",
             "{\"error\":{\"message\":\"Invalid API Key\"}}",
         ) else {
-            unreachable!("embed_http_error always returns Error::Embed")
+            unreachable!("a 401 is an auth error")
         };
         assert!(m.contains("401"), "message should name the status: {m}");
         assert!(
@@ -743,24 +1022,24 @@ mod tests {
 
     #[test]
     fn http_error_403_also_points_at_api_key() {
-        let Error::Embed(m) = embed_http_error(
+        let Error::EmbedAuth(m) = embed_http_error(
             reqwest::StatusCode::FORBIDDEN,
             "http://host:8080/v1/embeddings",
             "",
         ) else {
-            unreachable!("embed_http_error always returns Error::Embed")
+            unreachable!("a 403 is an auth error")
         };
         assert!(m.contains("api_key"), "403 should point at api_key: {m}");
     }
 
     #[test]
     fn http_error_500_is_generic_not_auth() {
-        let Error::Embed(m) = embed_http_error(
+        let Error::EmbedTransient(m) = embed_http_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "http://host:8080/v1/embeddings",
             "boom",
         ) else {
-            unreachable!("embed_http_error always returns Error::Embed")
+            unreachable!("a 5xx is a transient error")
         };
         assert!(m.contains("500"), "message should name the status: {m}");
         assert!(
@@ -786,6 +1065,132 @@ mod tests {
             .unwrap();
         assert_eq!(whole, batched, "batching must not change vectors or order");
     }
+
+    #[test]
+    fn embedder_reports_no_budget_by_default() {
+        let e = MockEmbedder::new("m", 8);
+        assert_eq!(
+            e.max_input_tokens(),
+            None,
+            "an embedder that never probed must report an unknown budget"
+        );
+    }
+
+    #[test]
+    fn mock_embedder_can_declare_a_budget() {
+        let e = MockEmbedder::new("m", 8).with_max_input_tokens(2048);
+        assert_eq!(e.max_input_tokens(), Some(2048));
+    }
+
+    #[tokio::test]
+    async fn mock_rejects_oversized_input_like_llama_cpp() {
+        // Simulates llama.cpp's structured 400 so the adaptive budget loop is
+        // testable without a server.
+        let e = MockEmbedder::new("m", 8).with_context_limit(100, 4);
+        // 400 bytes / 4 = 100 tokens: exactly at the limit, accepted.
+        let ok = e.embed(&["x".repeat(400)]).await;
+        assert!(ok.is_ok(), "at-limit input must be accepted");
+        // 404 bytes / 4 = 101 tokens: over.
+        match e.embed(&["x".repeat(404)]).await {
+            Err(Error::EmbedContextExceeded {
+                n_prompt_tokens,
+                n_ctx,
+            }) => {
+                assert_eq!(n_prompt_tokens, 101);
+                assert_eq!(n_ctx, 100);
+            }
+            other => panic!("expected EmbedContextExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_context_error_is_typed() {
+        let body = r#"{"error":{"code":400,"message":"request (15001 tokens) exceeds the available context size (2048 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":15001,"n_ctx":2048}}"#;
+        let err = embed_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "http://x/v1/embeddings",
+            body,
+        );
+        match err {
+            Error::EmbedContextExceeded {
+                n_prompt_tokens,
+                n_ctx,
+            } => {
+                assert_eq!(n_prompt_tokens, 15001);
+                assert_eq!(n_ctx, 2048);
+            }
+            other => panic!("expected EmbedContextExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_400_stays_generic() {
+        let body = r#"{"error":{"code":400,"message":"bad input","type":"invalid_request_error"}}"#;
+        let err = embed_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "http://x/v1/embeddings",
+            body,
+        );
+        assert!(
+            matches!(err, Error::Embed(_)),
+            "a non-context 400 must not be reported as a context overflow"
+        );
+    }
+
+    #[test]
+    fn context_error_without_n_ctx_stays_generic() {
+        // A router could echo the type without the numbers; without n_ctx there is
+        // nothing to retry against, so it must not become a typed retry signal.
+        let body = r#"{"error":{"type":"exceed_context_size_error"}}"#;
+        let err = embed_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "http://x/v1/embeddings",
+            body,
+        );
+        assert!(matches!(err, Error::Embed(_)));
+    }
+
+    #[test]
+    fn classifies_http_status_into_error_kinds() {
+        let url = "http://localhost:8080/v1/embeddings";
+        // Auth failure: the request reached the server and was rejected. Retrying
+        // cannot help and the whole run is doomed.
+        let e = embed_http_error(reqwest::StatusCode::UNAUTHORIZED, url, "");
+        assert!(matches!(e, Error::EmbedAuth(_)));
+        assert!(e.is_fatal_for_run());
+        assert!(!e.is_retryable());
+
+        // Overload: transient, worth retrying.
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let e = embed_http_error(status, url, "");
+            assert!(e.is_retryable(), "{status} should be retryable");
+            assert!(!e.is_fatal_for_run());
+        }
+
+        // A structured overflow is a budget signal, not a failure of either kind.
+        let body =
+            r#"{"error":{"type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":8192}}"#;
+        let e = embed_http_error(reqwest::StatusCode::BAD_REQUEST, url, body);
+        assert!(matches!(e, Error::EmbedContextExceeded { .. }));
+        assert!(!e.is_retryable());
+        assert!(!e.is_fatal_for_run());
+    }
+
+    #[test]
+    fn auth_errors_are_unchanged() {
+        let err = embed_http_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "http://x/v1/embeddings",
+            "",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("api_key"), "auth hint must survive: {msg}");
+    }
 }
 
 #[cfg(test)]
@@ -806,5 +1211,30 @@ mod live {
         let v = e.embed(&["fn main() {}".into()]).await.unwrap();
         let n: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-4);
+    }
+
+    /// Exercises the real discovery path against the machine's actual configured
+    /// endpoint, credentials included — hence the full `Config::load` rather than
+    /// `EmbedderConfig::default()`, which carries no `api_key` and would only ever
+    /// prove that a 401 is a 401. Against a `llama serve` supervisor this
+    /// necessarily resolves via `/v1/models`, since its `/props` reports `n_ctx: 0`.
+    #[tokio::test]
+    #[ignore = "requires a running llama.cpp embeddings server"]
+    async fn live_probe_reports_context_window() {
+        let cfg = crate::config::Config::load(None, std::env::current_dir().unwrap())
+            .expect("load config")
+            .embedder;
+        let e = LlamaCppEmbedder::connect(
+            cfg.base_url.clone(),
+            cfg.model.clone(),
+            cfg.request_timeout_secs,
+            cfg.resolved_api_key().unwrap(),
+        )
+        .await
+        .expect("connect");
+        let tokens = e
+            .max_input_tokens()
+            .expect("server should report its context window via /props or /v1/models");
+        assert!(tokens >= 512, "implausible context window: {tokens}");
     }
 }
