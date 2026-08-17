@@ -434,7 +434,7 @@ impl Default for Config {
             embedder: EmbedderConfig::default(),
             search: SearchConfig::default(),
             watch: WatchConfig::default(),
-            languages: vec!["rust".into(), "python".into(), "typescript".into()],
+            languages: vec![],
             strip_banner_comments: true,
             exclude: Vec::new(),
             index_tests: false,
@@ -529,9 +529,9 @@ impl Config {
 
     /// Check if a file should be indexed based on the language whitelist.
     ///
-    /// Empty `languages` → allow all. Otherwise, matches both the chunker's
-    /// detected language name ("rust", "python", "typescript") and the raw
-    /// extension ("rs", "py", "ts", "tsx"), so a user specifying either works.
+    /// Empty `languages` → allow all. Otherwise, matches the chunker's detected
+    /// language name ("tsx"), its family ("typescript" admits tsx), or the raw
+    /// extension ("rs", "py", "ts"), so a user specifying any of the three works.
     pub fn is_language_allowed(&self, path: &Path, detected_language: Option<&str>) -> bool {
         if self.languages.is_empty() {
             return true;
@@ -543,10 +543,13 @@ impl Config {
         let ext_matches = ext
             .as_deref()
             .is_some_and(|e| self.languages.iter().any(|l| l.eq_ignore_ascii_case(e)));
+        let family = detected_language
+            .and_then(crate::chunk::spec_for_name)
+            .map(|s| s.family);
         let lang_matches = detected_language.is_some_and(|l| {
-            self.languages
-                .iter()
-                .any(|lang| lang.eq_ignore_ascii_case(l))
+            self.languages.iter().any(|lang| {
+                lang.eq_ignore_ascii_case(l) || family.is_some_and(|f| lang.eq_ignore_ascii_case(f))
+            })
         });
         ext_matches || lang_matches
     }
@@ -565,7 +568,10 @@ mod tests {
         assert_eq!(c.search.max_results, 25);
         assert!((c.search.relevance_ratio - 0.75).abs() < 1e-6);
         assert!(c.search.token_budget > 0);
-        assert_eq!(c.languages, vec!["rust", "python", "typescript"]);
+        assert!(
+            c.languages.is_empty(),
+            "default whitelist is empty = index every language"
+        );
         assert!(c.cascade.is_empty(), "defaults have no cascade levels");
     }
 
@@ -861,8 +867,35 @@ mod tests {
             ".ts with typescript language should match"
         );
         assert!(
-            c.is_language_allowed(Path::new("App.tsx"), Some("typescript")),
-            ".tsx with typescript language should match"
+            c.is_language_allowed(Path::new("App.tsx"), Some("tsx")),
+            ".tsx detects as \"tsx\", which is in the typescript family and must match"
+        );
+    }
+
+    #[test]
+    fn is_language_allowed_matches_by_family() {
+        // The detected language for .tsx/.jsx is the grammar name ("tsx",
+        // "javascript"), not the family — the whitelist must admit by family so
+        // `languages = ["typescript"]` covers a React TS repo.
+        let c = Config {
+            languages: vec!["typescript".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            c.is_language_allowed(Path::new("App.tsx"), Some("tsx")),
+            "tsx family is typescript"
+        );
+        assert!(
+            !c.is_language_allowed(Path::new("app.jsx"), Some("javascript")),
+            "javascript is its own family, not typescript"
+        );
+        let js = Config {
+            languages: vec!["javascript".into()],
+            ..Config::default_for(PathBuf::from("/repo"))
+        };
+        assert!(
+            js.is_language_allowed(Path::new("app.jsx"), Some("javascript")),
+            ".jsx detects as javascript"
         );
     }
 
