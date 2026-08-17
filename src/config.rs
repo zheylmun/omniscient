@@ -94,6 +94,11 @@ fn merge_embedder(base: EmbedderConfig, overlay: EmbedderConfig) -> EmbedderConf
         } else {
             overlay.max_batch_bytes
         },
+        max_chunk_tokens: if overlay.max_chunk_tokens == def.max_chunk_tokens {
+            base.max_chunk_tokens
+        } else {
+            overlay.max_chunk_tokens
+        },
         embed_concurrency: if overlay.embed_concurrency == def.embed_concurrency {
             base.embed_concurrency
         } else {
@@ -179,17 +184,49 @@ fn merge_watch(base: &WatchConfig, overlay: &WatchConfig) -> WatchConfig {
     }
 }
 
+/// Default per-input token budget used when the endpoint reports no window.
+/// Also the value `chunk_budget_tokens()` falls back to for a configured `0`.
+const DEFAULT_MAX_CHUNK_TOKENS: usize = 2048;
+
+/// The default embedding model, used as BOTH the served model id (`model`) and
+/// the GGUF to fetch (`hf_repo`) — they must agree or `llama serve` rejects
+/// every request with `400 model '<id>' not found`.
+///
+/// Qwen3-Embedding-0.6B at `Q8_0` is ~640 MB and runs on CPU or an integrated GPU,
+/// so the out-of-the-box configuration works on an ordinary developer machine
+/// rather than requiring a large discrete GPU. It is the same family as the
+/// larger Qwen3-Embedding models, so `pooling = "last"` stays correct if a user
+/// scales up to 4B/8B by changing these two values.
+const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EmbedderConfig {
     pub base_url: String,
+    /// The model id sent as `model` on every embeddings request, and the id the
+    /// `/props?model=` capability probe is scoped to.
+    ///
+    /// This must be an id the endpoint actually serves. A bare `llama-server`
+    /// ignores the field, but `llama serve` routes by it and answers an unknown
+    /// id with `400 model '<id>' not found` — so the default matches `hf_repo`,
+    /// which is the id `llama serve` registers a `-hf`-loaded model under. The
+    /// `auto_start` path additionally passes `--alias <model>`, which makes the
+    /// spawned server register under *this* id whatever `hf_repo` says, so the
+    /// two can never drift out from under a user who changes only one of them.
     pub model: String,
     pub max_batch_chunks: usize,
     pub max_batch_bytes: usize,
+    /// Per-input token budget used when the endpoint does not report its own
+    /// (`/props` and `/v1/models` gave us nothing — e.g. a non-llama.cpp
+    /// OpenAI-compatible router, which also returns an unstructured 400 there
+    /// is nothing to learn from). A probed value always wins over this, and any
+    /// overflow the endpoint does report corrects it.
+    pub max_chunk_tokens: usize,
     /// Maximum number of concurrent embedding requests during reconcile.
-    /// Each request covers one file's chunks (batched by `max_batch_chunks/bytes`).
-    /// Higher values saturate the endpoint faster on large initial indexes.
-    pub embed_concurrency: usize,
+    /// Unset (the default) derives it from the server's reported `total_slots`,
+    /// falling back to 1 for an endpoint that does not report one. Set it only
+    /// to override what the server says.
+    pub embed_concurrency: Option<usize>,
     /// When true and `base_url` is unreachable at startup, omniscient launches a
     /// local llama.cpp server (`llama serve …`) itself and waits for it to come
     /// up, instead of erroring. Off by default — an already-running endpoint is
@@ -201,6 +238,11 @@ pub struct EmbedderConfig {
     pub llama_bin: String,
     /// The `-hf` argument passed to `llama serve`: a Hugging Face GGUF repo with
     /// an optional `:QUANT` tag. The GGUF is downloaded on first run.
+    ///
+    /// Defaults to the same string as `model` so the documented manual command
+    /// and the `auto_start` command produce an endpoint the default `model`
+    /// resolves against. Changing only this one is safe — `auto_start` aliases
+    /// the spawned server to `model` regardless.
     pub hf_repo: String,
     /// The `--pooling` strategy for the spawned server. Qwen3-Embedding (a
     /// decoder LLM) needs `last`; BERT-family embedders need `mean`.
@@ -225,13 +267,14 @@ impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:8080".into(),
-            model: "qwen3-embedding-4b".into(),
+            model: DEFAULT_MODEL.into(),
             max_batch_chunks: 64,
             max_batch_bytes: 32000,
-            embed_concurrency: 1,
+            max_chunk_tokens: DEFAULT_MAX_CHUNK_TOKENS,
+            embed_concurrency: None,
             auto_start: false,
             llama_bin: "llama".into(),
-            hf_repo: "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M".into(),
+            hf_repo: DEFAULT_MODEL.into(),
             pooling: "last".into(),
             auto_start_timeout_secs: 600,
             request_timeout_secs: 30,
@@ -247,6 +290,21 @@ impl EmbedderConfig {
         BatchLimits {
             max_chunks: self.max_batch_chunks.max(1),
             max_bytes: self.max_batch_bytes.max(1),
+        }
+    }
+
+    /// The per-input token budget to seed `ChunkBudget` with when the endpoint
+    /// reports no window of its own.
+    ///
+    /// `0` is treated as unset rather than obeyed: it is not a usable seed, and
+    /// `ChunkBudget::from_probe` would clamp it to 1 token — a 4-byte chunk budget
+    /// that shatters every file in the repo. Same spirit as `batch_limits`, which
+    /// clamps its own zeros rather than rejecting the config.
+    pub fn chunk_budget_tokens(&self) -> usize {
+        if self.max_chunk_tokens == 0 {
+            DEFAULT_MAX_CHUNK_TOKENS
+        } else {
+            self.max_chunk_tokens
         }
     }
 
@@ -502,7 +560,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = Config::default_for(PathBuf::from("/repo"));
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
         assert_eq!(c.embedder.base_url, "http://localhost:8080");
         assert_eq!(c.search.max_results, 25);
         assert!((c.search.relevance_ratio - 0.75).abs() < 1e-6);
@@ -556,7 +614,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -608,7 +666,7 @@ mod tests {
         assert_eq!(c.embedder.max_batch_chunks, 16);
         assert_eq!(c.embedder.max_batch_bytes, 8000);
         // unspecified embedder fields keep their defaults
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -616,7 +674,11 @@ mod tests {
         let c = Config::default_for(PathBuf::from("/repo"));
         assert!(!c.embedder.auto_start, "auto_start defaults to off");
         assert_eq!(c.embedder.llama_bin, "llama");
-        assert_eq!(c.embedder.hf_repo, "Qwen/Qwen3-Embedding-4B-GGUF:Q4_K_M");
+        assert_eq!(c.embedder.hf_repo, DEFAULT_MODEL);
+        assert_eq!(
+            c.embedder.hf_repo, c.embedder.model,
+            "the GGUF we fetch must register under the id we send as `model`"
+        );
         assert_eq!(c.embedder.pooling, "last");
         assert_eq!(c.embedder.auto_start_timeout_secs, 600);
 
@@ -635,7 +697,51 @@ mod tests {
         assert_eq!(c.embedder.pooling, "mean");
         assert_eq!(c.embedder.auto_start_timeout_secs, 120);
         // unspecified embedder fields keep their defaults
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn chunk_budget_defaults() {
+        let c = Config::default_for(PathBuf::from("/repo"));
+        assert_eq!(c.embedder.max_chunk_tokens, 2048);
+    }
+
+    #[test]
+    fn chunk_budget_overrides_parse() {
+        let toml = r"
+            [embedder]
+            max_chunk_tokens = 8192
+        ";
+        let c = Config::from_toml_str(toml, PathBuf::from("/repo")).unwrap();
+        assert_eq!(c.embedder.max_chunk_tokens, 8192);
+    }
+
+    #[test]
+    fn chunk_budget_tokens_treats_zero_as_unset() {
+        // `batch_limits()` clamps its zeros; this knob must not be the exception.
+        // Unclamped, 0 flows into `ChunkBudget::from_probe`, whose `.max(1)` makes
+        // it 1 token — a 4-byte chunk budget that shatters every file in the repo.
+        let c = Config::from_toml_str("[embedder]\nmax_chunk_tokens = 0\n", PathBuf::from("/repo"))
+            .unwrap();
+        assert_eq!(
+            c.embedder.max_chunk_tokens, 0,
+            "the raw field keeps the user's value, as the batch knobs do"
+        );
+        assert_eq!(
+            c.embedder.chunk_budget_tokens(),
+            EmbedderConfig::default().max_chunk_tokens,
+            "0 is not a usable seed, so fall back to the default"
+        );
+    }
+
+    #[test]
+    fn chunk_budget_tokens_passes_a_real_value_through() {
+        let c = Config::from_toml_str(
+            "[embedder]\nmax_chunk_tokens = 8192\n",
+            PathBuf::from("/repo"),
+        )
+        .unwrap();
+        assert_eq!(c.embedder.chunk_budget_tokens(), 8192);
     }
 
     #[test]
@@ -880,7 +986,7 @@ mod tests {
         )
         .unwrap();
         assert!(c.cascade.is_empty(), "no files → no cascade levels");
-        assert_eq!(c.embedder.model, "qwen3-embedding-4b");
+        assert_eq!(c.embedder.model, DEFAULT_MODEL);
     }
 
     #[test]
@@ -1129,11 +1235,11 @@ mod tests {
     }
 
     #[test]
-    fn embed_concurrency_defaults_to_one() {
+    fn embed_concurrency_defaults_to_unset() {
         let c = Config::default_for(PathBuf::from("/repo"));
         assert_eq!(
-            c.embedder.embed_concurrency, 1,
-            "default must match a single-slot llama.cpp server"
+            c.embedder.embed_concurrency, None,
+            "unset by default: concurrency is derived from the server's total_slots"
         );
     }
 }

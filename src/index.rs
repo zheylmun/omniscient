@@ -18,6 +18,9 @@ pub struct StoredChunk {
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
+    /// Position within the file's chunk list. Disambiguates the merge key, and
+    /// orders sub-line pieces that necessarily share a line number.
+    pub chunk_index: usize,
     pub language: String,
     pub symbol: Option<String>,
     pub text: String,
@@ -139,7 +142,11 @@ impl Index {
         let existing: Option<Meta> = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok());
-        let mismatch = existing.as_ref().is_some_and(|m| {
+        // Unknown provenance means rebuild. A table we cannot attribute to an
+        // embedder id, dim and chunker version may predate the current schema,
+        // and reusing it fails every merge_insert — a fatal error that wedges
+        // reconcile permanently. An unnecessary rebuild is the cheap direction.
+        let mismatch = existing.as_ref().is_none_or(|m| {
             m.embedder_id != embedder_id || m.dim != dim || m.chunker_version != chunker_version
         });
 
@@ -283,12 +290,28 @@ impl Index {
     /// never a gap or a superset. The operation is idempotent, so an interrupted reconcile
     /// that re-upserts the same content self-heals instead of duplicating rows. `file_meta`
     /// is updated in the same call and kept in lockstep.
-    pub async fn upsert_file(&self, path: &str, chunks: Vec<StoredChunk>) -> Result<()> {
+    ///
+    /// `file_hash` is passed explicitly rather than read off `chunks[0]` because a
+    /// file that is present but yields no chunks still has one, and still needs it
+    /// recorded — see the empty-chunks branch below.
+    pub async fn upsert_file(
+        &self,
+        path: &str,
+        file_hash: &str,
+        chunks: Vec<StoredChunk>,
+    ) -> Result<()> {
         if chunks.is_empty() {
-            // File now yields no chunks (e.g. deleted/emptied): just drop its rows.
-            return self.delete_file(path).await;
+            // The file exists but produced no chunks (empty, or whitespace only).
+            // Drop any rows it left behind, but still record its hash: without a
+            // `file_meta` row `diff` reports it as changed on every reconcile
+            // forever, repeating this delete on every search that reconciles.
+            self.table
+                .delete(&path_eq_filter(path))
+                .await
+                .map_err(|e| Error::Index(e.to_string()))?;
+            return self.write_file_meta(path, file_hash).await;
         }
-        let new_hash = chunks[0].file_hash.clone();
+        let new_hash = file_hash.to_string();
         let schema = schema_for(self.dim);
         let batch = build_batch(&schema, &chunks, self.dim)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -360,6 +383,7 @@ impl Index {
             let syms = str_col(b, "symbol")?;
             let starts = u32_col(b, "start_line")?;
             let ends = u32_col(b, "end_line")?;
+            let idxs = u32_col(b, "chunk_index")?;
             let dist = b
                 .column_by_name("_distance")
                 .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
@@ -376,6 +400,7 @@ impl Index {
                         path: paths.value(i).to_string(),
                         start_line: starts.value(i) as usize,
                         end_line: ends.value(i) as usize,
+                        chunk_index: idxs.value(i) as usize,
                         language: langs.value(i).to_string(),
                         symbol,
                         text: texts.value(i).to_string(),
@@ -423,8 +448,9 @@ fn build_batch(schema: &Arc<Schema>, chunks: &[StoredChunk], dim: usize) -> Resu
     );
     // Position within the file's chunk list — the disambiguator in the merge key.
     let indices = UInt32Array::from(
-        (0..chunks.len())
-            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+        chunks
+            .iter()
+            .map(|c| u32::try_from(c.chunk_index).unwrap_or(u32::MAX))
             .collect::<Vec<_>>(),
     );
     let langs = StringArray::from(
@@ -474,11 +500,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn chunk(path: &str, hash: &str, line: usize, vec: Vec<f32>) -> StoredChunk {
+    fn chunk(path: &str, hash: &str, index: usize, line: usize, vec: Vec<f32>) -> StoredChunk {
         StoredChunk {
             path: path.into(),
             start_line: line,
             end_line: line + 1,
+            chunk_index: index,
             language: "rust".into(),
             symbol: Some("f".into()),
             text: format!("code at {line}"),
@@ -493,9 +520,10 @@ mod tests {
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         idx.upsert_file(
             "a.rs",
+            "h1",
             vec![
-                chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0]),
-                chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]),
+                chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0]),
+                chunk("a.rs", "h1", 1, 5, vec![0.0, 1.0, 0.0]),
             ],
         )
         .await
@@ -509,12 +537,20 @@ mod tests {
     async fn upsert_replaces_old_rows_for_file() {
         let dir = tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-            .await
-            .unwrap();
-        idx.upsert_file("a.rs", vec![chunk("a.rs", "h2", 9, vec![1.0, 0.0, 0.0])])
-            .await
-            .unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h1",
+            vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h2",
+            vec![chunk("a.rs", "h2", 0, 9, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
         let hashes = idx.file_hashes().await.unwrap();
         assert_eq!(hashes.get("a.rs"), Some(&"h2".to_string()));
         let hits = idx.search(&[1.0, 0.0, 0.0], 5).await.unwrap();
@@ -529,14 +565,19 @@ mod tests {
         // old-hash rows, and none of the just-added new rows wrongly deleted.
         let dir = tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-            .await
-            .unwrap();
         idx.upsert_file(
             "a.rs",
+            "h1",
+            vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h2",
             vec![
-                chunk("a.rs", "h2", 10, vec![1.0, 0.0, 0.0]),
-                chunk("a.rs", "h2", 20, vec![0.0, 1.0, 0.0]),
+                chunk("a.rs", "h2", 0, 10, vec![1.0, 0.0, 0.0]),
+                chunk("a.rs", "h2", 1, 20, vec![0.0, 1.0, 0.0]),
             ],
         )
         .await
@@ -563,12 +604,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
         let rows = vec![
-            chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0]),
-            chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]),
+            chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0]),
+            chunk("a.rs", "h1", 1, 5, vec![0.0, 1.0, 0.0]),
         ];
-        idx.upsert_file("a.rs", rows.clone()).await.unwrap();
+        idx.upsert_file("a.rs", "h1", rows.clone()).await.unwrap();
         // Re-upsert the exact same content (the interrupted-reconcile / stale-meta case).
-        idx.upsert_file("a.rs", rows).await.unwrap();
+        idx.upsert_file("a.rs", "h1", rows).await.unwrap();
         assert_eq!(
             idx.chunk_count().await.unwrap(),
             2,
@@ -586,8 +627,8 @@ mod tests {
         // unindexed and reconcile stuck); the chunk_index key must keep them distinct.
         let dir = tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-        let mut a = chunk("a.rs", "h1", 5, vec![1.0, 0.0, 0.0]);
-        let mut b = chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]);
+        let mut a = chunk("a.rs", "h1", 0, 5, vec![1.0, 0.0, 0.0]);
+        let mut b = chunk("a.rs", "h1", 1, 5, vec![0.0, 1.0, 0.0]);
         a.symbol = Some("A".into());
         b.symbol = Some("B".into());
         assert_eq!(
@@ -595,18 +636,18 @@ mod tests {
             (b.start_line, b.end_line),
             "test premise: both chunks share the same line range"
         );
-        idx.upsert_file("a.rs", vec![a, b]).await.unwrap();
+        idx.upsert_file("a.rs", "h1", vec![a, b]).await.unwrap();
         assert_eq!(
             idx.chunk_count().await.unwrap(),
             2,
             "both same-line chunks are stored, not collapsed"
         );
         // A second upsert of identical content must still converge (idempotent).
-        let mut a2 = chunk("a.rs", "h1", 5, vec![1.0, 0.0, 0.0]);
-        let mut b2 = chunk("a.rs", "h1", 5, vec![0.0, 1.0, 0.0]);
+        let mut a2 = chunk("a.rs", "h1", 0, 5, vec![1.0, 0.0, 0.0]);
+        let mut b2 = chunk("a.rs", "h1", 1, 5, vec![0.0, 1.0, 0.0]);
         a2.symbol = Some("A".into());
         b2.symbol = Some("B".into());
-        idx.upsert_file("a.rs", vec![a2, b2]).await.unwrap();
+        idx.upsert_file("a.rs", "h1", vec![a2, b2]).await.unwrap();
         assert_eq!(
             idx.chunk_count().await.unwrap(),
             2,
@@ -623,10 +664,14 @@ mod tests {
     async fn upsert_empty_chunks_removes_file() {
         let dir = tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-            .await
-            .unwrap();
-        idx.upsert_file("a.rs", vec![]).await.unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h1",
+            vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
+        idx.upsert_file("a.rs", "h2", vec![]).await.unwrap();
         assert_eq!(
             idx.chunk_count().await.unwrap(),
             0,
@@ -642,9 +687,13 @@ mod tests {
         // must not keep pointing at deleted fragment files.
         let dir = tempdir().unwrap();
         let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-        idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-            .await
-            .unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h1",
+            vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
 
         // Simulate `reindex`: blow away the dataset dir and rebuild it via a fresh
         // handle with different contents.
@@ -652,7 +701,11 @@ mod tests {
         {
             let rebuilt = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
             rebuilt
-                .upsert_file("b.rs", vec![chunk("b.rs", "h2", 7, vec![1.0, 0.0, 0.0])])
+                .upsert_file(
+                    "b.rs",
+                    "h2",
+                    vec![chunk("b.rs", "h2", 0, 7, vec![1.0, 0.0, 0.0])],
+                )
                 .await
                 .unwrap();
         }
@@ -669,9 +722,13 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-            idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-                .await
-                .unwrap();
+            idx.upsert_file(
+                "a.rs",
+                "h1",
+                vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+            )
+            .await
+            .unwrap();
         }
         let idx = Index::open(dir.path(), "different-model", 3, 1)
             .await
@@ -685,9 +742,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-            idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-                .await
-                .unwrap();
+            idx.upsert_file(
+                "a.rs",
+                "h1",
+                vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+            )
+            .await
+            .unwrap();
         }
         // Simulate an index written before file_meta existed: drop the meta table.
         let conn = lancedb::connect(dir.path().join("lance").to_string_lossy().as_ref())
@@ -715,13 +776,56 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
-            idx.upsert_file("a.rs", vec![chunk("a.rs", "h1", 1, vec![1.0, 0.0, 0.0])])
-                .await
-                .unwrap();
+            idx.upsert_file(
+                "a.rs",
+                "h1",
+                vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+            )
+            .await
+            .unwrap();
         }
         // Same embedder, bumped chunker version: stale chunks must be dropped.
         let idx = Index::open(dir.path(), "mock-v1", 3, 2).await.unwrap();
         assert!(idx.rebuilt());
         assert!(idx.file_hashes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_meta_forces_a_rebuild() {
+        // A truncated meta.json must not let a stale-schema table survive: the
+        // first merge_insert would fail on the missing column, and index write
+        // errors are fatal, so every reconcile — and every search — would fail
+        // permanently until .omniscient/ was deleted by hand.
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "embedder-a", 8, 4).await.unwrap();
+        idx.upsert_file("a.rs", "h", vec![chunk("a.rs", "h", 0, 1, vec![0.0; 8])])
+            .await
+            .unwrap();
+        assert_eq!(idx.chunk_count().await.unwrap(), 1);
+        drop(idx);
+
+        std::fs::write(dir.path().join("meta.json"), "{ truncated").unwrap();
+
+        let idx = Index::open(dir.path(), "embedder-a", 8, 4).await.unwrap();
+        assert_eq!(
+            idx.chunk_count().await.unwrap(),
+            0,
+            "unreadable meta must rebuild, not reuse a table of unknown provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_meta_forces_a_rebuild() {
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "embedder-a", 8, 4).await.unwrap();
+        idx.upsert_file("a.rs", "h", vec![chunk("a.rs", "h", 0, 1, vec![0.0; 8])])
+            .await
+            .unwrap();
+        drop(idx);
+
+        std::fs::remove_file(dir.path().join("meta.json")).unwrap();
+
+        let idx = Index::open(dir.path(), "embedder-a", 8, 4).await.unwrap();
+        assert_eq!(idx.chunk_count().await.unwrap(), 0);
     }
 }

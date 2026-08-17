@@ -1,9 +1,32 @@
-//! CLI: serve (MCP) + status/reindex (human debugging).
+//! CLI: serve (MCP) + status/reindex/doctor (human debugging).
 use crate::config::Config;
 use crate::engine::Engine;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
+
+/// Default log filter: omniscient's own INFO, everything else only on warnings.
+///
+/// Without a filter, `tracing_subscriber::fmt()` admits INFO from every
+/// dependency, and `LanceDB` narrates each table load and query plan. That noise
+/// buries the report `doctor` exists to print and the two lines `status` and
+/// `reindex` exist to print. `RUST_LOG` overrides this in full, so the detail is
+/// one environment variable away when a dependency is what needs debugging.
+const DEFAULT_LOG_FILTER: &str = "warn,omniscient=info";
+
+/// Install the log subscriber. Always writes to **stderr**: `serve` reserves
+/// stdout for the MCP protocol, and the human commands reserve it for their own
+/// output, so no log line may ever land there.
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
+        )
+        .init();
+}
 
 #[derive(Parser)]
 #[command(name = "omniscient", version)]
@@ -95,15 +118,11 @@ pub fn run() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd {
         Cmd::Serve => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .init();
+            init_logging();
             rt.block_on(crate::mcp::serve(load(&cli)?))?;
         }
         Cmd::Status => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .init();
+            init_logging();
             rt.block_on(async {
                 let engine = Engine::new(load(&cli)?).await?;
                 engine.refresh().await?;
@@ -115,9 +134,7 @@ pub fn run() -> anyhow::Result<()> {
             })?;
         }
         Cmd::Reindex => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .init();
+            init_logging();
             let cfg = load(&cli)?;
             let _ = std::fs::remove_dir_all(cfg.repo_root.join(".omniscient"));
             rt.block_on(async {
@@ -128,9 +145,7 @@ pub fn run() -> anyhow::Result<()> {
             })?;
         }
         Cmd::Doctor => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .init();
+            init_logging();
             let cfg = load(&cli)?;
             rt.block_on(async {
                 let engine = Engine::new(cfg.clone())
