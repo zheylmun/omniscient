@@ -1,5 +1,9 @@
 # Copy to omniscient.toml in your repo root and edit.
-languages = ["rust", "python", "typescript"]
+# Language whitelist. Empty (the default) indexes every language: tree-sitter
+# chunking for rust/python/javascript/typescript/tsx, line windows for the rest.
+# Entries match a language name ("tsx"), a family ("typescript" also admits
+# .tsx), or a raw extension ("rs"), case-insensitive.
+languages = []
 # Strip leading banner comments (license headers, module doc comments) from search
 # results. Inline comments are preserved — they carry implementation intent.
 # The old key name 'strip_comments' is still accepted for backward compatibility.

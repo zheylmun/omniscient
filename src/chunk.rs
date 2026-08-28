@@ -13,7 +13,16 @@ use std::path::Path;
 /// v4: chunks are split to fit the embedding endpoint's context window.
 /// 5: byte-budget splitting moved off the read path onto the embedding path,
 /// and sub-line pieces are now identified by `chunk_index`.
-pub const CHUNKER_VERSION: u32 = 5;
+/// 6: language registry — tsx admitted by the typescript family, symbols for
+/// Rust `impl` blocks and JS/TS `const` declarations.
+pub const CHUNKER_VERSION: u32 = 6;
+
+/// blake3 of [`LANGUAGES`]' observable surface, recorded so the
+/// `registry_changes_require_a_chunker_version_bump` test can force a
+/// [`CHUNKER_VERSION`] bump whenever the registry changes. Update both together;
+/// the failing test prints the new value.
+pub const REGISTRY_FINGERPRINT: &str =
+    "792b064d61e3a392c29d13f207f25df7dac98167678204d3ce4a35fb1836e57a";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -24,15 +33,164 @@ pub struct Chunk {
     pub symbol: Option<String>,
 }
 
-pub fn language_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("rs") => Some("rust"),
-        Some("py") => Some("python"),
-        Some("js" | "jsx") => Some("javascript"),
-        Some("ts") => Some("typescript"),
-        Some("tsx") => Some("tsx"),
-        _ => None,
+/// Extracts a chunk's symbol from a def node the generic `name`-field path
+/// cannot name; `None` falls through to that generic path.
+pub type SymbolHook = fn(tree_sitter::Node, &[u8]) -> Option<String>;
+
+/// True if a node is test-only code that must be skipped entirely.
+pub type TestItemHook = fn(tree_sitter::Node, &[u8]) -> bool;
+
+/// Everything the pipeline needs to know about one supported language, in one
+/// place. Adding a language is a single entry in [`LANGUAGES`]; the struct has
+/// no `Default` impl on purpose, so the compiler forces every field — including
+/// the optional hooks — to be considered explicitly.
+pub struct LanguageSpec {
+    /// The grammar's own name ("tsx"), stored on chunks and shown in results.
+    pub name: &'static str,
+    /// Whitelist grouping for `[languages]` in config: "tsx" belongs to the
+    /// "typescript" family. Equals `name` for a standalone language.
+    pub family: &'static str,
+    /// File extensions that select this spec (lowercase, no dot).
+    pub extensions: &'static [&'static str],
+    pub grammar: fn() -> tree_sitter::Language,
+    /// Node kinds that are emitted as one chunk per top-level definition.
+    pub def_kinds: &'static [&'static str],
+    /// Language-specific symbol extraction for def nodes whose name is not in a
+    /// `name` field (Rust `impl` blocks, JS/TS `const x = …` declarators).
+    /// `None` from the hook (or no hook) falls back to the generic `name` field.
+    pub symbol_for: Option<SymbolHook>,
+    /// Inline-test detection: true if this node is test-only code (Rust's
+    /// `#[cfg(test)]`/`#[test]`-gated items) and must be skipped entirely —
+    /// neither emitted nor recursed into. `None` = the language has no
+    /// inline-test convention; test *files* are excluded by glob instead.
+    pub is_test_item: Option<TestItemHook>,
+    /// This language's test-file naming conventions, contributed to the default
+    /// exclude set (dropped when `index_tests = true`). Language-agnostic
+    /// conventions (`tests/`, `__tests__/`, `*_test.*`) live in
+    /// `freshness::DEFAULT_TEST_EXCLUDES` instead.
+    pub test_file_globs: &'static [&'static str],
+}
+
+/// The language registry: the single source of truth for extension mapping,
+/// grammar selection, and definition kinds.
+pub static LANGUAGES: &[LanguageSpec] = &[
+    LanguageSpec {
+        name: "rust",
+        family: "rust",
+        extensions: &["rs"],
+        grammar: || tree_sitter_rust::LANGUAGE.into(),
+        def_kinds: &[
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "impl_item",
+        ],
+        symbol_for: Some(rust_extra_symbol),
+        is_test_item: Some(rust_is_test_item),
+        test_file_globs: &["**/benches/**"],
+    },
+    LanguageSpec {
+        name: "python",
+        family: "python",
+        extensions: &["py"],
+        grammar: || tree_sitter_python::LANGUAGE.into(),
+        def_kinds: &["function_definition", "class_definition"],
+        symbol_for: None,
+        is_test_item: None,
+        test_file_globs: &["**/test_*.py", "**/conftest.py"],
+    },
+    LanguageSpec {
+        name: "javascript",
+        family: "javascript",
+        extensions: &["js", "jsx"],
+        grammar: || tree_sitter_javascript::LANGUAGE.into(),
+        def_kinds: &[
+            "function_declaration",
+            "class_declaration",
+            "method_definition",
+            "lexical_declaration",
+            "variable_declaration",
+        ],
+        symbol_for: Some(declarator_symbol),
+        is_test_item: None,
+        test_file_globs: &["**/*.test.*", "**/*.spec.*"],
+    },
+    LanguageSpec {
+        name: "typescript",
+        family: "typescript",
+        extensions: &["ts"],
+        grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        def_kinds: &[
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "method_definition",
+            "lexical_declaration",
+        ],
+        symbol_for: Some(declarator_symbol),
+        is_test_item: None,
+        test_file_globs: &["**/*.test.*", "**/*.spec.*"],
+    },
+    LanguageSpec {
+        name: "tsx",
+        family: "typescript",
+        extensions: &["tsx"],
+        grammar: || tree_sitter_typescript::LANGUAGE_TSX.into(),
+        def_kinds: &[
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "method_definition",
+            "lexical_declaration",
+        ],
+        symbol_for: Some(declarator_symbol),
+        is_test_item: None,
+        test_file_globs: &["**/*.test.*", "**/*.spec.*"],
+    },
+];
+
+/// Rust symbols the generic `name`-field path misses: an `impl` block has no
+/// `name`, but its implemented type (`impl Engine`, `impl Clone for Engine`) is
+/// the name users search for.
+fn rust_extra_symbol(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if node.kind() != "impl_item" {
+        return None;
     }
+    node.child_by_field_name("type")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .map(std::string::ToString::to_string)
+}
+
+/// JS/TS `const foo = …` / `var foo = …`: the name lives on the declarator
+/// inside the declaration, not in a `name` field on the declaration itself.
+fn declarator_symbol(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let declarator = node
+        .children(&mut cursor)
+        .find(|n| n.kind() == "variable_declarator")?;
+    declarator
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .map(std::string::ToString::to_string)
+}
+
+pub fn spec_for_path(path: &Path) -> Option<&'static LanguageSpec> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    LANGUAGES
+        .iter()
+        .find(|s| s.extensions.contains(&ext.as_str()))
+}
+
+pub fn spec_for_name(name: &str) -> Option<&'static LanguageSpec> {
+    LANGUAGES.iter().find(|s| s.name == name)
+}
+
+pub fn language_for_path(path: &Path) -> Option<&'static str> {
+    spec_for_path(path).map(|s| s.name)
 }
 
 pub fn chunk_file(path: &Path, source: &str, max_window_lines: usize) -> Result<Vec<Chunk>> {
@@ -186,61 +344,20 @@ fn enforce_byte_budget(chunk: Chunk, max_bytes: usize) -> Vec<Chunk> {
     out
 }
 
-fn ts_language(lang: &str) -> Option<tree_sitter::Language> {
-    match lang {
-        "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "python" => Some(tree_sitter_python::LANGUAGE.into()),
-        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        _ => None,
-    }
-}
-
-fn def_kinds(lang: &str) -> &'static [&'static str] {
-    match lang {
-        "rust" => &[
-            "function_item",
-            "struct_item",
-            "enum_item",
-            "trait_item",
-            "impl_item",
-        ],
-        "python" => &["function_definition", "class_definition"],
-        "javascript" => &[
-            "function_declaration",
-            "class_declaration",
-            "method_definition",
-            "lexical_declaration",
-            "variable_declaration",
-        ],
-        "typescript" | "tsx" => &[
-            "function_declaration",
-            "class_declaration",
-            "interface_declaration",
-            "method_definition",
-            "lexical_declaration",
-        ],
-        _ => &[],
-    }
-}
-
 fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
-    let language =
-        ts_language(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
+    let spec = spec_for_name(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&language)
+        .set_language(&(spec.grammar)())
         .map_err(|e| Error::Chunk(e.to_string()))?;
     // non-fatal: caller falls through to line_windows
     let Some(tree) = parser.parse(source, None) else {
         return Ok(vec![]);
     };
-    let kinds = def_kinds(lang);
     let bytes = source.as_bytes();
 
     let mut chunks = Vec::new();
-    walk_children(tree.root_node(), kinds, bytes, &mut chunks, lang);
+    walk_children(tree.root_node(), spec, bytes, &mut chunks);
     Ok(chunks)
 }
 
@@ -253,52 +370,70 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
 /// it); any other node is recursed into so real modules still contribute their defs.
 fn walk_children(
     parent: tree_sitter::Node,
-    kinds: &[&str],
+    spec: &LanguageSpec,
     bytes: &[u8],
     chunks: &mut Vec<Chunk>,
-    lang: &str,
 ) {
+    let kinds = spec.def_kinds;
     let mut cursor = parent.walk();
-    let mut test_gated = false;
     for child in parent.children(&mut cursor) {
-        match child.kind() {
-            "attribute_item" => {
-                // Attributes stack; any test attribute gates the item that follows.
-                if is_test_attribute(child, bytes) {
-                    test_gated = true;
-                }
-                continue;
-            }
-            // Comments between an attribute and its item must not consume the gate.
-            "line_comment" | "block_comment" => continue,
-            _ => {}
-        }
-
-        let gated = test_gated;
-        test_gated = false;
-        if gated {
-            continue; // skip the gated item entirely: no chunk, no recursion
+        if spec.is_test_item.is_some_and(|hook| hook(child, bytes)) {
+            continue; // test-only code: no chunk, no recursion
         }
 
         if kinds.contains(&child.kind()) {
             let text = child.utf8_text(bytes).unwrap_or("").to_string();
-            let symbol = child
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(bytes).ok())
-                .map(std::string::ToString::to_string);
+            let symbol = spec
+                .symbol_for
+                .and_then(|hook| hook(child, bytes))
+                .or_else(|| {
+                    child
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(bytes).ok())
+                        .map(std::string::ToString::to_string)
+                });
             chunks.push(Chunk {
                 text,
                 start_line: child.start_position().row + 1,
                 end_line: child.end_position().row + 1,
-                language: lang.to_string(),
+                language: spec.name.to_string(),
                 symbol,
             });
             // Do NOT recurse into a matched def — nested definitions (methods inside
             // impl/class) are part of this chunk and must not be emitted again.
         } else {
-            walk_children(child, kinds, bytes, chunks, lang);
+            walk_children(child, spec, bytes, chunks);
         }
     }
+}
+
+/// The Rust `is_test_item` hook: a node is test-only when any attribute in the
+/// stack of `attribute_item` siblings directly above it is a test marker.
+/// Attributes and doc comments may interleave (`#[cfg(test)]` / `/// docs` /
+/// `#[derive(..)]` / `mod tests`), so the backward scan skips comments and
+/// keeps checking attributes until it hits real code. An `attribute_item` node
+/// itself is never a chunk and carries no defs, so it reports false and the
+/// walker's generic recursion handles it harmlessly.
+fn rust_is_test_item(node: tree_sitter::Node, bytes: &[u8]) -> bool {
+    if node.kind() == "attribute_item" {
+        return false;
+    }
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        match sib.kind() {
+            "attribute_item" => {
+                // Attributes stack; any test attribute gates the item below them.
+                if is_test_attribute(sib, bytes) {
+                    return true;
+                }
+            }
+            // Comments between an attribute and its item must not break the stack.
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = sib.prev_sibling();
+    }
+    false
 }
 
 /// True if an `attribute_item` is a test marker: `#[test]`, `#[bench]`,
@@ -852,5 +987,112 @@ async fn async_test() {}
             !symbols.contains(&"async_test"),
             "async_test should be skipped: {symbols:?}"
         );
+    }
+
+    #[test]
+    fn rust_impl_blocks_get_the_type_name_as_symbol() {
+        let src = "struct Engine;\nimpl Engine {\n    fn go(&self) {}\n}\nimpl Clone for Engine {\n    fn clone(&self) -> Self { Engine }\n}\n";
+        let chunks = chunk_file(Path::new("a.rs"), src, 80).unwrap();
+        let symbols: Vec<Option<&str>> = chunks.iter().map(|c| c.symbol.as_deref()).collect();
+        assert!(
+            symbols.contains(&Some("Engine")),
+            "inherent impl should carry the type name: {symbols:?}"
+        );
+        // Both impl blocks target Engine; the trait impl must not be nameless.
+        let impl_symbols: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.starts_with("impl"))
+            .map(|c| c.symbol.as_deref())
+            .collect();
+        assert!(
+            impl_symbols.iter().all(|s| *s == Some("Engine")),
+            "every impl block names its implemented type: {impl_symbols:?}"
+        );
+    }
+
+    #[test]
+    fn js_const_declarations_get_the_declarator_name_as_symbol() {
+        let src = "const fetchUser = async (id) => {\n  return id;\n};\n";
+        let chunks = chunk_file(Path::new("api.js"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].symbol.as_deref(),
+            Some("fetchUser"),
+            "const arrow fn should index under its name"
+        );
+    }
+
+    #[test]
+    fn ts_const_declarations_get_the_declarator_name_as_symbol() {
+        let src = "const parseConfig = (raw: string): Config => {\n  return JSON.parse(raw);\n};\n";
+        let chunks = chunk_file(Path::new("cfg.ts"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbol.as_deref(), Some("parseConfig"));
+    }
+
+    #[test]
+    fn registry_changes_require_a_chunker_version_bump() {
+        // The registry's observable surface changes what chunks are produced,
+        // so editing it without bumping CHUNKER_VERSION would leave stale
+        // chunks in existing indexes. This fingerprint is recorded next to the
+        // version; if this test fails, bump CHUNKER_VERSION and update
+        // REGISTRY_FINGERPRINT to the value in the assertion message.
+        let mut surface = String::new();
+        for s in LANGUAGES {
+            use std::fmt::Write;
+            write!(
+                surface,
+                "{}|{}|{:?}|{:?}|sym:{}|test:{}|globs:{:?};",
+                s.name,
+                s.family,
+                s.extensions,
+                s.def_kinds,
+                s.symbol_for.is_some(),
+                s.is_test_item.is_some(),
+                s.test_file_globs,
+            )
+            .unwrap();
+        }
+        let fingerprint = blake3::hash(surface.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            fingerprint, REGISTRY_FINGERPRINT,
+            "language registry changed: bump CHUNKER_VERSION (currently {CHUNKER_VERSION}) \
+             and set REGISTRY_FINGERPRINT to {fingerprint}"
+        );
+    }
+
+    #[test]
+    fn registry_resolves_specs_by_extension_and_name() {
+        let tsx = spec_for_path(Path::new("component.tsx")).expect("tsx has a grammar");
+        assert_eq!(tsx.name, "tsx");
+        assert_eq!(
+            tsx.family, "typescript",
+            "tsx belongs to the typescript family"
+        );
+
+        let jsx = spec_for_path(Path::new("component.jsx")).expect("jsx maps to javascript");
+        assert_eq!(jsx.name, "javascript");
+        assert_eq!(
+            jsx.family, "javascript",
+            "a standalone language is its own family"
+        );
+
+        assert!(spec_for_path(Path::new("notes.md")).is_none());
+
+        let rust = spec_for_name("rust").expect("rust is registered");
+        assert_eq!(rust.extensions, &["rs"]);
+        assert!(spec_for_name("markdown").is_none());
+    }
+
+    #[test]
+    fn language_for_path_is_backed_by_the_registry() {
+        // The pre-registry behavior must survive: same names for the same paths.
+        assert_eq!(language_for_path(Path::new("a.rs")), Some("rust"));
+        assert_eq!(language_for_path(Path::new("a.py")), Some("python"));
+        assert_eq!(language_for_path(Path::new("a.js")), Some("javascript"));
+        assert_eq!(language_for_path(Path::new("a.jsx")), Some("javascript"));
+        assert_eq!(language_for_path(Path::new("a.ts")), Some("typescript"));
+        assert_eq!(language_for_path(Path::new("a.tsx")), Some("tsx"));
+        assert_eq!(language_for_path(Path::new("a.txt")), None);
     }
 }

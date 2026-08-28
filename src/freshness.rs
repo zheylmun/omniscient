@@ -29,34 +29,37 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "**/packages.lock.json",  // NuGet
 ];
 
-/// Built-in glob patterns for test/fixture files that are skipped during
-/// indexing unless `index_tests` is set. `**/` prefixes so they match in
-/// workspace members and nested packages, not just the repo root. `examples/`
-/// is deliberately absent — examples are real, runnable code worth searching.
+/// Language-agnostic test/fixture glob patterns, skipped during indexing unless
+/// `index_tests` is set. `**/` prefixes so they match in workspace members and
+/// nested packages, not just the repo root. `examples/` is deliberately absent —
+/// examples are real, runnable code worth searching. Per-language conventions
+/// (`test_*.py`, `*.spec.*`, `benches/`) live on `chunk::LANGUAGES` instead,
+/// so a new language declares its own alongside its grammar.
 pub const DEFAULT_TEST_EXCLUDES: &[&str] = &[
-    "**/tests/**",     // Rust integration tests + fixtures live here
-    "**/benches/**",   // Rust benchmarks
+    "**/tests/**",     // integration tests + fixtures (Rust, Python, ...)
     "**/__tests__/**", // JS/TS
-    "**/*.test.*",     // JS/TS
-    "**/*.spec.*",     // JS/TS
     "**/*_test.*",     // Python *_test.py, Go *_test.go, ...
-    "**/test_*.py",    // pytest
-    "**/conftest.py",  // pytest fixtures
 ];
 
 /// Resolve the effective exclude patterns: the always-on built-in excludes (lock
-/// files), then the test excludes unless `index_tests`, then the user's extras.
+/// files), then the test excludes unless `index_tests` — the generic set plus
+/// every language's own conventions from the registry, deduplicated — then the
+/// user's extras.
 pub fn resolve_excludes(user_exclude: &[String], index_tests: bool) -> Vec<String> {
     let mut out: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
     if !index_tests {
-        out.extend(
-            DEFAULT_TEST_EXCLUDES
-                .iter()
-                .map(std::string::ToString::to_string),
-        );
+        let mut test_globs: Vec<&str> = DEFAULT_TEST_EXCLUDES.to_vec();
+        for spec in crate::chunk::LANGUAGES {
+            for glob in spec.test_file_globs {
+                if !test_globs.contains(glob) {
+                    test_globs.push(glob);
+                }
+            }
+        }
+        out.extend(test_globs.iter().map(std::string::ToString::to_string));
     }
     out.extend(user_exclude.iter().cloned());
     out
@@ -207,6 +210,36 @@ mod tests {
             .into_iter()
             .map(|s| s.path)
             .collect()
+    }
+
+    #[test]
+    fn registry_test_globs_flow_into_resolved_excludes() {
+        // Per-language test-file globs live on the language registry; the
+        // exclude list must pick every one of them up when index_tests is off
+        // and drop every one of them when it is on.
+        let default = resolve_excludes(&[], false);
+        let indexing_tests = resolve_excludes(&[], true);
+        for spec in crate::chunk::LANGUAGES {
+            for glob in spec.test_file_globs {
+                assert!(
+                    default.iter().any(|g| g == glob),
+                    "{} glob {glob} missing from default excludes",
+                    spec.name
+                );
+                assert!(
+                    !indexing_tests.iter().any(|g| g == glob),
+                    "{} glob {glob} must be dropped when index_tests = true",
+                    spec.name
+                );
+            }
+        }
+        // And at least one language actually declares globs — the field is live.
+        assert!(
+            crate::chunk::LANGUAGES
+                .iter()
+                .any(|s| !s.test_file_globs.is_empty()),
+            "registry should carry per-language test globs"
+        );
     }
 
     #[test]

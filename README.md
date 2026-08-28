@@ -96,7 +96,11 @@ The `Embedder` trait in `src/embed.rs` is the seam for adding in-process embeddi
 Copy `omniscient.example.toml` to `omniscient.toml` in your repo root and edit:
 
 ```toml
-languages = ["rust", "python", "typescript"]
+# Language whitelist. Empty (the default) indexes every language: tree-sitter
+# chunking for rust/python/javascript/typescript/tsx, line windows for the rest.
+# Entries match a language name ("tsx"), a family ("typescript" also admits
+# .tsx), or a raw extension ("rs").
+languages = []
 strip_comments = true
 
 # Test/fixture files (tests/, benches/, **/*.test.*, **/*.spec.*, **/*_test.*,
