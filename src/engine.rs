@@ -739,7 +739,7 @@ fn chunks_for_embedding(
     Ok((chunks, largest))
 }
 
-/// One entry per structural definition, carrying its signature line only.
+/// One entry per structural definition, carrying its signature only.
 ///
 /// Deliberately NOT split for embedding: showing whole definitions is the
 /// outline's contract, and splitting here is what once produced entries whose
@@ -751,12 +751,7 @@ fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>) -> Vec<ContextE
             // Chunks open with their doc/attribute prelude; the outline's job
             // is the signature, which `def_line` names.
             let signature_offset = c.def_line.saturating_sub(c.start_line);
-            let code = c
-                .text
-                .lines()
-                .nth(signature_offset)
-                .unwrap_or("")
-                .to_string();
+            let code = signature_lines(c.text.lines().skip(signature_offset));
             ContextEntry {
                 path: path.to_string(),
                 start_line: c.start_line,
@@ -769,6 +764,28 @@ fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>) -> Vec<ContextE
             }
         })
         .collect()
+}
+
+/// A signature through its balanced parentheses: lines are taken while the
+/// running `(`-depth stays positive, so a wrapped parameter list is shown
+/// whole (`fn f(` alone tells the reader nothing) while a one-line signature
+/// or a bare `impl Engine {` stays one line. Capped as a backstop against
+/// pathological input — an outline entry is a summary, not a body.
+fn signature_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    const MAX_SIGNATURE_LINES: usize = 12;
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for (i, line) in lines.take(MAX_SIGNATURE_LINES).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        depth = (depth + line.matches('(').count()).saturating_sub(line.matches(')').count());
+        if depth == 0 {
+            break;
+        }
+    }
+    out
 }
 
 /// Split each structural chunk against `budget` on its own, tagging every piece
@@ -1946,6 +1963,33 @@ mod tests {
         assert!(
             !outline.iter().any(|e| e.code.trim() == "let x = 1;"),
             "no entry may be a body fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn outline_keeps_a_multi_line_signature_whole() {
+        // A signature that wraps across lines must be shown through its
+        // closing paren — `fn chunks_for_embedding(` with a dangling open
+        // paren tells the reader nothing about parameters or return type.
+        let repo = tempdir().unwrap();
+        let src = "pub async fn embed_with_retry(\n\
+                   \x20   embedder: &dyn Embedder,\n\
+                   \x20   item: WorkItem,\n\
+                   ) -> Result<Vec<StoredChunk>> {\n\
+                   \x20   todo!()\n\
+                   }\n";
+        fs::write(repo.path().join("m.rs"), src).unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+
+        let outline = engine.read_file("m.rs", None).await.unwrap();
+        assert_eq!(outline.len(), 1);
+        assert_eq!(
+            outline[0].code,
+            "pub async fn embed_with_retry(\n\
+             \x20   embedder: &dyn Embedder,\n\
+             \x20   item: WorkItem,\n\
+             ) -> Result<Vec<StoredChunk>> {",
+            "the whole signature through the balanced paren and body brace"
         );
     }
 
