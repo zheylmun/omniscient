@@ -417,6 +417,69 @@ impl Index {
         });
         Ok(hits)
     }
+
+    /// Every stored chunk of one file, vectors included, in `chunk_index`
+    /// order. This is what lets a focus read of an unchanged file rank
+    /// against the vectors it already paid to compute, embedding only the
+    /// query. Empty when the file is not indexed.
+    pub async fn chunks_for_file(&self, path: &str) -> Result<Vec<StoredChunk>> {
+        use lancedb::query::{ExecutableQuery, QueryBase};
+        // LanceDB filters are SQL-ish: escape single quotes by doubling.
+        let filter = format!("path = '{}'", path.replace('\'', "''"));
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?;
+
+        let mut chunks = Vec::new();
+        for b in &batches {
+            let paths = str_col(b, "path")?;
+            let langs = str_col(b, "language")?;
+            let texts = str_col(b, "text")?;
+            let hashes = str_col(b, "file_hash")?;
+            let syms = str_col(b, "symbol")?;
+            let starts = u32_col(b, "start_line")?;
+            let ends = u32_col(b, "end_line")?;
+            let idxs = u32_col(b, "chunk_index")?;
+            let vectors = b
+                .column_by_name("vector")
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or_else(|| Error::Index("vector column missing".into()))?;
+            for i in 0..b.num_rows() {
+                let vector = vectors
+                    .value(i)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| Error::Index("vector rows must be Float32".into()))?
+                    .values()
+                    .to_vec();
+                let symbol = if syms.is_null(i) {
+                    None
+                } else {
+                    Some(syms.value(i).to_string())
+                };
+                chunks.push(StoredChunk {
+                    path: paths.value(i).to_string(),
+                    start_line: starts.value(i) as usize,
+                    end_line: ends.value(i) as usize,
+                    chunk_index: idxs.value(i) as usize,
+                    language: langs.value(i).to_string(),
+                    symbol,
+                    text: texts.value(i).to_string(),
+                    file_hash: hashes.value(i).to_string(),
+                    vector,
+                });
+            }
+        }
+        chunks.sort_by_key(|c| c.chunk_index);
+        Ok(chunks)
+    }
 }
 
 fn str_col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
