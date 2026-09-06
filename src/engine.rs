@@ -22,6 +22,12 @@ const MAX_WINDOW_LINES: usize = 80;
 /// numbers are self-inconsistent. Shared by the indexing and focus-read paths.
 const MAX_OVERFLOW_ROUNDS: usize = 8;
 
+/// How many times `k` the ANN query fetches. Exclusion filtering and per-file
+/// merging shrink the hit list after the fetch, so fetching exactly `k` makes
+/// the effective breadth unpredictable; the relevance ratio and token budget
+/// are what actually bound the result, with `k` capping returned entries.
+const OVERFETCH_FACTOR: usize = 3;
+
 /// Stand-in "path" recorded when a reconcile aborted as a whole rather than
 /// failing on individual files, so `diagnostics` can render the reason with the
 /// same `path: error` shape it uses for per-file failures.
@@ -573,24 +579,74 @@ impl Engine {
         // here bounds only the interactive query so a hung endpoint can't block the tool.
         self.ensure_fresh().await?;
         let k = k.unwrap_or(self.config.search.max_results).max(1);
+        // Over-fetch: exclusion filtering and per-file merging both happen
+        // AFTER the ANN query, so fetching exactly k lets one file with many
+        // similar chunks fill every slot and collapse into a single entry,
+        // starving other relevant files. `k` is the advertised ceiling on
+        // returned ENTRIES; the relevance ratio and token budget do the real
+        // trimming.
+        let fetch = k.saturating_mul(OVERFETCH_FACTOR);
         let hits = tokio::time::timeout(self.query_timeout(), async {
             let qv = self.embed_one(query).await?;
-            self.index.search(&qv, k).await
+            let hits = self.index.search(&qv, fetch).await?;
+            // Enforce the exclude policy at read time too: even if the index
+            // hasn't reconciled away an excluded file yet (lag window), never
+            // surface it. Applied before symbol fusion so a lexical match
+            // cannot resurrect an excluded path either.
+            let mut hits: Vec<_> = hits
+                .into_iter()
+                .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
+                .collect();
+            self.fuse_symbol_matches(query, &qv, &mut hits).await?;
+            Ok::<_, Error>(hits)
         })
         .await
         .map_err(|_| self.query_timeout_err())??;
-        // Enforce the exclude policy at read time too: even if the index hasn't reconciled
-        // away an excluded file yet (lag window), never surface it.
-        let hits: Vec<_> = hits
-            .into_iter()
-            .filter(|h| !is_excluded(&self.matcher, &h.chunk.path))
-            .collect();
-        Ok(distill_context(
+        let mut entries = distill_context(
             hits,
             self.config.strip_banner_comments,
             self.config.search.token_budget,
             self.config.search.relevance_ratio,
-        ))
+        );
+        entries.truncate(k);
+        Ok(entries)
+    }
+
+    /// The lexical half of search: a chunk whose symbol matches an
+    /// identifier-like token of the query is promoted to rank alongside the
+    /// top vector hit. Dense retrieval's known weak spot is exactly the query
+    /// that names a symbol — the embedding can rank prose above the
+    /// definition and the relevance floor then drops it entirely. Promotion,
+    /// not just inclusion: an exact name match IS what the caller asked for.
+    async fn fuse_symbol_matches(
+        &self,
+        query: &str,
+        qv: &[f32],
+        hits: &mut Vec<crate::index::Hit>,
+    ) -> Result<()> {
+        let top = hits.first().map_or(0.0, |h| h.score);
+        for token in symbol_tokens(query) {
+            for chunk in self.index.chunks_for_symbol_token(&token).await? {
+                if is_excluded(&self.matcher, &chunk.path) {
+                    continue;
+                }
+                // Rank with the top hit, never below the honest similarity.
+                let score = dot(qv, &chunk.vector).max(top);
+                if let Some(h) = hits.iter_mut().find(|h| {
+                    h.chunk.path == chunk.path && h.chunk.chunk_index == chunk.chunk_index
+                }) {
+                    h.boosted = true;
+                    h.score = h.score.max(score);
+                } else {
+                    hits.push(crate::index::Hit {
+                        score,
+                        boosted: true,
+                        chunk,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn read_file(&self, path: &str, focus: Option<&str>) -> Result<Vec<ContextEntry>> {
@@ -904,6 +960,29 @@ fn split_focus_pieces(
 /// Concurrency policy: an explicit config value wins, then what the server
 /// reports, then serial. The derived value is capped because `total_slots` on a
 /// large server can far exceed what saturating it usefully requires.
+/// Identifier-like tokens of a query, for symbol matching: split on anything
+/// outside `[A-Za-z0-9_:.]`, trim stray leading/trailing separators, keep
+/// tokens of 3+ chars that start with a letter or underscore. Case-sensitive —
+/// a user naming a symbol types its real name. Capped to bound the number of
+/// index lookups a long query can trigger.
+fn symbol_tokens(query: &str) -> Vec<String> {
+    const MAX_TOKENS: usize = 8;
+    let mut out: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.'))) {
+        let t = raw.trim_matches(|c| matches!(c, ':' | '.'));
+        if t.len() >= 3
+            && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !out.iter().any(|o| o == t)
+        {
+            out.push(t.to_string());
+            if out.len() == MAX_TOKENS {
+                break;
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn resolve_concurrency(configured: Option<usize>, reported: Option<usize>) -> usize {
     const MAX_DERIVED: usize = 8;
     configured
@@ -2078,6 +2157,169 @@ mod tests {
             .map(|i| format!("pub fn f{i}() -> u32 {{\n    {i}\n}}\n"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Embedder with hand-picked vectors: the first marker contained in the
+    /// text wins; anything else (the query) gets `default`. All unit-norm, so
+    /// cosine similarities in tests are exact dot products by construction.
+    struct ScriptedEmbedder {
+        rules: Vec<(&'static str, Vec<f32>)>,
+        default: Vec<f32>,
+        dim: usize,
+    }
+    impl ScriptedEmbedder {
+        fn new(dim: usize, rules: Vec<(&'static str, Vec<f32>)>, default: Vec<f32>) -> Self {
+            Self {
+                rules,
+                default,
+                dim,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Embedder for ScriptedEmbedder {
+        fn id(&self) -> &'static str {
+            "scripted-v1"
+        }
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = self
+                        .rules
+                        .iter()
+                        .find(|(marker, _)| t.contains(marker))
+                        .map_or_else(|| self.default.clone(), |(_, v)| v.clone());
+                    crate::embed::l2_normalize(&mut v);
+                    v
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn one_dominant_file_does_not_starve_other_relevant_files() {
+        // `k` was the raw ANN fetch limit, applied BEFORE per-file merging: a
+        // file with many similar chunks could fill all k slots and collapse
+        // into one entry, starving every other relevant file out of the
+        // results. The index must be over-fetched so k caps returned ENTRIES.
+        let repo = tempdir().unwrap();
+        // 12 contiguous one-line fns: 12 chunks, all merging into one entry.
+        let alpha = (0..12)
+            .map(|i| format!("fn alpha{i}() {{}}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        fs::write(repo.path().join("a.rs"), alpha).unwrap();
+        fs::write(repo.path().join("b.rs"), "fn beta() {}\n").unwrap();
+
+        let embedder = Arc::new(ScriptedEmbedder::new(
+            4,
+            vec![
+                ("alpha", vec![1.0, 0.0, 0.0, 0.0]),
+                ("beta", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+            vec![0.9, 0.8, 0.0, 0.0], // query: alpha 0.747, beta 0.664 — both above the 0.75 ratio floor
+        ));
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.max_results = 10; // fewer than a.rs's 12 chunks
+        let engine = Engine::new_with_embedder(cfg, embedder).await.unwrap();
+
+        let entries = engine
+            .search("find the relevant thing", None)
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().any(|e| e.path == "b.rs"),
+            "b.rs scores within the relevance floor and must not be starved \
+             by a.rs filling the fetch window; got {:?}",
+            entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        assert!(entries.len() <= 10, "k stays a ceiling on returned entries");
+    }
+
+    #[tokio::test]
+    async fn a_symbol_named_in_the_query_is_never_floored_out() {
+        // Dense retrieval's known weak spot: an exact identifier the user
+        // typed can rank below semantically-similar prose and fall under the
+        // relevance floor. A chunk whose symbol matches an identifier-like
+        // query token must surface, promoted alongside the top hit.
+        let repo = tempdir().unwrap();
+        let alpha = (0..4)
+            .map(|i| format!("fn alpha{i}() {{}}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        fs::write(repo.path().join("a.rs"), alpha).unwrap();
+        fs::write(repo.path().join("b.rs"), "fn quux_worker() { beta() }\n").unwrap();
+
+        let embedder = Arc::new(ScriptedEmbedder::new(
+            4,
+            vec![
+                ("alpha", vec![1.0, 0.0, 0.0, 0.0]),
+                ("beta", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+            // Query is orthogonal to b.rs's vector: semantically invisible.
+            vec![1.0, 0.0, 0.0, 0.0],
+        ));
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, embedder).await.unwrap();
+
+        let entries = engine
+            .search("where does quux_worker fit into the flow", None)
+            .await
+            .unwrap();
+        let hit = entries
+            .iter()
+            .find(|e| e.path == "b.rs")
+            .unwrap_or_else(|| {
+                panic!(
+                    "quux_worker was named in the query and must not be floored out; got {:?}",
+                    entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            hit.why_matched.contains("symbol"),
+            "the promotion must say why: {}",
+            hit.why_matched
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_token_matches_a_qualified_symbol_suffix() {
+        // Members carry qualified symbols (Engine::search); the user types the
+        // bare name. The last segment must match.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join("a.rs"),
+            "impl Widget {\n    fn quux_worker(&self) { beta() }\n}\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("noise.rs"), "fn alpha() {}\n").unwrap();
+
+        let embedder = Arc::new(ScriptedEmbedder::new(
+            4,
+            vec![
+                ("alpha", vec![1.0, 0.0, 0.0, 0.0]),
+                ("beta", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+            vec![1.0, 0.0, 0.0, 0.0],
+        ));
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let engine = Engine::new_with_embedder(cfg, embedder).await.unwrap();
+
+        let entries = engine.search("explain quux_worker", None).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.symbol.as_deref() == Some("Widget::quux_worker")),
+            "bare token must match the qualified member; got {:?}",
+            entries
+                .iter()
+                .map(|e| (&e.path, &e.symbol))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

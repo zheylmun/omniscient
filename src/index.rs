@@ -32,6 +32,9 @@ pub struct StoredChunk {
 pub struct Hit {
     pub chunk: StoredChunk,
     pub score: f32,
+    /// True when this hit was promoted by a symbol match on the query text
+    /// (not just vector similarity); distill surfaces it in `why_matched`.
+    pub boosted: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -395,6 +398,7 @@ impl Index {
                     Some(syms.value(i).to_string())
                 };
                 hits.push(Hit {
+                    boosted: false,
                     score: 1.0 - dist.value(i),
                     chunk: StoredChunk {
                         path: paths.value(i).to_string(),
@@ -418,14 +422,40 @@ impl Index {
         Ok(hits)
     }
 
+    /// Stored chunks whose symbol is `token` or ends in `::token` / `.token`
+    /// — the lexical side of search: an identifier the user typed matches by
+    /// NAME, however its vector scores. Vectors included so the caller can
+    /// still compute an honest similarity. The SQL LIKE is a pre-filter (its
+    /// `_` wildcard can over-match); the exact suffix check happens in Rust.
+    pub async fn chunks_for_symbol_token(&self, token: &str) -> Result<Vec<StoredChunk>> {
+        let esc = token.replace('\'', "''");
+        let filter = format!("symbol = '{esc}' OR symbol LIKE '%::{esc}' OR symbol LIKE '%.{esc}'");
+        let mut chunks = self.chunks_matching(&filter).await?;
+        chunks.retain(|c| {
+            c.symbol.as_deref().is_some_and(|s| {
+                s == token
+                    || s.strip_suffix(token)
+                        .is_some_and(|head| head.ends_with("::") || head.ends_with('.'))
+            })
+        });
+        Ok(chunks)
+    }
+
     /// Every stored chunk of one file, vectors included, in `chunk_index`
     /// order. This is what lets a focus read of an unchanged file rank
     /// against the vectors it already paid to compute, embedding only the
     /// query. Empty when the file is not indexed.
     pub async fn chunks_for_file(&self, path: &str) -> Result<Vec<StoredChunk>> {
-        use lancedb::query::{ExecutableQuery, QueryBase};
         // LanceDB filters are SQL-ish: escape single quotes by doubling.
         let filter = format!("path = '{}'", path.replace('\'', "''"));
+        let mut chunks = self.chunks_matching(&filter).await?;
+        chunks.sort_by_key(|c| c.chunk_index);
+        Ok(chunks)
+    }
+
+    /// All chunks matching a `LanceDB` `only_if` filter, vectors included.
+    async fn chunks_matching(&self, filter: &str) -> Result<Vec<StoredChunk>> {
+        use lancedb::query::{ExecutableQuery, QueryBase};
         let batches: Vec<RecordBatch> = self
             .table
             .query()
@@ -477,7 +507,6 @@ impl Index {
                 });
             }
         }
-        chunks.sort_by_key(|c| c.chunk_index);
         Ok(chunks)
     }
 }
