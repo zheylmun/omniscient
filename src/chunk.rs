@@ -15,14 +15,18 @@ use std::path::Path;
 /// and sub-line pieces are now identified by `chunk_index`.
 /// 6: language registry — tsx admitted by the typescript family, symbols for
 /// Rust `impl` blocks and JS/TS `const` declarations.
-pub const CHUNKER_VERSION: u32 = 6;
+/// 7: coverage — declarative items (Rust const/static/type/macro/union, TS type
+/// aliases and enums) are chunked; containers (impl/class) recurse into
+/// per-member chunks under a header-only parent; doc comments and attributes
+/// are part of their item's chunk; uncovered top-level spans are gap-filled.
+pub const CHUNKER_VERSION: u32 = 7;
 
 /// blake3 of [`LANGUAGES`]' observable surface, recorded so the
 /// `registry_changes_require_a_chunker_version_bump` test can force a
 /// [`CHUNKER_VERSION`] bump whenever the registry changes. Update both together;
 /// the failing test prints the new value.
 pub const REGISTRY_FINGERPRINT: &str =
-    "792b064d61e3a392c29d13f207f25df7dac98167678204d3ce4a35fb1836e57a";
+    "f6996a18e25dbca94692d1b3f6eaa33ed24c7aab9404c0bc3ac5490147b34a2d";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -85,6 +89,11 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "enum_item",
             "trait_item",
             "impl_item",
+            "const_item",
+            "static_item",
+            "type_item",
+            "macro_definition",
+            "union_item",
         ],
         symbol_for: Some(rust_extra_symbol),
         is_test_item: Some(rust_is_test_item),
@@ -127,6 +136,8 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
         ],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
@@ -143,6 +154,8 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
         ],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
@@ -1028,6 +1041,40 @@ async fn async_test() {}
         let chunks = chunk_file(Path::new("cfg.ts"), src, 80).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].symbol.as_deref(), Some("parseConfig"));
+    }
+
+    #[test]
+    fn rust_declarative_items_are_chunked_with_symbols() {
+        // Constants, statics, type aliases, macros, and unions are where a
+        // crate's load-bearing declarative knowledge lives (this crate's own
+        // `LANGUAGES` registry, `CHUNKER_VERSION`, `DEFAULT_EXCLUDES`). They
+        // must be retrievable, each under its own name.
+        let src = "pub const MAX: u32 = 8;\n\
+                   pub static REGISTRY: &[u32] = &[1, 2];\n\
+                   pub type Alias = Vec<u32>;\n\
+                   macro_rules! my_macro { () => {}; }\n\
+                   pub union U { a: u32, b: f32 }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(
+            symbols,
+            vec!["MAX", "REGISTRY", "Alias", "my_macro", "U"],
+            "each declarative item is one chunk under its own symbol"
+        );
+        assert!(
+            chunks.iter().any(|c| c.text.contains("REGISTRY: &[u32]")),
+            "the item's full text is the chunk body"
+        );
+    }
+
+    #[test]
+    fn typescript_type_aliases_and_enums_are_chunked() {
+        // `export type` and `enum` previously produced NO chunks at all —
+        // recursion found `interface_declaration` but neither of these kinds.
+        let src = "export type Foo = { a: number };\nenum E { A, B }\n";
+        let chunks = chunk_source(Some("typescript"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Foo", "E"]);
     }
 
     #[test]
