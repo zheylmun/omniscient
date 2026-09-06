@@ -26,13 +26,17 @@ pub const CHUNKER_VERSION: u32 = 7;
 /// [`CHUNKER_VERSION`] bump whenever the registry changes. Update both together;
 /// the failing test prints the new value.
 pub const REGISTRY_FINGERPRINT: &str =
-    "317c53a02de89414b03d8189d21bfbb82b65d1510ca65aa61d30f3231044ae9d";
+    "23153f726f638d922abcff0eadbebd888665a971106c8eb358b62574971607a0";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub text: String,
     pub start_line: usize, // 1-based inclusive
     pub end_line: usize,   // 1-based inclusive
+    /// The definition's own first line (1-based): equal to `start_line` unless
+    /// the chunk opens with a doc/attribute prelude. The outline renders this
+    /// line, not the prelude.
+    pub def_line: usize,
     pub language: String,
     pub symbol: Option<String>,
 }
@@ -67,6 +71,11 @@ pub struct LanguageSpec {
     /// Separator between a container's symbol and a member's ("::" for Rust,
     /// "." elsewhere), producing member symbols like `Engine::search`.
     pub member_separator: &'static str,
+    /// Node kinds that, as contiguous preceding siblings of a definition, are
+    /// part of its chunk: doc comments, attributes, decorators. The "why"
+    /// prose is the highest-signal text for a semantic match — dropping it is
+    /// what once left 56% of this repo's doc-comment lines unindexed.
+    pub prelude_kinds: &'static [&'static str],
     /// Language-specific symbol extraction for def nodes whose name is not in a
     /// `name` field (Rust `impl` blocks, JS/TS `const x = …` declarators).
     /// `None` from the hook (or no hook) falls back to the generic `name` field.
@@ -104,6 +113,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         ],
         container_kinds: &["impl_item"],
         member_separator: "::",
+        prelude_kinds: &["line_comment", "block_comment", "attribute_item"],
         symbol_for: Some(rust_extra_symbol),
         is_test_item: Some(rust_is_test_item),
         test_file_globs: &["**/benches/**"],
@@ -116,6 +126,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         def_kinds: &["function_definition"],
         container_kinds: &["class_definition"],
         member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: None,
         is_test_item: None,
         test_file_globs: &["**/test_*.py", "**/conftest.py"],
@@ -133,6 +144,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         ],
         container_kinds: &["class_declaration"],
         member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -152,6 +164,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         ],
         container_kinds: &["class_declaration", "abstract_class_declaration"],
         member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -171,6 +184,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         ],
         container_kinds: &["class_declaration", "abstract_class_declaration"],
         member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -281,6 +295,7 @@ fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Ch
             text: lines[start..end].join("\n"),
             start_line: start + 1,
             end_line: end,
+            def_line: start + 1,
             language: language.to_string(),
             symbol: None,
         });
@@ -299,6 +314,8 @@ fn piece(parent: &Chunk, text: String, start_line: usize, end_line: usize) -> Ch
         text,
         start_line,
         end_line: end_line.max(start_line),
+        // A piece is body text; its own first line is the honest def line.
+        def_line: start_line,
         language: parent.language.clone(),
         symbol: parent.symbol.clone(),
     }
@@ -429,12 +446,14 @@ fn emit_def(
     chunks: &mut Vec<Chunk>,
     parent_symbol: Option<&str>,
 ) {
-    let text = child.utf8_text(bytes).unwrap_or("").to_string();
     let symbol = qualified_symbol(child, spec, bytes, parent_symbol);
+    let prelude_start = prelude_start(child, spec);
+    let text = text_from(bytes, prelude_start.byte, child.end_byte());
     chunks.push(Chunk {
         text,
-        start_line: child.start_position().row + 1,
+        start_line: prelude_start.row + 1,
         end_line: child.end_position().row + 1,
+        def_line: child.start_position().row + 1,
         language: spec.name.to_string(),
         symbol,
     });
@@ -465,21 +484,56 @@ fn emit_container(
     if bytes.get(end) == Some(&b'{') {
         end += 1;
     }
-    let text = std::str::from_utf8(&bytes[child.start_byte()..end])
-        .unwrap_or("")
-        .trim_end()
-        .to_string();
-    let start_line = child.start_position().row + 1;
+    let prelude_start = prelude_start(child, spec);
+    let text = text_from(bytes, prelude_start.byte, end);
+    let start_line = prelude_start.row + 1;
     let end_line = start_line + text.lines().count().saturating_sub(1);
     chunks.push(Chunk {
         text,
         start_line,
         end_line,
+        def_line: child.start_position().row + 1,
         language: spec.name.to_string(),
         symbol: symbol.clone(),
     });
 
     walk_children(body, spec, bytes, chunks, symbol.as_deref());
+}
+
+/// Where a chunk's text begins once its doc/attribute prelude is included.
+struct PreludeStart {
+    byte: usize,
+    row: usize,
+}
+
+/// Walk backward over contiguous preceding siblings whose kind is in the
+/// language's `prelude_kinds` (doc comments, attributes, decorators). A row
+/// gap breaks the run: a comment separated by a blank line is free-standing,
+/// not this item's documentation.
+fn prelude_start(node: tree_sitter::Node, spec: &LanguageSpec) -> PreludeStart {
+    let mut start = PreludeStart {
+        byte: node.start_byte(),
+        row: node.start_position().row,
+    };
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        if !spec.prelude_kinds.contains(&sib.kind()) || sib.end_position().row + 1 < start.row {
+            break;
+        }
+        start = PreludeStart {
+            byte: sib.start_byte(),
+            row: sib.start_position().row,
+        };
+        prev = sib.prev_sibling();
+    }
+    start
+}
+
+fn text_from(bytes: &[u8], start: usize, end: usize) -> String {
+    std::str::from_utf8(&bytes[start..end])
+        .unwrap_or("")
+        .trim_end()
+        .to_string()
 }
 
 /// A node's own symbol (language hook, then the generic `name` field),
@@ -631,6 +685,7 @@ mod tests {
             text: text.to_string(),
             start_line: 10,
             end_line: 10 + text.lines().count().saturating_sub(1),
+            def_line: 10,
             language: "rust".into(),
             symbol: Some("big_fn".into()),
         }
@@ -1223,6 +1278,101 @@ async fn async_test() {}
     }
 
     #[test]
+    fn doc_comments_and_attributes_belong_to_their_items_chunk() {
+        // The `///` explaining WHY is the highest-signal text for a semantic
+        // match — measured on this repo, 56% of doc-comment lines were in no
+        // chunk at all. Contiguous preceding doc comments and attributes are
+        // part of the item's chunk; `def_line` still names the signature line
+        // so the outline can skip past the prelude.
+        let src = "/// Why this matters.\n\
+                   #[derive(Debug)]\n\
+                   pub struct S {\n\
+                       x: u32,\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let c = &chunks[0];
+        assert!(
+            c.text
+                .starts_with("/// Why this matters.\n#[derive(Debug)]\npub struct S {"),
+            "prelude must open the chunk, got:\n{}",
+            c.text
+        );
+        assert_eq!((c.start_line, c.end_line), (1, 5));
+        assert_eq!(c.def_line, 3, "the signature line, past the prelude");
+        assert_eq!(c.symbol.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn blank_line_detaches_a_free_standing_comment() {
+        // A comment block separated from the item by a blank line is not that
+        // item's documentation and must not be pulled into its chunk.
+        let src = "// A file-level remark.\n\
+                   \n\
+                   pub fn f() {}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.starts_with("pub fn f"),
+            "detached comment must stay out, got:\n{}",
+            chunks[0].text
+        );
+        assert_eq!(chunks[0].start_line, 3);
+    }
+
+    #[test]
+    fn container_headers_carry_their_docs_too() {
+        let src = "/// The central type.\n\
+                   impl Engine {\n\
+                       fn go(&self) {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let header = &chunks[0];
+        assert_eq!(header.symbol.as_deref(), Some("Engine"));
+        assert_eq!(
+            header.text, "/// The central type.\nimpl Engine {",
+            "header chunk = docs + signature"
+        );
+        assert_eq!(
+            (header.start_line, header.end_line, header.def_line),
+            (1, 2, 2)
+        );
+    }
+
+    #[test]
+    fn python_decorators_belong_to_their_defs_chunk() {
+        // Decorators are children of `decorated_definition`, which the walk
+        // recurses through — inside it they are preceding siblings of the def,
+        // so prelude extension captures them like Rust attributes.
+        let src = "@retry(3)\ndef fetch(url):\n    return url\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.starts_with("@retry(3)\ndef fetch"),
+            "decorator must open the chunk, got:\n{}",
+            chunks[0].text
+        );
+        assert_eq!(chunks[0].symbol.as_deref(), Some("fetch"));
+    }
+
+    #[test]
+    fn doc_comments_on_cfg_test_items_stay_out_with_them() {
+        // Prelude capture must not resurrect test-gated code: the whole item,
+        // docs included, is skipped.
+        let src = "/// Docs on a test helper.\n\
+                   #[cfg(test)]\n\
+                   fn helper() {}\n\
+                   pub fn real() {}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["real"]);
+        assert!(
+            chunks.iter().all(|c| !c.text.contains("test helper")),
+            "a skipped item's docs must not attach to anything else"
+        );
+    }
+
+    #[test]
     fn registry_changes_require_a_chunker_version_bump() {
         // The registry's observable surface changes what chunks are produced,
         // so editing it without bumping CHUNKER_VERSION would leave stale
@@ -1234,13 +1384,14 @@ async fn async_test() {}
             use std::fmt::Write;
             write!(
                 surface,
-                "{}|{}|{:?}|{:?}|cont:{:?}|sep:{}|sym:{}|test:{}|globs:{:?};",
+                "{}|{}|{:?}|{:?}|cont:{:?}|sep:{}|pre:{:?}|sym:{}|test:{}|globs:{:?};",
                 s.name,
                 s.family,
                 s.extensions,
                 s.def_kinds,
                 s.container_kinds,
                 s.member_separator,
+                s.prelude_kinds,
                 s.symbol_for.is_some(),
                 s.is_test_item.is_some(),
                 s.test_file_globs,
