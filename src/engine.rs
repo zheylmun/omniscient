@@ -599,7 +599,7 @@ impl Engine {
         let chunks = chunk_file(Path::new(path), &source, MAX_WINDOW_LINES)?;
         match focus {
             None => Ok(outline_entries(path, chunks)),
-            Some(f) => self.focus_entries(path, f, chunks).await,
+            Some(f) => self.focus_entries(path, f, &source, chunks).await,
         }
     }
 
@@ -608,10 +608,19 @@ impl Engine {
         &self,
         path: &str,
         f: &str,
+        source: &str,
         chunks: Vec<crate::chunk::Chunk>,
     ) -> Result<Vec<ContextEntry>> {
         if chunks.is_empty() {
             return Ok(vec![]);
+        }
+        // The index already holds a vector for every chunk of an indexed,
+        // unchanged file — reuse them and embed only the query. Anything
+        // less than a full hash match (not indexed, uncommitted edits, a
+        // store hiccup) falls through to ranking the live content below,
+        // because read_file's contract is current disk content.
+        if let Some(entries) = self.focus_from_index(path, f, source).await? {
+            return Ok(entries);
         }
         // Ranking means embedding, so the same per-input budget that binds
         // the indexing path binds here: an unsplit chunk from a minified or
@@ -640,17 +649,7 @@ impl Engine {
             // category error that `tighten`'s monotonicity makes permanent,
             // and re-splitting the file's chunks could never make the query
             // itself fit anyway.
-            let fv = self.embed_one(f).await.map_err(|e| match e {
-                Error::EmbedContextExceeded {
-                    n_prompt_tokens,
-                    n_ctx,
-                } => Error::Embed(format!(
-                    "{path}: the focus query is too large to embed \
-                             ({n_prompt_tokens} tokens against the endpoint's \
-                             {n_ctx}-token window) — use a shorter focus"
-                )),
-                other => other,
-            })?;
+            let fv = self.embed_focus_query(path, f).await?;
             let mut attempted = self.budget.bytes();
             for _ in 0..MAX_OVERFLOW_ROUNDS {
                 let pieces = split_focus_pieces(&chunks, attempted);
@@ -724,6 +723,96 @@ impl Engine {
             self.config.search.token_budget,
             self.config.search.relevance_ratio,
         ))
+    }
+
+    /// Embed the focus query, translating an overflow into caller advice. The
+    /// query is caller-supplied and never split, so its overflow is a property
+    /// of the argument, not a measurement of chunk size — it must NOT feed the
+    /// shared budget (`tighten`'s monotonicity would make one oversized focus
+    /// argument ratchet the budget to its floor permanently).
+    async fn embed_focus_query(&self, path: &str, f: &str) -> Result<Vec<f32>> {
+        self.embed_one(f).await.map_err(|e| match e {
+            Error::EmbedContextExceeded {
+                n_prompt_tokens,
+                n_ctx,
+            } => Error::Embed(format!(
+                "{path}: the focus query is too large to embed \
+                 ({n_prompt_tokens} tokens against the endpoint's \
+                 {n_ctx}-token window) — use a shorter focus"
+            )),
+            other => other,
+        })
+    }
+
+    /// Focus ranking against the vectors the index already paid to compute.
+    /// `Some` only when every stored chunk of `path` carries the live file's
+    /// hash — then one embed (the query) replaces re-embedding the whole
+    /// file. `None` falls back to the live path; a store error does too
+    /// (logged), since a focus read must not fail over an optimization.
+    async fn focus_from_index(
+        &self,
+        path: &str,
+        f: &str,
+        source: &str,
+    ) -> Result<Option<Vec<ContextEntry>>> {
+        let stored = match self.index.chunks_for_file(path).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::debug!("focus: stored-vector reuse unavailable for {path}: {e}");
+                return Ok(None);
+            }
+        };
+        let live_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        if stored.is_empty() || stored.iter().any(|c| c.file_hash != live_hash) {
+            return Ok(None);
+        }
+
+        let fv = tokio::time::timeout(self.query_timeout(), self.embed_focus_query(path, f))
+            .await
+            .map_err(|_| self.query_timeout_err())??;
+
+        // Pieces of one split chunk share a physical line span (a minified
+        // file is one line); seeing a span twice is what marks an entry as
+        // partial, the same signal the live path derives from the splitter.
+        let mut span_seen: std::collections::HashMap<(usize, usize), usize> =
+            std::collections::HashMap::new();
+        for c in &stored {
+            *span_seen.entry((c.start_line, c.end_line)).or_default() += 1;
+        }
+
+        let mut entries: Vec<ContextEntry> = stored
+            .into_iter()
+            .map(|c| {
+                let score = dot(&fv, &c.vector);
+                let partial = span_seen[&(c.start_line, c.end_line)] > 1;
+                ContextEntry {
+                    path: path.to_string(),
+                    start_line: c.start_line,
+                    end_line: c.end_line,
+                    language: c.language,
+                    symbol: c.symbol,
+                    code: c.text,
+                    score,
+                    why_matched: if partial {
+                        format!(
+                            "focus similarity {score:.3} (partial: split to fit the embedding window)"
+                        )
+                    } else {
+                        format!("focus similarity {score:.3}")
+                    },
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(Some(crate::distill::select_by_shape(
+            entries,
+            self.config.search.token_budget,
+            self.config.search.relevance_ratio,
+        )))
     }
 }
 
@@ -1989,6 +2078,57 @@ mod tests {
             .map(|i| format!("pub fn f{i}() -> u32 {{\n    {i}\n}}\n"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn focus_reuses_stored_vectors_for_an_unchanged_file() {
+        // The index already holds a vector for every chunk of an indexed file.
+        // A focus read of an unchanged file must embed ONLY the query — not
+        // re-embed the whole file, chunk by chunk, on every call.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("m.rs"), many_fns(6)).unwrap();
+        let counting = Arc::new(CountingEmbedder::new(64));
+        let engine = build_test_engine(repo.path(), counting.clone()).await;
+        engine.refresh().await.unwrap();
+        let after_index: usize = counting.calls.lock().unwrap().iter().sum();
+
+        let entries = engine.read_file("m.rs", Some("a function")).await.unwrap();
+        assert!(!entries.is_empty());
+        let focus_cost: usize = counting.calls.lock().unwrap().iter().sum::<usize>() - after_index;
+        assert_eq!(
+            focus_cost, 1,
+            "an unchanged indexed file needs one embed: the focus query"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_on_a_modified_file_ranks_the_live_content() {
+        // Uncommitted edits: the stored vectors are stale, so the live file is
+        // chunked and embedded — read_file's contract is current disk content.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("m.rs"), many_fns(3)).unwrap();
+        let counting = Arc::new(CountingEmbedder::new(64));
+        let engine = build_test_engine(repo.path(), counting.clone()).await;
+        engine.refresh().await.unwrap();
+
+        // Edit the file without reconciling.
+        fs::write(
+            repo.path().join("m.rs"),
+            "pub fn brand_new_name() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+        let after_index: usize = counting.calls.lock().unwrap().iter().sum();
+
+        let entries = engine.read_file("m.rs", Some("a function")).await.unwrap();
+        assert!(
+            entries.iter().any(|e| e.code.contains("brand_new_name")),
+            "focus must rank live content, got {entries:?}"
+        );
+        let focus_cost: usize = counting.calls.lock().unwrap().iter().sum::<usize>() - after_index;
+        assert!(
+            focus_cost > 1,
+            "a modified file must be re-embedded live (query + chunks), got {focus_cost}"
+        );
     }
 
     #[tokio::test]
