@@ -26,7 +26,7 @@ pub const CHUNKER_VERSION: u32 = 7;
 /// [`CHUNKER_VERSION`] bump whenever the registry changes. Update both together;
 /// the failing test prints the new value.
 pub const REGISTRY_FINGERPRINT: &str =
-    "f6996a18e25dbca94692d1b3f6eaa33ed24c7aab9404c0bc3ac5490147b34a2d";
+    "317c53a02de89414b03d8189d21bfbb82b65d1510ca65aa61d30f3231044ae9d";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -59,6 +59,14 @@ pub struct LanguageSpec {
     pub grammar: fn() -> tree_sitter::Language,
     /// Node kinds that are emitted as one chunk per top-level definition.
     pub def_kinds: &'static [&'static str],
+    /// Node kinds recursed into per member (`impl` blocks, classes): the
+    /// container contributes a header chunk spanning ONLY its signature lines,
+    /// and each member inside becomes its own chunk. A whole-span parent would
+    /// contain every member chunk and duplicate their text whenever both hit.
+    pub container_kinds: &'static [&'static str],
+    /// Separator between a container's symbol and a member's ("::" for Rust,
+    /// "." elsewhere), producing member symbols like `Engine::search`.
+    pub member_separator: &'static str,
     /// Language-specific symbol extraction for def nodes whose name is not in a
     /// `name` field (Rust `impl` blocks, JS/TS `const x = …` declarators).
     /// `None` from the hook (or no hook) falls back to the generic `name` field.
@@ -88,13 +96,14 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "struct_item",
             "enum_item",
             "trait_item",
-            "impl_item",
             "const_item",
             "static_item",
             "type_item",
             "macro_definition",
             "union_item",
         ],
+        container_kinds: &["impl_item"],
+        member_separator: "::",
         symbol_for: Some(rust_extra_symbol),
         is_test_item: Some(rust_is_test_item),
         test_file_globs: &["**/benches/**"],
@@ -104,7 +113,9 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         family: "python",
         extensions: &["py"],
         grammar: || tree_sitter_python::LANGUAGE.into(),
-        def_kinds: &["function_definition", "class_definition"],
+        def_kinds: &["function_definition"],
+        container_kinds: &["class_definition"],
+        member_separator: ".",
         symbol_for: None,
         is_test_item: None,
         test_file_globs: &["**/test_*.py", "**/conftest.py"],
@@ -116,11 +127,12 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_javascript::LANGUAGE.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "method_definition",
             "lexical_declaration",
             "variable_declaration",
         ],
+        container_kinds: &["class_declaration"],
+        member_separator: ".",
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -132,13 +144,14 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
             "type_alias_declaration",
             "enum_declaration",
         ],
+        container_kinds: &["class_declaration", "abstract_class_declaration"],
+        member_separator: ".",
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -150,13 +163,14 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_typescript::LANGUAGE_TSX.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
             "type_alias_declaration",
             "enum_declaration",
         ],
+        container_kinds: &["class_declaration", "abstract_class_declaration"],
+        member_separator: ".",
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -370,7 +384,7 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
     let bytes = source.as_bytes();
 
     let mut chunks = Vec::new();
-    walk_children(tree.root_node(), spec, bytes, &mut chunks);
+    walk_children(tree.root_node(), spec, bytes, &mut chunks, None);
     Ok(chunks)
 }
 
@@ -386,37 +400,109 @@ fn walk_children(
     spec: &LanguageSpec,
     bytes: &[u8],
     chunks: &mut Vec<Chunk>,
+    parent_symbol: Option<&str>,
 ) {
-    let kinds = spec.def_kinds;
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
         if spec.is_test_item.is_some_and(|hook| hook(child, bytes)) {
             continue; // test-only code: no chunk, no recursion
         }
 
-        if kinds.contains(&child.kind()) {
-            let text = child.utf8_text(bytes).unwrap_or("").to_string();
-            let symbol = spec
-                .symbol_for
-                .and_then(|hook| hook(child, bytes))
-                .or_else(|| {
-                    child
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(bytes).ok())
-                        .map(std::string::ToString::to_string)
-                });
-            chunks.push(Chunk {
-                text,
-                start_line: child.start_position().row + 1,
-                end_line: child.end_position().row + 1,
-                language: spec.name.to_string(),
-                symbol,
-            });
-            // Do NOT recurse into a matched def — nested definitions (methods inside
-            // impl/class) are part of this chunk and must not be emitted again.
+        if spec.container_kinds.contains(&child.kind()) {
+            emit_container(child, spec, bytes, chunks, parent_symbol);
+        } else if spec.def_kinds.contains(&child.kind()) {
+            emit_def(child, spec, bytes, chunks, parent_symbol);
+            // Do NOT recurse into a matched def — nested definitions (closures,
+            // local types) are part of this chunk and must not be emitted again.
         } else {
-            walk_children(child, spec, bytes, chunks);
+            walk_children(child, spec, bytes, chunks, parent_symbol);
         }
+    }
+}
+
+/// One chunk for a definition node, its symbol qualified by the enclosing
+/// container's (`Engine::search`, `C.m`) when there is one.
+fn emit_def(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    chunks: &mut Vec<Chunk>,
+    parent_symbol: Option<&str>,
+) {
+    let text = child.utf8_text(bytes).unwrap_or("").to_string();
+    let symbol = qualified_symbol(child, spec, bytes, parent_symbol);
+    chunks.push(Chunk {
+        text,
+        start_line: child.start_position().row + 1,
+        end_line: child.end_position().row + 1,
+        language: spec.name.to_string(),
+        symbol,
+    });
+}
+
+/// A container (`impl` block, class): a header chunk spanning ONLY its
+/// signature lines, then one chunk per member inside. The header must not span
+/// the whole container — a whole-span parent contains every member chunk, and
+/// a parent+member co-hit would duplicate the member's text in distill's merge.
+fn emit_container(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    chunks: &mut Vec<Chunk>,
+    parent_symbol: Option<&str>,
+) {
+    let Some(body) = child.child_by_field_name("body") else {
+        // A bodiless container (declaration form) is just a definition.
+        emit_def(child, spec, bytes, chunks, parent_symbol);
+        return;
+    };
+    let symbol = qualified_symbol(child, spec, bytes, parent_symbol);
+
+    // Header text: everything before the body, keeping a brace-opened body's
+    // `{` so the header reads as it does in the source (`impl Engine {`), and
+    // trimming the trailing newline/indent a `:`-opened body (Python) leaves.
+    let mut end = body.start_byte();
+    if bytes.get(end) == Some(&b'{') {
+        end += 1;
+    }
+    let text = std::str::from_utf8(&bytes[child.start_byte()..end])
+        .unwrap_or("")
+        .trim_end()
+        .to_string();
+    let start_line = child.start_position().row + 1;
+    let end_line = start_line + text.lines().count().saturating_sub(1);
+    chunks.push(Chunk {
+        text,
+        start_line,
+        end_line,
+        language: spec.name.to_string(),
+        symbol: symbol.clone(),
+    });
+
+    walk_children(body, spec, bytes, chunks, symbol.as_deref());
+}
+
+/// A node's own symbol (language hook, then the generic `name` field),
+/// prefixed with the enclosing container's symbol when inside one.
+fn qualified_symbol(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    parent_symbol: Option<&str>,
+) -> Option<String> {
+    let own = spec
+        .symbol_for
+        .and_then(|hook| hook(child, bytes))
+        .or_else(|| {
+            child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(std::string::ToString::to_string)
+        });
+    match (parent_symbol, own) {
+        (Some(p), Some(s)) => Some(format!("{p}{sep}{s}", sep = spec.member_separator)),
+        (None, own) => own,
+        (Some(p), None) => Some(p.to_string()),
     }
 }
 
@@ -802,106 +888,80 @@ mod tests {
     fn rust_no_over_chunking() {
         let src = read("tests/fixtures/sample.rs");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.rs"), &src, 100).unwrap();
-        // beta is a method inside `impl Point` — it must NOT appear as a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
-        );
-        // Exactly 3 top-level definitions: alpha (fn), Point (struct), impl Point (symbol=None)
+        // beta appears exactly ONCE, as a member chunk qualified by its impl —
+        // never bare, and never duplicated inside a whole-impl chunk.
+        let betas = chunks.iter().filter(|c| c.text.contains("fn beta")).count();
         assert_eq!(
-            chunks.len(),
-            3,
-            "expected exactly 3 chunks, got {}: {chunks:?}",
-            chunks.len()
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(
+            symbols,
+            vec!["alpha", "Point", "Point", "Point::beta"],
+            "fn, struct, impl header, then the qualified member"
+        );
     }
 
     #[test]
     fn python_no_over_chunking() {
         let src = read("tests/fixtures/sample.py");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.py"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks
+            .iter()
+            .filter(|c| c.text.contains("def beta"))
+            .count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
     fn typescript_no_over_chunking() {
         let src = read("tests/fixtures/sample.ts");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.ts"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks.iter().filter(|c| c.text.contains("beta(")).count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         // alpha is exported (wrapped in export_statement) — must still be captured
-        assert!(
-            symbols.contains(&"alpha"),
-            "alpha (exported fn) missing from {symbols:?}"
-        );
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
     fn tsx_no_over_chunking() {
         let src = read("tests/fixtures/sample.tsx");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.tsx"), &src, 100).unwrap();
-        // render is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("render")),
-            "render should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // render appears exactly ONCE, as a member chunk qualified by its class.
+        let renders = chunks.iter().filter(|c| c.text.contains("render(")).count();
+        assert_eq!(
+            renders, 1,
+            "render must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"Alpha"), "Alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(symbols, vec!["Alpha", "Point", "Point.render"]);
         assert!(chunks.iter().all(|c| c.language == "tsx"));
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (Alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
     }
 
     #[test]
     fn javascript_no_over_chunking() {
         let src = read("tests/fixtures/sample.js");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.js"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks.iter().filter(|c| c.text.contains("beta(")).count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
@@ -1078,6 +1138,91 @@ async fn async_test() {}
     }
 
     #[test]
+    fn rust_impl_blocks_yield_per_method_chunks_under_a_header() {
+        // One chunk per method, so a 600-line impl is not one diluted vector
+        // and one retrieved blob. The parent header chunk spans ONLY its
+        // signature line: a whole-span parent would contain every member
+        // chunk, and a parent+member co-hit would duplicate the member's text
+        // in distill's merge.
+        let src = "pub struct Engine;\n\
+                   impl Engine {\n\
+                       pub fn search(&self) -> u32 {\n\
+                           1\n\
+                       }\n\
+                       fn reconcile(&self) -> u32 {\n\
+                           2\n\
+                       }\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let by_symbol: Vec<(&str, usize, usize)> = chunks
+            .iter()
+            .map(|c| (c.symbol.as_deref().unwrap_or(""), c.start_line, c.end_line))
+            .collect();
+        assert_eq!(
+            by_symbol,
+            vec![
+                ("Engine", 1, 1),         // struct
+                ("Engine", 2, 2),         // impl header: signature line ONLY
+                ("Engine::search", 3, 5), // members, parent-qualified
+                ("Engine::reconcile", 6, 8),
+            ],
+            "got chunks: {by_symbol:?}"
+        );
+        let header = &chunks[1];
+        assert_eq!(
+            header.text, "impl Engine {",
+            "header chunk is the signature only"
+        );
+    }
+
+    #[test]
+    fn rust_trait_impl_methods_qualify_under_the_type() {
+        let src = "impl Clone for Engine {\n\
+                       fn clone(&self) -> Self {\n\
+                           Engine\n\
+                       }\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Engine", "Engine::clone"]);
+    }
+
+    #[test]
+    fn python_class_methods_are_chunked_individually() {
+        let src = "class C:\n\
+                   \x20   def m(self):\n\
+                   \x20       return 1\n\
+                   \x20   def n(self):\n\
+                   \x20       return 2\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["C", "C.m", "C.n"]);
+    }
+
+    #[test]
+    fn js_class_methods_are_chunked_individually() {
+        // method_definition was a dead def kind before containers recursed:
+        // methods only occur inside classes, and classes were emitted whole.
+        let src = "class A {\n  m() { return 1; }\n  n() { return 2; }\n}\n";
+        let chunks = chunk_source(Some("javascript"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["A", "A.m", "A.n"]);
+    }
+
+    #[test]
+    fn cfg_test_methods_inside_an_impl_are_still_skipped() {
+        // The test-item hook must keep applying during container recursion.
+        let src = "impl Engine {\n\
+                       pub fn real(&self) {}\n\
+                       #[cfg(test)]\n\
+                       fn helper(&self) {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Engine", "Engine::real"]);
+    }
+
+    #[test]
     fn registry_changes_require_a_chunker_version_bump() {
         // The registry's observable surface changes what chunks are produced,
         // so editing it without bumping CHUNKER_VERSION would leave stale
@@ -1089,11 +1234,13 @@ async fn async_test() {}
             use std::fmt::Write;
             write!(
                 surface,
-                "{}|{}|{:?}|{:?}|sym:{}|test:{}|globs:{:?};",
+                "{}|{}|{:?}|{:?}|cont:{:?}|sep:{}|sym:{}|test:{}|globs:{:?};",
                 s.name,
                 s.family,
                 s.extensions,
                 s.def_kinds,
+                s.container_kinds,
+                s.member_separator,
                 s.symbol_for.is_some(),
                 s.is_test_item.is_some(),
                 s.test_file_globs,
