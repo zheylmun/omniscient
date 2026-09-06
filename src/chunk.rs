@@ -15,20 +15,28 @@ use std::path::Path;
 /// and sub-line pieces are now identified by `chunk_index`.
 /// 6: language registry — tsx admitted by the typescript family, symbols for
 /// Rust `impl` blocks and JS/TS `const` declarations.
-pub const CHUNKER_VERSION: u32 = 6;
+/// 7: coverage — declarative items (Rust const/static/type/macro/union, TS type
+/// aliases and enums) are chunked; containers (impl/class) recurse into
+/// per-member chunks under a header-only parent; doc comments and attributes
+/// are part of their item's chunk; uncovered top-level spans are gap-filled.
+pub const CHUNKER_VERSION: u32 = 7;
 
 /// blake3 of [`LANGUAGES`]' observable surface, recorded so the
 /// `registry_changes_require_a_chunker_version_bump` test can force a
 /// [`CHUNKER_VERSION`] bump whenever the registry changes. Update both together;
 /// the failing test prints the new value.
 pub const REGISTRY_FINGERPRINT: &str =
-    "792b064d61e3a392c29d13f207f25df7dac98167678204d3ce4a35fb1836e57a";
+    "23153f726f638d922abcff0eadbebd888665a971106c8eb358b62574971607a0";
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub text: String,
     pub start_line: usize, // 1-based inclusive
     pub end_line: usize,   // 1-based inclusive
+    /// The definition's own first line (1-based): equal to `start_line` unless
+    /// the chunk opens with a doc/attribute prelude. The outline renders this
+    /// line, not the prelude.
+    pub def_line: usize,
     pub language: String,
     pub symbol: Option<String>,
 }
@@ -55,6 +63,19 @@ pub struct LanguageSpec {
     pub grammar: fn() -> tree_sitter::Language,
     /// Node kinds that are emitted as one chunk per top-level definition.
     pub def_kinds: &'static [&'static str],
+    /// Node kinds recursed into per member (`impl` blocks, classes): the
+    /// container contributes a header chunk spanning ONLY its signature lines,
+    /// and each member inside becomes its own chunk. A whole-span parent would
+    /// contain every member chunk and duplicate their text whenever both hit.
+    pub container_kinds: &'static [&'static str],
+    /// Separator between a container's symbol and a member's ("::" for Rust,
+    /// "." elsewhere), producing member symbols like `Engine::search`.
+    pub member_separator: &'static str,
+    /// Node kinds that, as contiguous preceding siblings of a definition, are
+    /// part of its chunk: doc comments, attributes, decorators. The "why"
+    /// prose is the highest-signal text for a semantic match — dropping it is
+    /// what once left 56% of this repo's doc-comment lines unindexed.
+    pub prelude_kinds: &'static [&'static str],
     /// Language-specific symbol extraction for def nodes whose name is not in a
     /// `name` field (Rust `impl` blocks, JS/TS `const x = …` declarators).
     /// `None` from the hook (or no hook) falls back to the generic `name` field.
@@ -84,8 +105,15 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "struct_item",
             "enum_item",
             "trait_item",
-            "impl_item",
+            "const_item",
+            "static_item",
+            "type_item",
+            "macro_definition",
+            "union_item",
         ],
+        container_kinds: &["impl_item"],
+        member_separator: "::",
+        prelude_kinds: &["line_comment", "block_comment", "attribute_item"],
         symbol_for: Some(rust_extra_symbol),
         is_test_item: Some(rust_is_test_item),
         test_file_globs: &["**/benches/**"],
@@ -95,7 +123,10 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         family: "python",
         extensions: &["py"],
         grammar: || tree_sitter_python::LANGUAGE.into(),
-        def_kinds: &["function_definition", "class_definition"],
+        def_kinds: &["function_definition"],
+        container_kinds: &["class_definition"],
+        member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: None,
         is_test_item: None,
         test_file_globs: &["**/test_*.py", "**/conftest.py"],
@@ -107,11 +138,13 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_javascript::LANGUAGE.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "method_definition",
             "lexical_declaration",
             "variable_declaration",
         ],
+        container_kinds: &["class_declaration"],
+        member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -123,11 +156,15 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
         ],
+        container_kinds: &["class_declaration", "abstract_class_declaration"],
+        member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -139,11 +176,15 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         grammar: || tree_sitter_typescript::LANGUAGE_TSX.into(),
         def_kinds: &[
             "function_declaration",
-            "class_declaration",
             "interface_declaration",
             "method_definition",
             "lexical_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
         ],
+        container_kinds: &["class_declaration", "abstract_class_declaration"],
+        member_separator: ".",
+        prelude_kinds: &["comment", "decorator"],
         symbol_for: Some(declarator_symbol),
         is_test_item: None,
         test_file_globs: &["**/*.test.*", "**/*.spec.*"],
@@ -208,7 +249,7 @@ pub fn chunk_source(
     max_window_lines: usize,
 ) -> Result<Vec<Chunk>> {
     let chunks = if let Some(lang) = language {
-        match treesitter_chunks(lang, source) {
+        match treesitter_chunks(lang, source, max_window_lines) {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => line_windows(source, lang, max_window_lines),
             Err(e) => {
@@ -254,6 +295,7 @@ fn line_windows(source: &str, language: &str, max_window_lines: usize) -> Vec<Ch
             text: lines[start..end].join("\n"),
             start_line: start + 1,
             end_line: end,
+            def_line: start + 1,
             language: language.to_string(),
             symbol: None,
         });
@@ -272,6 +314,8 @@ fn piece(parent: &Chunk, text: String, start_line: usize, end_line: usize) -> Ch
         text,
         start_line,
         end_line: end_line.max(start_line),
+        // A piece is body text; its own first line is the honest def line.
+        def_line: start_line,
         language: parent.language.clone(),
         symbol: parent.symbol.clone(),
     }
@@ -344,7 +388,7 @@ fn enforce_byte_budget(chunk: Chunk, max_bytes: usize) -> Vec<Chunk> {
     out
 }
 
-fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
+fn treesitter_chunks(lang: &str, source: &str, max_window_lines: usize) -> Result<Vec<Chunk>> {
     let spec = spec_for_name(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -357,8 +401,97 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
     let bytes = source.as_bytes();
 
     let mut chunks = Vec::new();
-    walk_children(tree.root_node(), spec, bytes, &mut chunks);
+    let mut skipped = Vec::new();
+    walk_children(
+        tree.root_node(),
+        spec,
+        bytes,
+        &mut chunks,
+        &mut skipped,
+        None,
+    );
+    if chunks.is_empty() {
+        // No definitions at all: the caller falls through to whole-file line
+        // windows, which already cover everything.
+        return Ok(chunks);
+    }
+    chunks.extend(gap_chunks(
+        source,
+        spec,
+        &chunks,
+        &skipped,
+        max_window_lines,
+    ));
+    // Gap chunks were appended; give callers (the outline above all) source order.
+    chunks.sort_by_key(|c| (c.start_line, c.def_line));
     Ok(chunks)
+}
+
+/// Cover what the walk missed: any run of lines in no chunk and no skipped
+/// test span becomes line-window chunks. This is what makes "all non-test
+/// source is indexed" an invariant by construction rather than a def-kind
+/// list to maintain — module docs, `use` blocks, Python class attributes, and
+/// whatever a grammar update adds later all land here. Runs are trimmed to
+/// content: blank and punctuation-only edges (a container's closing brace)
+/// are structure, not text worth a chunk.
+fn gap_chunks(
+    source: &str,
+    spec: &LanguageSpec,
+    chunks: &[Chunk],
+    skipped: &[(usize, usize)],
+    max_window_lines: usize,
+) -> Vec<Chunk> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    let mut cover = |s: usize, e: usize| {
+        for row in covered
+            .iter_mut()
+            .take(e.min(lines.len()))
+            .skip(s.saturating_sub(1))
+        {
+            *row = true;
+        }
+    };
+    for c in chunks {
+        cover(c.start_line, c.end_line);
+    }
+    for &(s, e) in skipped {
+        cover(s, e);
+    }
+
+    let fill_worthy = |line: &str| line.chars().any(char::is_alphanumeric);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if covered[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < lines.len() && !covered[j] {
+            j += 1;
+        }
+        let (mut a, mut b) = (i, j);
+        while a < b && !fill_worthy(lines[a]) {
+            a += 1;
+        }
+        while b > a && !fill_worthy(lines[b - 1]) {
+            b -= 1;
+        }
+        if a < b {
+            let text = lines[a..b].join("\n");
+            for w in line_windows(&text, spec.name, max_window_lines) {
+                out.push(Chunk {
+                    start_line: w.start_line + a,
+                    end_line: w.end_line + a,
+                    def_line: w.start_line + a,
+                    ..w
+                });
+            }
+        }
+        i = j;
+    }
+    out
 }
 
 /// Walk a parent node's children, emitting one chunk per top-level def-kind node.
@@ -373,37 +506,153 @@ fn walk_children(
     spec: &LanguageSpec,
     bytes: &[u8],
     chunks: &mut Vec<Chunk>,
+    skipped: &mut Vec<(usize, usize)>,
+    parent_symbol: Option<&str>,
 ) {
-    let kinds = spec.def_kinds;
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
         if spec.is_test_item.is_some_and(|hook| hook(child, bytes)) {
-            continue; // test-only code: no chunk, no recursion
+            // Test-only code: no chunk, no recursion — and the gap-filler must
+            // know this span (docs and attributes included) is deliberately
+            // absent, or it would resurrect it as anonymous window chunks.
+            let start = prelude_start(child, spec);
+            skipped.push((start.row + 1, child.end_position().row + 1));
+            continue;
         }
 
-        if kinds.contains(&child.kind()) {
-            let text = child.utf8_text(bytes).unwrap_or("").to_string();
-            let symbol = spec
-                .symbol_for
-                .and_then(|hook| hook(child, bytes))
-                .or_else(|| {
-                    child
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(bytes).ok())
-                        .map(std::string::ToString::to_string)
-                });
-            chunks.push(Chunk {
-                text,
-                start_line: child.start_position().row + 1,
-                end_line: child.end_position().row + 1,
-                language: spec.name.to_string(),
-                symbol,
-            });
-            // Do NOT recurse into a matched def — nested definitions (methods inside
-            // impl/class) are part of this chunk and must not be emitted again.
+        if spec.container_kinds.contains(&child.kind()) {
+            emit_container(child, spec, bytes, chunks, skipped, parent_symbol);
+        } else if spec.def_kinds.contains(&child.kind()) {
+            emit_def(child, spec, bytes, chunks, parent_symbol);
+            // Do NOT recurse into a matched def — nested definitions (closures,
+            // local types) are part of this chunk and must not be emitted again.
         } else {
-            walk_children(child, spec, bytes, chunks);
+            walk_children(child, spec, bytes, chunks, skipped, parent_symbol);
         }
+    }
+}
+
+/// One chunk for a definition node, its symbol qualified by the enclosing
+/// container's (`Engine::search`, `C.m`) when there is one.
+fn emit_def(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    chunks: &mut Vec<Chunk>,
+    parent_symbol: Option<&str>,
+) {
+    let symbol = qualified_symbol(child, spec, bytes, parent_symbol);
+    let prelude_start = prelude_start(child, spec);
+    let text = text_from(bytes, prelude_start.byte, child.end_byte());
+    chunks.push(Chunk {
+        text,
+        start_line: prelude_start.row + 1,
+        end_line: child.end_position().row + 1,
+        def_line: child.start_position().row + 1,
+        language: spec.name.to_string(),
+        symbol,
+    });
+}
+
+/// A container (`impl` block, class): a header chunk spanning ONLY its
+/// signature lines, then one chunk per member inside. The header must not span
+/// the whole container — a whole-span parent contains every member chunk, and
+/// a parent+member co-hit would duplicate the member's text in distill's merge.
+fn emit_container(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    chunks: &mut Vec<Chunk>,
+    skipped: &mut Vec<(usize, usize)>,
+    parent_symbol: Option<&str>,
+) {
+    let Some(body) = child.child_by_field_name("body") else {
+        // A bodiless container (declaration form) is just a definition.
+        emit_def(child, spec, bytes, chunks, parent_symbol);
+        return;
+    };
+    let symbol = qualified_symbol(child, spec, bytes, parent_symbol);
+
+    // Header text: everything before the body, keeping a brace-opened body's
+    // `{` so the header reads as it does in the source (`impl Engine {`), and
+    // trimming the trailing newline/indent a `:`-opened body (Python) leaves.
+    let mut end = body.start_byte();
+    if bytes.get(end) == Some(&b'{') {
+        end += 1;
+    }
+    let prelude_start = prelude_start(child, spec);
+    let text = text_from(bytes, prelude_start.byte, end);
+    let start_line = prelude_start.row + 1;
+    let end_line = start_line + text.lines().count().saturating_sub(1);
+    chunks.push(Chunk {
+        text,
+        start_line,
+        end_line,
+        def_line: child.start_position().row + 1,
+        language: spec.name.to_string(),
+        symbol: symbol.clone(),
+    });
+
+    walk_children(body, spec, bytes, chunks, skipped, symbol.as_deref());
+}
+
+/// Where a chunk's text begins once its doc/attribute prelude is included.
+struct PreludeStart {
+    byte: usize,
+    row: usize,
+}
+
+/// Walk backward over contiguous preceding siblings whose kind is in the
+/// language's `prelude_kinds` (doc comments, attributes, decorators). A row
+/// gap breaks the run: a comment separated by a blank line is free-standing,
+/// not this item's documentation.
+fn prelude_start(node: tree_sitter::Node, spec: &LanguageSpec) -> PreludeStart {
+    let mut start = PreludeStart {
+        byte: node.start_byte(),
+        row: node.start_position().row,
+    };
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        if !spec.prelude_kinds.contains(&sib.kind()) || sib.end_position().row + 1 < start.row {
+            break;
+        }
+        start = PreludeStart {
+            byte: sib.start_byte(),
+            row: sib.start_position().row,
+        };
+        prev = sib.prev_sibling();
+    }
+    start
+}
+
+fn text_from(bytes: &[u8], start: usize, end: usize) -> String {
+    std::str::from_utf8(&bytes[start..end])
+        .unwrap_or("")
+        .trim_end()
+        .to_string()
+}
+
+/// A node's own symbol (language hook, then the generic `name` field),
+/// prefixed with the enclosing container's symbol when inside one.
+fn qualified_symbol(
+    child: tree_sitter::Node,
+    spec: &LanguageSpec,
+    bytes: &[u8],
+    parent_symbol: Option<&str>,
+) -> Option<String> {
+    let own = spec
+        .symbol_for
+        .and_then(|hook| hook(child, bytes))
+        .or_else(|| {
+            child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .map(std::string::ToString::to_string)
+        });
+    match (parent_symbol, own) {
+        (Some(p), Some(s)) => Some(format!("{p}{sep}{s}", sep = spec.member_separator)),
+        (None, own) => own,
+        (Some(p), None) => Some(p.to_string()),
     }
 }
 
@@ -532,6 +781,7 @@ mod tests {
             text: text.to_string(),
             start_line: 10,
             end_line: 10 + text.lines().count().saturating_sub(1),
+            def_line: 10,
             language: "rust".into(),
             symbol: Some("big_fn".into()),
         }
@@ -789,106 +1039,80 @@ mod tests {
     fn rust_no_over_chunking() {
         let src = read("tests/fixtures/sample.rs");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.rs"), &src, 100).unwrap();
-        // beta is a method inside `impl Point` — it must NOT appear as a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
-        );
-        // Exactly 3 top-level definitions: alpha (fn), Point (struct), impl Point (symbol=None)
+        // beta appears exactly ONCE, as a member chunk qualified by its impl —
+        // never bare, and never duplicated inside a whole-impl chunk.
+        let betas = chunks.iter().filter(|c| c.text.contains("fn beta")).count();
         assert_eq!(
-            chunks.len(),
-            3,
-            "expected exactly 3 chunks, got {}: {chunks:?}",
-            chunks.len()
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(
+            symbols,
+            vec!["alpha", "Point", "Point", "Point::beta"],
+            "fn, struct, impl header, then the qualified member"
+        );
     }
 
     #[test]
     fn python_no_over_chunking() {
         let src = read("tests/fixtures/sample.py");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.py"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks
+            .iter()
+            .filter(|c| c.text.contains("def beta"))
+            .count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
     fn typescript_no_over_chunking() {
         let src = read("tests/fixtures/sample.ts");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.ts"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks.iter().filter(|c| c.text.contains("beta(")).count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
         // alpha is exported (wrapped in export_statement) — must still be captured
-        assert!(
-            symbols.contains(&"alpha"),
-            "alpha (exported fn) missing from {symbols:?}"
-        );
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
     fn tsx_no_over_chunking() {
         let src = read("tests/fixtures/sample.tsx");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.tsx"), &src, 100).unwrap();
-        // render is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("render")),
-            "render should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // render appears exactly ONCE, as a member chunk qualified by its class.
+        let renders = chunks.iter().filter(|c| c.text.contains("render(")).count();
+        assert_eq!(
+            renders, 1,
+            "render must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"Alpha"), "Alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
+        assert_eq!(symbols, vec!["Alpha", "Point", "Point.render"]);
         assert!(chunks.iter().all(|c| c.language == "tsx"));
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (Alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
     }
 
     #[test]
     fn javascript_no_over_chunking() {
         let src = read("tests/fixtures/sample.js");
         let chunks = chunk_file(Path::new("tests/fixtures/sample.js"), &src, 100).unwrap();
-        // beta is a method inside class Point — must NOT be a standalone chunk
-        assert!(
-            !chunks.iter().any(|c| c.symbol.as_deref() == Some("beta")),
-            "beta should not be emitted as a standalone chunk; chunks: {chunks:?}"
+        // beta appears exactly ONCE, as a member chunk qualified by its class.
+        let betas = chunks.iter().filter(|c| c.text.contains("beta(")).count();
+        assert_eq!(
+            betas, 1,
+            "beta must be chunked exactly once; chunks: {chunks:?}"
         );
         let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
-        assert!(symbols.contains(&"alpha"), "alpha missing from {symbols:?}");
-        assert!(symbols.contains(&"Point"), "Point missing from {symbols:?}");
-        assert_eq!(
-            chunks.len(),
-            2,
-            "expected exactly 2 chunks (alpha, Point), got {}: {chunks:?}",
-            chunks.len()
-        );
+        assert_eq!(symbols, vec!["alpha", "Point", "Point.beta"]);
     }
 
     #[test]
@@ -1031,6 +1255,323 @@ async fn async_test() {}
     }
 
     #[test]
+    fn rust_declarative_items_are_chunked_with_symbols() {
+        // Constants, statics, type aliases, macros, and unions are where a
+        // crate's load-bearing declarative knowledge lives (this crate's own
+        // `LANGUAGES` registry, `CHUNKER_VERSION`, `DEFAULT_EXCLUDES`). They
+        // must be retrievable, each under its own name.
+        let src = "pub const MAX: u32 = 8;\n\
+                   pub static REGISTRY: &[u32] = &[1, 2];\n\
+                   pub type Alias = Vec<u32>;\n\
+                   macro_rules! my_macro { () => {}; }\n\
+                   pub union U { a: u32, b: f32 }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(
+            symbols,
+            vec!["MAX", "REGISTRY", "Alias", "my_macro", "U"],
+            "each declarative item is one chunk under its own symbol"
+        );
+        assert!(
+            chunks.iter().any(|c| c.text.contains("REGISTRY: &[u32]")),
+            "the item's full text is the chunk body"
+        );
+    }
+
+    #[test]
+    fn typescript_type_aliases_and_enums_are_chunked() {
+        // `export type` and `enum` previously produced NO chunks at all —
+        // recursion found `interface_declaration` but neither of these kinds.
+        let src = "export type Foo = { a: number };\nenum E { A, B }\n";
+        let chunks = chunk_source(Some("typescript"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Foo", "E"]);
+    }
+
+    #[test]
+    fn rust_impl_blocks_yield_per_method_chunks_under_a_header() {
+        // One chunk per method, so a 600-line impl is not one diluted vector
+        // and one retrieved blob. The parent header chunk spans ONLY its
+        // signature line: a whole-span parent would contain every member
+        // chunk, and a parent+member co-hit would duplicate the member's text
+        // in distill's merge.
+        let src = "pub struct Engine;\n\
+                   impl Engine {\n\
+                       pub fn search(&self) -> u32 {\n\
+                           1\n\
+                       }\n\
+                       fn reconcile(&self) -> u32 {\n\
+                           2\n\
+                       }\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let by_symbol: Vec<(&str, usize, usize)> = chunks
+            .iter()
+            .map(|c| (c.symbol.as_deref().unwrap_or(""), c.start_line, c.end_line))
+            .collect();
+        assert_eq!(
+            by_symbol,
+            vec![
+                ("Engine", 1, 1),         // struct
+                ("Engine", 2, 2),         // impl header: signature line ONLY
+                ("Engine::search", 3, 5), // members, parent-qualified
+                ("Engine::reconcile", 6, 8),
+            ],
+            "got chunks: {by_symbol:?}"
+        );
+        let header = &chunks[1];
+        assert_eq!(
+            header.text, "impl Engine {",
+            "header chunk is the signature only"
+        );
+    }
+
+    #[test]
+    fn rust_trait_impl_methods_qualify_under_the_type() {
+        let src = "impl Clone for Engine {\n\
+                       fn clone(&self) -> Self {\n\
+                           Engine\n\
+                       }\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Engine", "Engine::clone"]);
+    }
+
+    #[test]
+    fn python_class_methods_are_chunked_individually() {
+        let src = "class C:\n\
+                   \x20   def m(self):\n\
+                   \x20       return 1\n\
+                   \x20   def n(self):\n\
+                   \x20       return 2\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["C", "C.m", "C.n"]);
+    }
+
+    #[test]
+    fn js_class_methods_are_chunked_individually() {
+        // method_definition was a dead def kind before containers recursed:
+        // methods only occur inside classes, and classes were emitted whole.
+        let src = "class A {\n  m() { return 1; }\n  n() { return 2; }\n}\n";
+        let chunks = chunk_source(Some("javascript"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["A", "A.m", "A.n"]);
+    }
+
+    #[test]
+    fn cfg_test_methods_inside_an_impl_are_still_skipped() {
+        // The test-item hook must keep applying during container recursion.
+        let src = "impl Engine {\n\
+                       pub fn real(&self) {}\n\
+                       #[cfg(test)]\n\
+                       fn helper(&self) {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["Engine", "Engine::real"]);
+    }
+
+    #[test]
+    fn doc_comments_and_attributes_belong_to_their_items_chunk() {
+        // The `///` explaining WHY is the highest-signal text for a semantic
+        // match — measured on this repo, 56% of doc-comment lines were in no
+        // chunk at all. Contiguous preceding doc comments and attributes are
+        // part of the item's chunk; `def_line` still names the signature line
+        // so the outline can skip past the prelude.
+        let src = "/// Why this matters.\n\
+                   #[derive(Debug)]\n\
+                   pub struct S {\n\
+                       x: u32,\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let c = &chunks[0];
+        assert!(
+            c.text
+                .starts_with("/// Why this matters.\n#[derive(Debug)]\npub struct S {"),
+            "prelude must open the chunk, got:\n{}",
+            c.text
+        );
+        assert_eq!((c.start_line, c.end_line), (1, 5));
+        assert_eq!(c.def_line, 3, "the signature line, past the prelude");
+        assert_eq!(c.symbol.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn blank_line_detaches_a_free_standing_comment() {
+        // A comment block separated from the item by a blank line is not that
+        // item's documentation and must not be pulled into its chunk.
+        let src = "// A file-level remark.\n\
+                   \n\
+                   pub fn f() {}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let f = chunks
+            .iter()
+            .find(|c| c.symbol.as_deref() == Some("f"))
+            .expect("fn chunk");
+        assert!(
+            f.text.starts_with("pub fn f"),
+            "detached comment must stay out of the fn's chunk, got:\n{}",
+            f.text
+        );
+        assert_eq!(f.start_line, 3);
+        // The remark is still indexed — as its own gap chunk, not as f's docs.
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol.is_none() && c.text.contains("file-level remark")),
+            "detached comment should be gap-filled: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn container_headers_carry_their_docs_too() {
+        let src = "/// The central type.\n\
+                   impl Engine {\n\
+                       fn go(&self) {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let header = &chunks[0];
+        assert_eq!(header.symbol.as_deref(), Some("Engine"));
+        assert_eq!(
+            header.text, "/// The central type.\nimpl Engine {",
+            "header chunk = docs + signature"
+        );
+        assert_eq!(
+            (header.start_line, header.end_line, header.def_line),
+            (1, 2, 2)
+        );
+    }
+
+    #[test]
+    fn python_decorators_belong_to_their_defs_chunk() {
+        // Decorators are children of `decorated_definition`, which the walk
+        // recurses through — inside it they are preceding siblings of the def,
+        // so prelude extension captures them like Rust attributes.
+        let src = "@retry(3)\ndef fetch(url):\n    return url\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.starts_with("@retry(3)\ndef fetch"),
+            "decorator must open the chunk, got:\n{}",
+            chunks[0].text
+        );
+        assert_eq!(chunks[0].symbol.as_deref(), Some("fetch"));
+    }
+
+    #[test]
+    fn doc_comments_on_cfg_test_items_stay_out_with_them() {
+        // Prelude capture must not resurrect test-gated code: the whole item,
+        // docs included, is skipped.
+        let src = "/// Docs on a test helper.\n\
+                   #[cfg(test)]\n\
+                   fn helper() {}\n\
+                   pub fn real() {}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let symbols: Vec<_> = chunks.iter().filter_map(|c| c.symbol.as_deref()).collect();
+        assert_eq!(symbols, vec!["real"]);
+        assert!(
+            chunks.iter().all(|c| !c.text.contains("test helper")),
+            "a skipped item's docs must not attach to anything else"
+        );
+    }
+
+    #[test]
+    fn uncovered_top_level_spans_are_gap_filled() {
+        // Module docs, use blocks, and anything a def-kind list misses must
+        // still be indexed: coverage is an invariant, not an enumeration.
+        let src = "//! Module docs explaining the design.\n\
+                   \n\
+                   use std::collections::HashMap;\n\
+                   use std::path::Path;\n\
+                   \n\
+                   pub fn f() -> HashMap<String, u32> {\n\
+                       HashMap::new()\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("Module docs explaining"),
+            "module docs missing:\n{all}"
+        );
+        assert!(
+            all.contains("use std::collections::HashMap"),
+            "use block missing:\n{all}"
+        );
+        // Chunks come back in source order.
+        let starts: Vec<_> = chunks.iter().map(|c| c.start_line).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted, "chunks must be in source order");
+    }
+
+    #[test]
+    fn gap_fill_skips_punctuation_only_lines() {
+        // A container's closing brace is structure, not content — it must not
+        // become a one-character noise chunk.
+        let src = "impl Engine {\n    fn go(&self) {}\n}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        assert!(
+            chunks.iter().all(|c| c.text.trim() != "}"),
+            "closing brace must not be its own chunk: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn gap_fill_does_not_resurrect_test_modules() {
+        // #[cfg(test)] items are skipped by the walk; the gap-filler must know
+        // those spans are deliberately absent, docs and attributes included.
+        let src = "pub fn real() {}\n\
+                   \n\
+                   /// Docs on the test module.\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       fn helper() {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains("mod tests"),
+            "test module resurrected:\n{all}"
+        );
+        assert!(
+            !all.contains("cfg(test)"),
+            "test attribute resurrected:\n{all}"
+        );
+        assert!(
+            !all.contains("Docs on the test module"),
+            "a skipped item's docs resurrected:\n{all}"
+        );
+    }
+
+    #[test]
+    fn python_class_attributes_are_gap_filled() {
+        // Container recursion emits per-method chunks; a class-level
+        // assignment is no def kind, so only gap-fill keeps it indexed.
+        let src = "class C:\n\
+                   \x20   LIMIT = 5\n\
+                   \x20   def m(self):\n\
+                   \x20       return self.LIMIT\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("LIMIT = 5"), "class attribute missing:\n{all}");
+    }
+
+    #[test]
     fn registry_changes_require_a_chunker_version_bump() {
         // The registry's observable surface changes what chunks are produced,
         // so editing it without bumping CHUNKER_VERSION would leave stale
@@ -1042,11 +1583,14 @@ async fn async_test() {}
             use std::fmt::Write;
             write!(
                 surface,
-                "{}|{}|{:?}|{:?}|sym:{}|test:{}|globs:{:?};",
+                "{}|{}|{:?}|{:?}|cont:{:?}|sep:{}|pre:{:?}|sym:{}|test:{}|globs:{:?};",
                 s.name,
                 s.family,
                 s.extensions,
                 s.def_kinds,
+                s.container_kinds,
+                s.member_separator,
+                s.prelude_kinds,
                 s.symbol_for.is_some(),
                 s.is_test_item.is_some(),
                 s.test_file_globs,
