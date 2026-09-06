@@ -249,7 +249,7 @@ pub fn chunk_source(
     max_window_lines: usize,
 ) -> Result<Vec<Chunk>> {
     let chunks = if let Some(lang) = language {
-        match treesitter_chunks(lang, source) {
+        match treesitter_chunks(lang, source, max_window_lines) {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => line_windows(source, lang, max_window_lines),
             Err(e) => {
@@ -388,7 +388,7 @@ fn enforce_byte_budget(chunk: Chunk, max_bytes: usize) -> Vec<Chunk> {
     out
 }
 
-fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
+fn treesitter_chunks(lang: &str, source: &str, max_window_lines: usize) -> Result<Vec<Chunk>> {
     let spec = spec_for_name(lang).ok_or_else(|| Error::Chunk(format!("no grammar for {lang}")))?;
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -401,8 +401,97 @@ fn treesitter_chunks(lang: &str, source: &str) -> Result<Vec<Chunk>> {
     let bytes = source.as_bytes();
 
     let mut chunks = Vec::new();
-    walk_children(tree.root_node(), spec, bytes, &mut chunks, None);
+    let mut skipped = Vec::new();
+    walk_children(
+        tree.root_node(),
+        spec,
+        bytes,
+        &mut chunks,
+        &mut skipped,
+        None,
+    );
+    if chunks.is_empty() {
+        // No definitions at all: the caller falls through to whole-file line
+        // windows, which already cover everything.
+        return Ok(chunks);
+    }
+    chunks.extend(gap_chunks(
+        source,
+        spec,
+        &chunks,
+        &skipped,
+        max_window_lines,
+    ));
+    // Gap chunks were appended; give callers (the outline above all) source order.
+    chunks.sort_by_key(|c| (c.start_line, c.def_line));
     Ok(chunks)
+}
+
+/// Cover what the walk missed: any run of lines in no chunk and no skipped
+/// test span becomes line-window chunks. This is what makes "all non-test
+/// source is indexed" an invariant by construction rather than a def-kind
+/// list to maintain — module docs, `use` blocks, Python class attributes, and
+/// whatever a grammar update adds later all land here. Runs are trimmed to
+/// content: blank and punctuation-only edges (a container's closing brace)
+/// are structure, not text worth a chunk.
+fn gap_chunks(
+    source: &str,
+    spec: &LanguageSpec,
+    chunks: &[Chunk],
+    skipped: &[(usize, usize)],
+    max_window_lines: usize,
+) -> Vec<Chunk> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    let mut cover = |s: usize, e: usize| {
+        for row in covered
+            .iter_mut()
+            .take(e.min(lines.len()))
+            .skip(s.saturating_sub(1))
+        {
+            *row = true;
+        }
+    };
+    for c in chunks {
+        cover(c.start_line, c.end_line);
+    }
+    for &(s, e) in skipped {
+        cover(s, e);
+    }
+
+    let fill_worthy = |line: &str| line.chars().any(char::is_alphanumeric);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if covered[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < lines.len() && !covered[j] {
+            j += 1;
+        }
+        let (mut a, mut b) = (i, j);
+        while a < b && !fill_worthy(lines[a]) {
+            a += 1;
+        }
+        while b > a && !fill_worthy(lines[b - 1]) {
+            b -= 1;
+        }
+        if a < b {
+            let text = lines[a..b].join("\n");
+            for w in line_windows(&text, spec.name, max_window_lines) {
+                out.push(Chunk {
+                    start_line: w.start_line + a,
+                    end_line: w.end_line + a,
+                    def_line: w.start_line + a,
+                    ..w
+                });
+            }
+        }
+        i = j;
+    }
+    out
 }
 
 /// Walk a parent node's children, emitting one chunk per top-level def-kind node.
@@ -417,22 +506,28 @@ fn walk_children(
     spec: &LanguageSpec,
     bytes: &[u8],
     chunks: &mut Vec<Chunk>,
+    skipped: &mut Vec<(usize, usize)>,
     parent_symbol: Option<&str>,
 ) {
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
         if spec.is_test_item.is_some_and(|hook| hook(child, bytes)) {
-            continue; // test-only code: no chunk, no recursion
+            // Test-only code: no chunk, no recursion — and the gap-filler must
+            // know this span (docs and attributes included) is deliberately
+            // absent, or it would resurrect it as anonymous window chunks.
+            let start = prelude_start(child, spec);
+            skipped.push((start.row + 1, child.end_position().row + 1));
+            continue;
         }
 
         if spec.container_kinds.contains(&child.kind()) {
-            emit_container(child, spec, bytes, chunks, parent_symbol);
+            emit_container(child, spec, bytes, chunks, skipped, parent_symbol);
         } else if spec.def_kinds.contains(&child.kind()) {
             emit_def(child, spec, bytes, chunks, parent_symbol);
             // Do NOT recurse into a matched def — nested definitions (closures,
             // local types) are part of this chunk and must not be emitted again.
         } else {
-            walk_children(child, spec, bytes, chunks, parent_symbol);
+            walk_children(child, spec, bytes, chunks, skipped, parent_symbol);
         }
     }
 }
@@ -468,6 +563,7 @@ fn emit_container(
     spec: &LanguageSpec,
     bytes: &[u8],
     chunks: &mut Vec<Chunk>,
+    skipped: &mut Vec<(usize, usize)>,
     parent_symbol: Option<&str>,
 ) {
     let Some(body) = child.child_by_field_name("body") else {
@@ -497,7 +593,7 @@ fn emit_container(
         symbol: symbol.clone(),
     });
 
-    walk_children(body, spec, bytes, chunks, symbol.as_deref());
+    walk_children(body, spec, bytes, chunks, skipped, symbol.as_deref());
 }
 
 /// Where a chunk's text begins once its doc/attribute prelude is included.
@@ -1311,13 +1407,23 @@ async fn async_test() {}
                    \n\
                    pub fn f() {}\n";
         let chunks = chunk_source(Some("rust"), src, 80).unwrap();
-        assert_eq!(chunks.len(), 1);
+        let f = chunks
+            .iter()
+            .find(|c| c.symbol.as_deref() == Some("f"))
+            .expect("fn chunk");
         assert!(
-            chunks[0].text.starts_with("pub fn f"),
-            "detached comment must stay out, got:\n{}",
-            chunks[0].text
+            f.text.starts_with("pub fn f"),
+            "detached comment must stay out of the fn's chunk, got:\n{}",
+            f.text
         );
-        assert_eq!(chunks[0].start_line, 3);
+        assert_eq!(f.start_line, 3);
+        // The remark is still indexed — as its own gap chunk, not as f's docs.
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol.is_none() && c.text.contains("file-level remark")),
+            "detached comment should be gap-filled: {chunks:?}"
+        );
     }
 
     #[test]
@@ -1370,6 +1476,99 @@ async fn async_test() {}
             chunks.iter().all(|c| !c.text.contains("test helper")),
             "a skipped item's docs must not attach to anything else"
         );
+    }
+
+    #[test]
+    fn uncovered_top_level_spans_are_gap_filled() {
+        // Module docs, use blocks, and anything a def-kind list misses must
+        // still be indexed: coverage is an invariant, not an enumeration.
+        let src = "//! Module docs explaining the design.\n\
+                   \n\
+                   use std::collections::HashMap;\n\
+                   use std::path::Path;\n\
+                   \n\
+                   pub fn f() -> HashMap<String, u32> {\n\
+                       HashMap::new()\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("Module docs explaining"),
+            "module docs missing:\n{all}"
+        );
+        assert!(
+            all.contains("use std::collections::HashMap"),
+            "use block missing:\n{all}"
+        );
+        // Chunks come back in source order.
+        let starts: Vec<_> = chunks.iter().map(|c| c.start_line).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted, "chunks must be in source order");
+    }
+
+    #[test]
+    fn gap_fill_skips_punctuation_only_lines() {
+        // A container's closing brace is structure, not content — it must not
+        // become a one-character noise chunk.
+        let src = "impl Engine {\n    fn go(&self) {}\n}\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        assert!(
+            chunks.iter().all(|c| c.text.trim() != "}"),
+            "closing brace must not be its own chunk: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn gap_fill_does_not_resurrect_test_modules() {
+        // #[cfg(test)] items are skipped by the walk; the gap-filler must know
+        // those spans are deliberately absent, docs and attributes included.
+        let src = "pub fn real() {}\n\
+                   \n\
+                   /// Docs on the test module.\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       fn helper() {}\n\
+                   }\n";
+        let chunks = chunk_source(Some("rust"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains("mod tests"),
+            "test module resurrected:\n{all}"
+        );
+        assert!(
+            !all.contains("cfg(test)"),
+            "test attribute resurrected:\n{all}"
+        );
+        assert!(
+            !all.contains("Docs on the test module"),
+            "a skipped item's docs resurrected:\n{all}"
+        );
+    }
+
+    #[test]
+    fn python_class_attributes_are_gap_filled() {
+        // Container recursion emits per-method chunks; a class-level
+        // assignment is no def kind, so only gap-fill keeps it indexed.
+        let src = "class C:\n\
+                   \x20   LIMIT = 5\n\
+                   \x20   def m(self):\n\
+                   \x20       return self.LIMIT\n";
+        let chunks = chunk_source(Some("python"), src, 80).unwrap();
+        let all: String = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("LIMIT = 5"), "class attribute missing:\n{all}");
     }
 
     #[test]
