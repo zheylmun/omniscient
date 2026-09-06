@@ -142,10 +142,23 @@ pub fn distill_context(
             .then_with(|| a.start_line.cmp(&b.start_line))
     });
 
-    // Entries are sorted by score desc, so the relevance floor is a cut point:
-    // once one entry falls below it, every later one does too. A non-positive top
-    // score means even the best match is weak — the floor would reject everything,
-    // so the always-keep-the-first rule (out.is_empty()) carries it instead.
+    select_by_shape(entries, token_budget, relevance_ratio)
+}
+
+/// Shape-based selection, shared by `search` and `read_file`'s focus branch:
+/// `entries` must already be sorted by score descending. Keep every entry
+/// scoring at least `relevance_ratio` of the top entry's score, under the
+/// token budget, always keeping the single best match.
+///
+/// The floor is a cut point (sorted input: once one entry falls below it,
+/// every later one does too). A non-positive top score means even the best
+/// match is weak — the floor would reject everything, so the
+/// always-keep-the-first rule (`out.is_empty()`) carries it instead.
+pub fn select_by_shape(
+    entries: Vec<ContextEntry>,
+    token_budget: usize,
+    relevance_ratio: f32,
+) -> Vec<ContextEntry> {
     let floor = entries.first().map_or(0.0, |e| e.score) * relevance_ratio.clamp(0.0, 1.0);
 
     let mut out = Vec::new();

@@ -697,9 +697,8 @@ impl Engine {
             .map(|(i, p)| (dot(&fv, &cvs[i]), p))
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(scored
+        let entries: Vec<ContextEntry> = scored
             .into_iter()
-            .take(5)
             .map(|(score, (c, partial))| ContextEntry {
                 path: path.to_string(),
                 start_line: c.start_line,
@@ -716,7 +715,15 @@ impl Engine {
                     format!("focus similarity {score:.3}")
                 },
             })
-            .collect())
+            .collect();
+        // Focus results are model context like any search result: the same
+        // relevance-shape selection and token budget apply — not a magic
+        // fixed count.
+        Ok(crate::distill::select_by_shape(
+            entries,
+            self.config.search.token_budget,
+            self.config.search.relevance_ratio,
+        ))
     }
 }
 
@@ -1963,6 +1970,64 @@ mod tests {
         assert!(
             !outline.iter().any(|e| e.code.trim() == "let x = 1;"),
             "no entry may be a body fragment"
+        );
+    }
+
+    async fn engine_with_search(
+        root: std::path::PathBuf,
+        f: impl FnOnce(&mut crate::config::SearchConfig),
+    ) -> Engine {
+        let mut cfg = Config::default_for(root);
+        f(&mut cfg.search);
+        Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap()
+    }
+
+    fn many_fns(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("pub fn f{i}() -> u32 {{\n    {i}\n}}\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn focus_is_not_capped_at_a_fixed_count() {
+        // Focus selection follows the relevance shape like search does — a
+        // permissive ratio must be able to return more than the old
+        // hard-coded five entries.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("m.rs"), many_fns(8)).unwrap();
+        let engine = engine_with_search(repo.path().to_path_buf(), |s| {
+            s.relevance_ratio = 0.0;
+        })
+        .await;
+
+        let entries = engine.read_file("m.rs", Some("a function")).await.unwrap();
+        assert!(
+            entries.len() > 5,
+            "ratio 0.0 over 8 defs must beat the old take(5), got {}",
+            entries.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_respects_the_token_budget() {
+        // A focus read is context for a model like any search result; it must
+        // not return five 600-line chunks because five was the magic number.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("m.rs"), many_fns(8)).unwrap();
+        let engine = engine_with_search(repo.path().to_path_buf(), |s| {
+            s.relevance_ratio = 0.0;
+            s.token_budget = 10; // fits one small entry at most
+        })
+        .await;
+
+        let entries = engine.read_file("m.rs", Some("a function")).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "over budget everything but the best entry is dropped"
         );
     }
 
