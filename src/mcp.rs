@@ -74,8 +74,10 @@ exhaustive 'every occurrence of X' sweep, use a grep/text tool — those lines a
 index and cannot be returned.\n\
 \n\
 Use when: 'where does concept X live', 'how does X work', locating code by behavior, or pulling \
-design rationale from docs. Avoid when: you need every call site (results are relevance-ranked and \
-capped, not exhaustive), an exact symbol you already know (grep is faster and literal), or results that must \
+design rationale from docs. Naming a symbol in the query works well: identifier-like tokens are \
+matched against indexed symbol names (including qualified members like Engine::search) and \
+promoted, labeled 'symbol match' in the result. Avoid when: you need every call site (results are \
+relevance-ranked and capped, not exhaustive), or results that must \
 reflect the very latest working-tree edits — the index refreshes on each call but can briefly \
 lag disk if the embedding backend is unreachable or a refresh is mid-flight, so cross-check grep \
 when freshness is load-bearing.\n\
