@@ -83,33 +83,32 @@ pub fn distill_context(
             let (s, e) = (h.chunk.start_line, h.chunk.end_line);
             match &mut cur {
                 Some(m) if s <= m.e + 2 => {
-                    // Append unconditionally: each hit is a distinct row, and
-                    // pieces of one source line share a range, so gating on
-                    // `e > m.e` would drop every piece after the first.
+                    // What to append is decided by `merge_fragment`: verbatim
+                    // shared lines (overlapping `line_windows`) are dropped so
+                    // the body quotes each file line once, while sub-line
+                    // fragments — whose texts don't byte-match — are appended
+                    // whole so a split chunk still reassembles. Gating on
+                    // `e > m.e` instead would drop every fragment after the
+                    // first, since pieces of one source line share a range.
                     //
-                    // The separator, though, is conditional. Only a piece that
+                    // The separator is conditional too. Only a fragment that
                     // genuinely starts on a later line gets a newline: pieces of
                     // ONE physical line (a minified bundle is a single line) must
                     // be concatenated, or the distilled body stops matching the
                     // file it claims to quote — while the entry's line numbers
-                    // still say it is all one line.
-                    //
-                    // The comparison is against the PREVIOUS HIT's start_line, and
-                    // neither endpoint of the merged span can stand in for it.
-                    // Against `m.e` (the running max end_line) the overlapping
-                    // windows `line_windows` emits — `1-80`, `65-144`, ~20% overlap
-                    // by construction — look like sub-line pieces, because `65 <= 80`,
-                    // and window A's last line gets glued onto window B's first.
-                    // That path is taken for any file tree-sitter yields no
-                    // definitions for. Against `m.s` every piece after the first
-                    // would compare to the span's *original* start, which says
-                    // nothing about the piece immediately before it.
-                    if s > m.last_s {
-                        m.text.push('\n');
+                    // still say it is all one line. The comparison is against
+                    // the PREVIOUS append's start line (`last_s`): `m.e` would
+                    // misclassify a window continuation as a sub-line piece,
+                    // and `m.s` says nothing about the piece just before.
+                    let (fragment, fragment_start) = merge_fragment(m, s, e, &h.chunk.text);
+                    if !fragment.is_empty() {
+                        if fragment_start > m.last_s {
+                            m.text.push('\n');
+                        }
+                        m.last_s = fragment_start;
+                        m.text.push_str(fragment);
                     }
-                    m.last_s = s;
                     m.e = m.e.max(e);
-                    m.text.push_str(&h.chunk.text);
                     if h.score > m.score {
                         m.score = h.score;
                     }
@@ -162,6 +161,91 @@ pub fn distill_context(
         }
     }
     out
+}
+
+/// Decide what part of an overlapping hit's text to append, and the line it
+/// starts on. Hits whose spans overlap the merged span AND quote the file
+/// verbatim (adjacent `line_windows` share ~20% of their lines by construction)
+/// would repeat the shared lines if appended whole, so:
+///
+/// - a hit contained in the merged span whose text matches the merged text at
+///   the corresponding line offset contributes nothing;
+/// - a hit overhanging the end whose leading lines byte-match the merged
+///   text's trailing lines contributes only the remainder.
+///
+/// The byte-match guard is what keeps sub-line fragments safe: pieces of one
+/// split chunk share a line span too, but their texts differ, so they fall
+/// through to plain concatenation — reassembling the split exactly as before.
+fn merge_fragment<'a>(m: &Merged, s: usize, e: usize, incoming: &'a str) -> (&'a str, usize) {
+    if s > m.e {
+        return (incoming, s); // no shared lines to worry about
+    }
+    let shared = e.min(m.e) - s + 1;
+    if e <= m.e {
+        // Fully contained: skip only if the merged text really holds this
+        // exact text where lines s..=e should sit.
+        if line_region(&m.text, s - m.s, shared) == Some(incoming) {
+            return ("", s);
+        }
+        return (incoming, s);
+    }
+    // Overhangs the end: drop the shared prefix if it matches the merged tail.
+    match (
+        tail_lines(&m.text, shared),
+        first_lines_len(incoming, shared),
+    ) {
+        (Some(tail), Some(plen)) if tail == &incoming[..plen] => {
+            let rest = &incoming[plen..];
+            (rest.strip_prefix('\n').unwrap_or(rest), m.e + 1)
+        }
+        _ => (incoming, s),
+    }
+}
+
+/// Byte length of the first `n` lines of `text` (without the trailing
+/// newline), or `None` if `text` has fewer than `n` lines.
+fn first_lines_len(text: &str, n: usize) -> Option<usize> {
+    let mut len = 0usize;
+    let mut count = 0usize;
+    for line in text.split('\n') {
+        if count > 0 {
+            len += 1; // the '\n' before this line
+        }
+        len += line.len();
+        count += 1;
+        if count == n {
+            return Some(len);
+        }
+    }
+    None
+}
+
+/// The sub-slice of `text` covering `take` lines starting after `skip` lines,
+/// or `None` if `text` has too few lines.
+fn line_region(text: &str, skip: usize, take: usize) -> Option<&str> {
+    let start = if skip == 0 {
+        0
+    } else {
+        first_lines_len(text, skip)? + 1 // step past the '\n'
+    };
+    if start > text.len() {
+        return None;
+    }
+    let region = &text[start..];
+    let len = first_lines_len(region, take)?;
+    Some(&region[..len])
+}
+
+/// The last `n` lines of `text`, or `None` if it has fewer.
+fn tail_lines(text: &str, n: usize) -> Option<&str> {
+    let mut newlines = 0usize;
+    for (i, _) in text.rmatch_indices('\n') {
+        newlines += 1;
+        if newlines == n {
+            return Some(&text[i + 1..]);
+        }
+    }
+    (newlines + 1 == n).then_some(text)
 }
 
 fn finish(path: &str, m: Merged, strip_comments: bool) -> ContextEntry {
@@ -439,18 +523,13 @@ mod tests {
 
     #[test]
     fn overlapping_line_windows_keep_their_newline() {
-        // The multi-line counterpart, and the case a `s > m.e` separator test gets
-        // wrong. `chunk::line_windows` emits windows overlapping by ~20% by
-        // construction (`step = win - win/5`), so consecutive windows look like
-        // `1-80` then `65-144`. Comparing the second hit's start_line against the
-        // running max end_line gives `65 <= 80` — indistinguishable from a sub-line
-        // piece — and window A's last line gets concatenated onto window B's first,
-        // producing a body that does not appear anywhere in the file.
-        //
-        // This is not an exotic path: line windows are what every file
-        // tree-sitter finds no definitions in falls back to (a Python script of
-        // top-level statements, a Rust file of only `const`/`static`/
-        // `macro_rules!`, or anything at all when `languages = []`).
+        // The non-verbatim fallback: these two hits claim overlapping spans
+        // (`1-80` then `65-144`) but their texts do NOT byte-match on the
+        // shared lines, so the dedup guard in `merge_fragment` must stand
+        // aside and both texts must be appended in full — separated by a
+        // newline, not spliced into one line. (Verbatim overlap, the case
+        // real `line_windows` produce, is covered by
+        // `overlapping_windows_do_not_duplicate_shared_lines`.)
         let hit = |idx: usize, s: usize, e: usize, text: &str| Hit {
             score: 0.9,
             chunk: StoredChunk {
@@ -483,6 +562,74 @@ mod tests {
         assert_eq!(
             out[0].code,
             "first = 1\nlast_of_a = 80\nfirst_of_b = 65\nlast = 144"
+        );
+    }
+
+    /// Windows built by `chunk::line_windows` quote the file verbatim, so the
+    /// overlap region (~20% by construction) appears in BOTH windows' texts.
+    /// Merging must not repeat it: the entry claims one line span, and a body
+    /// with the shared lines twice matches nothing in the file — and pays for
+    /// the duplicate lines in the caller's token budget.
+    #[test]
+    fn overlapping_windows_do_not_duplicate_shared_lines() {
+        let file_lines: Vec<String> = (1..=8).map(|i| format!("line {i}")).collect();
+        let window = |idx: usize, s: usize, e: usize| Hit {
+            score: 0.9,
+            chunk: StoredChunk {
+                path: "notes.md".into(),
+                start_line: s,
+                end_line: e,
+                chunk_index: idx,
+                language: "text".into(),
+                symbol: None,
+                text: file_lines[s - 1..e].join("\n"),
+                file_hash: "h".into(),
+                vector: vec![],
+            },
+        };
+        // Windows 1-5 and 4-8: lines 4-5 are quoted by both.
+        let out = distill_context(vec![window(0, 1, 5), window(1, 4, 8)], false, 10_000, 0.0);
+        assert_eq!(out.len(), 1, "overlapping windows merge into one entry");
+        assert_eq!((out[0].start_line, out[0].end_line), (1, 8));
+        assert_eq!(
+            out[0].code,
+            file_lines.join("\n"),
+            "the merged body must quote lines 1-8 exactly once each"
+        );
+    }
+
+    /// A hit whose span is wholly inside the merged span, quoting the same
+    /// text, adds nothing — it must be skipped, not appended a second time.
+    #[test]
+    fn contained_duplicate_window_is_not_appended() {
+        let file_lines: Vec<String> = (1..=8).map(|i| format!("line {i}")).collect();
+        let window = |idx: usize, s: usize, e: usize, score: f32| Hit {
+            score,
+            chunk: StoredChunk {
+                path: "notes.md".into(),
+                start_line: s,
+                end_line: e,
+                chunk_index: idx,
+                language: "text".into(),
+                symbol: None,
+                text: file_lines[s - 1..e].join("\n"),
+                file_hash: "h".into(),
+                vector: vec![],
+            },
+        };
+        // 1-8 first, then 4-6 (fully contained, verbatim). The contained hit's
+        // higher score must still win the entry's score.
+        let out = distill_context(
+            vec![window(0, 1, 8, 0.7), window(1, 4, 6, 0.95)],
+            false,
+            10_000,
+            0.0,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code, file_lines.join("\n"));
+        assert!(
+            (out[0].score - 0.95).abs() < 1e-6,
+            "score is the max of merged hits"
         );
     }
 }
