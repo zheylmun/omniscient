@@ -249,18 +249,13 @@ fn tail_lines(text: &str, n: usize) -> Option<&str> {
 }
 
 fn finish(path: &str, m: Merged, strip_comments: bool) -> ContextEntry {
-    // Banner stripping exists for license headers, which live at the top of a
-    // FILE — so it applies only to an entry that starts there. Chunks open
-    // with their item's doc comments, and stripping those would hide exactly
-    // the "why" prose the entry was retrieved for.
-    let strip = strip_comments && m.s == 1;
     ContextEntry {
         path: path.to_string(),
         start_line: m.s,
         end_line: m.e,
         language: m.language,
         symbol: m.symbol,
-        code: strip_banner(&m.text, strip),
+        code: strip_banner(&m.text, strip_comments),
         score: m.score,
         why_matched: format!("similarity {:.3}", m.score),
     }
@@ -303,31 +298,6 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].start_line, 1);
         assert_eq!(a[0].end_line, 8);
-    }
-
-    #[test]
-    fn strip_banner_spares_doc_comments_mid_file() {
-        // Banner stripping exists for license headers, which live at the top
-        // of a FILE. Chunks now open with their item's doc comments — exactly
-        // the "why" prose worth showing — so an entry that starts past line 1
-        // must keep its leading comments even with stripping enabled.
-        let out = distill_context(
-            vec![hit(
-                "a.rs",
-                42,
-                44,
-                0.9,
-                "/// Why this matters.\npub fn a() {}\n",
-            )],
-            true,
-            100_000,
-            0.0,
-        );
-        assert!(
-            out[0].code.contains("Why this matters"),
-            "mid-file doc comment stripped, got:\n{}",
-            out[0].code
-        );
     }
 
     #[test]

@@ -747,26 +747,15 @@ fn chunks_for_embedding(
 fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>) -> Vec<ContextEntry> {
     chunks
         .into_iter()
-        .map(|c| {
-            // Chunks open with their doc/attribute prelude; the outline's job
-            // is the signature, which `def_line` names.
-            let signature_offset = c.def_line.saturating_sub(c.start_line);
-            let code = c
-                .text
-                .lines()
-                .nth(signature_offset)
-                .unwrap_or("")
-                .to_string();
-            ContextEntry {
-                path: path.to_string(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                language: c.language,
-                symbol: c.symbol,
-                code,
-                score: 0.0,
-                why_matched: "outline".into(),
-            }
+        .map(|c| ContextEntry {
+            path: path.to_string(),
+            start_line: c.start_line,
+            end_line: c.end_line,
+            language: c.language,
+            symbol: c.symbol,
+            code: c.text.lines().next().unwrap_or("").to_string(),
+            score: 0.0,
+            why_matched: "outline".into(),
         })
         .collect()
 }
@@ -1946,27 +1935,6 @@ mod tests {
         assert!(
             !outline.iter().any(|e| e.code.trim() == "let x = 1;"),
             "no entry may be a body fragment"
-        );
-    }
-
-    #[tokio::test]
-    async fn outline_shows_the_signature_not_the_doc_prelude() {
-        // Chunks now open with their doc comments and attributes; the outline's
-        // job is still the signature. `def_line` names it.
-        let repo = tempdir().unwrap();
-        let src = "/// Why this exists.\n\
-                   #[derive(Debug)]\n\
-                   pub struct S {\n\
-                       x: u32,\n\
-                   }\n";
-        fs::write(repo.path().join("m.rs"), src).unwrap();
-        let engine = engine_for(repo.path().to_path_buf()).await;
-
-        let outline = engine.read_file("m.rs", None).await.unwrap();
-        assert_eq!(outline.len(), 1);
-        assert_eq!(
-            outline[0].code, "pub struct S {",
-            "the signature line, not the doc comment"
         );
     }
 
