@@ -49,6 +49,7 @@ fn strip_banner(text: &str, strip: bool) -> String {
 struct Merged {
     s: usize,
     e: usize,
+    boosted: bool,
     /// `start_line` of the hit appended most recently, which is what decides
     /// whether the *next* hit needs a newline in front of it. See the separator
     /// comment in `distill_context`: neither `s` nor `e` can answer that question.
@@ -109,6 +110,15 @@ pub fn distill_context(
                         m.text.push_str(fragment);
                     }
                     m.e = m.e.max(e);
+                    // The entry's symbol follows its best evidence: a
+                    // symbol-matched hit names exactly what the caller asked
+                    // for; otherwise the highest-scoring hit — not whichever
+                    // chunk happens to start first (an impl header would
+                    // always shadow its matched member).
+                    if (h.boosted && !m.boosted) || (h.score > m.score && h.boosted == m.boosted) {
+                        m.symbol.clone_from(&h.chunk.symbol);
+                    }
+                    m.boosted |= h.boosted;
                     if h.score > m.score {
                         m.score = h.score;
                     }
@@ -120,6 +130,7 @@ pub fn distill_context(
                     cur = Some(Merged {
                         s,
                         e,
+                        boosted: h.boosted,
                         last_s: s,
                         score: h.score,
                         text: h.chunk.text.clone(),
@@ -275,7 +286,11 @@ fn finish(path: &str, m: Merged, strip_comments: bool) -> ContextEntry {
         symbol: m.symbol,
         code: strip_banner(&m.text, strip),
         score: m.score,
-        why_matched: format!("similarity {:.3}", m.score),
+        why_matched: if m.boosted {
+            format!("similarity {:.3} — symbol match on the query", m.score)
+        } else {
+            format!("similarity {:.3}", m.score)
+        },
     }
 }
 
@@ -286,6 +301,7 @@ mod tests {
     fn hit(path: &str, s: usize, e: usize, score: f32, text: &str) -> Hit {
         Hit {
             score,
+            boosted: false,
             chunk: StoredChunk {
                 path: path.into(),
                 start_line: s,
@@ -475,6 +491,7 @@ mod tests {
         // the wrong body for the exact case sub-line splitting exists to handle.
         let hit = |idx: usize, text: &str, score: f32| Hit {
             score,
+            boosted: false,
             chunk: StoredChunk {
                 path: "bundle.min.js".into(),
                 start_line: 1,
@@ -517,6 +534,7 @@ mod tests {
         // line numbers on the entry say it is all one line.
         let hit = |idx: usize, text: &str| Hit {
             score: 0.9,
+            boosted: false,
             chunk: StoredChunk {
                 path: "bundle.min.js".into(),
                 start_line: 1,
@@ -543,6 +561,7 @@ mod tests {
         // The counterpart: genuinely distinct lines must not be run together.
         let hit = |idx: usize, line: usize, text: &str| Hit {
             score: 0.9,
+            boosted: false,
             chunk: StoredChunk {
                 path: "a.rs".into(),
                 start_line: line,
@@ -575,6 +594,7 @@ mod tests {
         // `overlapping_windows_do_not_duplicate_shared_lines`.)
         let hit = |idx: usize, s: usize, e: usize, text: &str| Hit {
             score: 0.9,
+            boosted: false,
             chunk: StoredChunk {
                 path: "script.py".into(),
                 start_line: s,
@@ -618,6 +638,7 @@ mod tests {
         let file_lines: Vec<String> = (1..=8).map(|i| format!("line {i}")).collect();
         let window = |idx: usize, s: usize, e: usize| Hit {
             score: 0.9,
+            boosted: false,
             chunk: StoredChunk {
                 path: "notes.md".into(),
                 start_line: s,
@@ -648,6 +669,7 @@ mod tests {
         let file_lines: Vec<String> = (1..=8).map(|i| format!("line {i}")).collect();
         let window = |idx: usize, s: usize, e: usize, score: f32| Hit {
             score,
+            boosted: false,
             chunk: StoredChunk {
                 path: "notes.md".into(),
                 start_line: s,
