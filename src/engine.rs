@@ -649,18 +649,36 @@ impl Engine {
         Ok(())
     }
 
+    /// The file's entries: the outline's (without its omitted count) when
+    /// `focus` is `None`, otherwise the parts relevant to `focus`. MCP callers
+    /// use [`Engine::outline`] for the outline so the cut is reported.
     pub async fn read_file(&self, path: &str, focus: Option<&str>) -> Result<Vec<ContextEntry>> {
+        match focus {
+            None => Ok(self.outline(path)?.entries),
+            Some(f) => {
+                let (source, chunks) = self.load_chunks(path)?;
+                self.focus_entries(path, f, &source, chunks).await
+            }
+        }
+    }
+
+    /// The structural outline of one file, read live from disk and bounded by
+    /// `token_budget`. The cut is positional (the file's first definitions are
+    /// kept) and reported in [`Outline::omitted`] so it renders as truncated.
+    pub fn outline(&self, path: &str) -> Result<Outline> {
+        let (_, chunks) = self.load_chunks(path)?;
+        Ok(outline_entries(
+            path,
+            chunks,
+            self.config.search.token_budget,
+        ))
+    }
+
+    fn load_chunks(&self, path: &str) -> Result<(String, Vec<crate::chunk::Chunk>)> {
         let abs = self.config.repo_root.join(path);
         let source = std::fs::read_to_string(&abs)?;
         let chunks = chunk_file(Path::new(path), &source, MAX_WINDOW_LINES)?;
-        match focus {
-            None => Ok(outline_entries(
-                path,
-                chunks,
-                self.config.search.token_budget,
-            )),
-            Some(f) => self.focus_entries(path, f, &source, chunks).await,
-        }
+        Ok((source, chunks))
     }
 
     /// Rank a file's chunks against a focus string and return the best few.
@@ -938,29 +956,21 @@ impl Engine {
         let mut by_path: std::collections::BTreeMap<String, Vec<crate::index::SymbolRow>> =
             std::collections::BTreeMap::new();
         for r in rows {
-            if !r.path.starts_with(prefix) || is_excluded(&self.matcher, &r.path) {
+            if !under_prefix(&r.path, prefix) || is_excluded(&self.matcher, &r.path) {
                 continue;
             }
             by_path.entry(r.path.clone()).or_default().push(r);
         }
 
-        let mut files = Vec::new();
-        let mut used = 0usize;
-        let mut omitted_files = 0usize;
-        for (path, mut rows) in by_path {
+        let files = by_path.into_iter().map(|(path, mut rows)| {
             rows.sort_by_key(|r| r.chunk_index);
-            let file = FileSymbols {
+            FileSymbols {
                 symbols: top_level_symbols(&rows),
                 path,
-            };
-            let cost = map_cost(&file);
-            if files.is_empty() || used + cost <= self.config.search.token_budget {
-                used += cost;
-                files.push(file);
-            } else {
-                omitted_files += 1;
             }
-        }
+        });
+        let (files, omitted_files) =
+            take_within_budget(files, self.config.search.token_budget, map_cost);
         Ok(RepoMap {
             files,
             omitted_files,
@@ -968,38 +978,93 @@ impl Engine {
     }
 }
 
+/// Whether `path` lies under `prefix` as a path *component*: `src` admits
+/// `src/a.rs` and `src` itself but not `src_old/a.rs`. An empty prefix admits
+/// everything; a prefix ending in `/` is a plain string prefix.
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        return path.starts_with(prefix);
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The positional budget cut shared by the outline and the map: items are
+/// taken in order while their running cost fits `budget`, the first
+/// unconditionally (a read must never come back empty because one item is
+/// large), and the number left behind is returned alongside.
+fn take_within_budget<T>(
+    items: impl IntoIterator<Item = T>,
+    budget: usize,
+    cost: impl Fn(&T) -> usize,
+) -> (Vec<T>, usize) {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut omitted = 0usize;
+    for item in items {
+        let c = cost(&item);
+        if out.is_empty() || used + c <= budget {
+            used += c;
+            out.push(item);
+        } else {
+            omitted += 1;
+        }
+    }
+    (out, omitted)
+}
+
 /// A symbol is a member when it is qualified with a container name — `::` for
-/// Rust, `.` for the others — the form `chunk` gives every member chunk. Members
-/// are folded into their parent's count; a member whose parent the index holds
-/// no header for (a Python method whose class chunk was elided, say) is dropped
-/// rather than promoted, because the map is a list of *top-level* names.
+/// Rust, `.` for the others — the form `chunk` gives every member chunk, and
+/// that container is a name already listed for the file (parents precede
+/// their members in `chunk_index` order). Members fold into their parent's
+/// count. A qualified symbol whose parent is *not* listed is a header, not an
+/// orphan: `impl Bar for other::Baz` carries the type's full path, and it
+/// lists as `Baz` rather than vanishing.
 ///
 /// One name, one line: a struct and its several `impl` blocks all carry the
 /// type's name, and `Engine, Engine (+28), Engine (+1)` says nothing that
-/// `Engine (+29)` does not. Repeats merge into the first occurrence, which
-/// keeps its span and accumulates the member count.
+/// `Engine (+29)` does not. Names are compared by [`bare_name`], so
+/// `impl<T> Foo<T>` and `impl Display for Foo<u8>` merge into `Foo` too.
+/// Repeats merge into the first occurrence, which keeps its span and
+/// accumulates the member count.
 fn top_level_symbols(rows: &[crate::index::SymbolRow]) -> Vec<MapSymbol> {
     let mut out: Vec<MapSymbol> = Vec::new();
     for r in rows {
         let Some(sym) = r.symbol.as_deref() else {
             continue;
         };
-        match sym.rsplit_once("::").or_else(|| sym.rsplit_once('.')) {
-            Some((parent, _)) => {
-                if let Some(p) = out.iter_mut().find(|m| m.name == parent) {
-                    p.members += 1;
-                }
-            }
-            None if out.iter().any(|m| m.name == sym) => {}
-            None => out.push(MapSymbol {
-                name: sym.to_string(),
-                start_line: r.start_line,
-                end_line: r.end_line,
-                members: 0,
-            }),
+        let parent = sym
+            .rsplit_once("::")
+            .or_else(|| sym.rsplit_once('.'))
+            .map(|(parent, _)| bare_name(parent));
+        if let Some(p) = parent.and_then(|parent| out.iter_mut().find(|m| m.name == parent)) {
+            p.members += 1;
+            continue;
         }
+        let name = bare_name(sym);
+        if out.iter().any(|m| m.name == name) {
+            continue;
+        }
+        out.push(MapSymbol {
+            name: name.to_string(),
+            start_line: r.start_line,
+            end_line: r.end_line,
+            members: 0,
+        });
     }
     out
+}
+
+/// The identifier a type-bearing symbol names, for merging: generic arguments
+/// (`Foo<T>` → `Foo`), a leading path (`fmt::Formatter` → `Formatter`) and a
+/// reference sigil (`&mut Foo` → `Foo`) are all spellings of one type.
+fn bare_name(sym: &str) -> &str {
+    let sym = sym.split('<').next().unwrap_or(sym).trim_end();
+    let sym = sym
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start();
+    sym.rsplit("::").next().unwrap_or(sym)
 }
 
 /// Approximate rendered cost of one map line: the path plus each symbol name
@@ -1007,6 +1072,15 @@ fn top_level_symbols(rows: &[crate::index::SymbolRow]) -> Vec<MapSymbol> {
 fn map_cost(file: &FileSymbols) -> usize {
     let names: usize = file.symbols.iter().map(|m| m.name.len() + 2).sum();
     crate::distill::approx_tokens(&file.path) + names / 4
+}
+
+/// A file's outline: one entry per structural definition, carrying its
+/// signature only, in file order, plus how many definitions `token_budget`
+/// cut from the end.
+#[derive(Debug, Clone)]
+pub struct Outline {
+    pub entries: Vec<ContextEntry>,
+    pub omitted: usize,
 }
 
 /// One entry per structural definition, carrying its signature only, in file
@@ -1018,46 +1092,30 @@ fn map_cost(file: &FileSymbols) -> usize {
 ///
 /// The budget binds here as it does on every other read. The outline has no
 /// relevance shape to cut on, so the cut is positional — the file's first
-/// definitions are kept, the first entry unconditionally — and the last
-/// retained entry says how many were dropped, so a truncated outline reads as
-/// truncated rather than as the file's end.
-fn outline_entries(
-    path: &str,
-    chunks: Vec<crate::chunk::Chunk>,
-    token_budget: usize,
-) -> Vec<ContextEntry> {
-    let total = chunks.len();
-    let mut used = 0usize;
-    let mut out: Vec<ContextEntry> = chunks
-        .into_iter()
-        .map(|c| {
-            // Chunks open with their doc/attribute prelude; the outline's job
-            // is the signature, which `def_line` names.
-            let signature_offset = c.def_line.saturating_sub(c.start_line);
-            let code = signature_lines(c.text.lines().skip(signature_offset));
-            ContextEntry {
-                path: path.to_string(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                language: c.language,
-                symbol: c.symbol,
-                code,
-                score: 0.0,
-                why_matched: "outline".into(),
-            }
-        })
-        .take_while(|e| {
-            let cost = crate::distill::approx_tokens(&e.code);
-            let fits = used == 0 || used + cost <= token_budget;
-            used += cost;
-            fits
-        })
-        .collect();
-    let omitted = total - out.len();
-    if let Some(last) = out.last_mut().filter(|_| omitted > 0) {
-        last.why_matched = format!("outline; {omitted} more definitions omitted by token_budget");
-    }
-    out
+/// definitions are kept, the first entry unconditionally — and the count
+/// dropped is reported, so a truncated outline reads as truncated rather than
+/// as the file's end.
+fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>, token_budget: usize) -> Outline {
+    let entries = chunks.into_iter().map(|c| {
+        // Chunks open with their doc/attribute prelude; the outline's job
+        // is the signature, which `def_line` names.
+        let signature_offset = c.def_line.saturating_sub(c.start_line);
+        let code = signature_lines(c.text.lines().skip(signature_offset));
+        ContextEntry {
+            path: path.to_string(),
+            start_line: c.start_line,
+            end_line: c.end_line,
+            language: c.language,
+            symbol: c.symbol,
+            code,
+            score: 0.0,
+            why_matched: "outline".into(),
+        }
+    });
+    let (entries, omitted) = take_within_budget(entries, token_budget, |e| {
+        crate::distill::approx_tokens(&e.code)
+    });
+    Outline { entries, omitted }
 }
 
 /// A signature through its balanced parentheses: lines are taken while the
@@ -3014,29 +3072,23 @@ mod tests {
             .await
             .unwrap();
 
-        let outline = engine.read_file("m.rs", None).await.unwrap();
+        let outline = engine.outline("m.rs").unwrap();
+        let kept = outline.entries.len();
         assert!(
-            outline.len() < 50 && !outline.is_empty(),
-            "expected a bounded prefix, got {} entries",
-            outline.len()
+            kept < 50 && kept > 0,
+            "expected a bounded prefix, got {kept} entries"
         );
         assert!(
-            outline[0].code.contains("function_number_000"),
+            outline.entries[0].code.contains("function_number_000"),
             "the outline keeps file order, starting at the top"
         );
-        let last = outline.last().unwrap();
-        let omitted = 50 - outline.len();
-        assert_eq!(
-            last.why_matched,
-            format!("outline; {omitted} more definitions omitted by token_budget"),
-            "the last retained entry names the cut: {last:#?}"
-        );
+        assert_eq!(outline.omitted, 50 - kept, "the cut is counted");
         assert!(
-            outline[..outline.len() - 1]
-                .iter()
-                .all(|e| e.why_matched == "outline"),
-            "only the last entry carries the note"
+            outline.entries.iter().all(|e| e.why_matched == "outline"),
+            "the count is typed, not smuggled through why_matched"
         );
+        let plain = engine.read_file("m.rs", None).await.unwrap();
+        assert_eq!(plain.len(), kept, "read_file(None) applies the same cut");
     }
 
     #[tokio::test]
@@ -3052,13 +3104,10 @@ mod tests {
         let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
             .await
             .unwrap();
-        let outline = engine.read_file("m.rs", None).await.unwrap();
-        assert_eq!(outline.len(), 1, "{outline:#?}");
-        assert!(outline[0].code.contains("a_rather_long_signature"));
-        assert_eq!(
-            outline[0].why_matched,
-            "outline; 1 more definitions omitted by token_budget"
-        );
+        let outline = engine.outline("m.rs").unwrap();
+        assert_eq!(outline.entries.len(), 1, "{outline:#?}");
+        assert!(outline.entries[0].code.contains("a_rather_long_signature"));
+        assert_eq!(outline.omitted, 1);
     }
 
     #[tokio::test]
@@ -3184,5 +3233,91 @@ mod tests {
         );
         assert_eq!(map.files.len() + map.omitted_files, 20);
         assert_eq!(map.files[0].path, "module_number_00.rs", "cut from the end");
+    }
+
+    #[tokio::test]
+    async fn map_merges_generic_and_path_qualified_impls_into_one_name() {
+        // `impl<T> Foo<T>` and `impl Display for Foo<u8>` are spellings of
+        // `Foo`; `impl Bar for other::Baz` is a header that lists as `Baz`,
+        // not a member of a nonexistent `other`.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join("m.rs"),
+            "pub struct Foo<T>(T);\n\
+             impl<T> Foo<T> {\n\
+             \x20   pub fn new(t: T) -> Self { Self(t) }\n\
+             }\n\
+             impl std::fmt::Display for Foo<u8> {\n\
+             \x20   fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n\
+             }\n\
+             impl Bar for other::Baz {\n\
+             \x20   fn go(&self) {}\n\
+             }\n",
+        )
+        .unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        let map = engine.map(None).await.unwrap();
+        let names: Vec<(&str, usize)> = map.files[0]
+            .symbols
+            .iter()
+            .map(|m| (m.name.as_str(), m.members))
+            .collect();
+        assert_eq!(names, [("Foo", 2), ("Baz", 1)], "{:#?}", map.files[0]);
+    }
+
+    #[test]
+    fn bare_name_strips_generics_paths_and_references() {
+        assert_eq!(bare_name("Foo"), "Foo");
+        assert_eq!(bare_name("Foo<T>"), "Foo");
+        assert_eq!(bare_name("Foo<Vec<T>>"), "Foo");
+        assert_eq!(bare_name("fmt::Formatter"), "Formatter");
+        assert_eq!(bare_name("a::b::C<'x>"), "C");
+        assert_eq!(bare_name("&mut Foo<T>"), "Foo");
+        assert_eq!(bare_name("&Foo"), "Foo");
+    }
+
+    #[test]
+    fn prefix_matches_a_path_component_not_a_string_prefix() {
+        assert!(under_prefix("src/a.rs", ""));
+        assert!(under_prefix("src/a.rs", "src"));
+        assert!(under_prefix("src/a.rs", "src/"));
+        assert!(under_prefix("src", "src"));
+        assert!(!under_prefix("src_old/a.rs", "src"));
+        assert!(!under_prefix("srcgen.rs", "src"));
+        assert!(
+            !under_prefix("src_old/a.rs", "src_"),
+            "no trailing slash, no component"
+        );
+        assert!(!under_prefix("lib/src/a.rs", "src"));
+    }
+
+    #[tokio::test]
+    async fn map_prefix_does_not_admit_sibling_dirs_sharing_a_string_prefix() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::create_dir_all(repo.path().join("src_old")).unwrap();
+        fs::write(repo.path().join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(repo.path().join("src_old/b.rs"), "pub fn b() {}\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+        let map = engine.map(Some("src")).await.unwrap();
+        let paths: Vec<_> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/a.rs"]);
+        assert_eq!(map.omitted_files, 0, "src_old is not an omitted file");
+    }
+
+    #[test]
+    fn budget_cut_keeps_the_first_item_and_counts_the_rest() {
+        let (kept, omitted) = take_within_budget([10usize, 5, 5, 5], 12, |c| *c);
+        assert_eq!((kept, omitted), (vec![10], 3), "first always kept");
+        let (kept, omitted) = take_within_budget([3usize, 3, 3, 3], 9, |c| *c);
+        assert_eq!((kept, omitted), (vec![3, 3, 3], 1));
+        let (kept, omitted) = take_within_budget([0usize, 3], 1, |c| *c);
+        assert_eq!(
+            (kept, omitted),
+            (vec![0], 1),
+            "a free first item is not a second pass"
+        );
+        let (kept, omitted) = take_within_budget(Vec::<usize>::new(), 1, |c| *c);
+        assert_eq!((kept, omitted), (vec![], 0));
     }
 }

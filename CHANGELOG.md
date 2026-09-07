@@ -13,7 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   folded under each `impl`/class. Built from the index's stored path and symbol
   columns alone (no text, no vectors, no embedding call), always-fresh and
   exclude-filtered like `search`, and bounded by `token_budget` with the omitted
-  file count reported. `path_prefix` narrows it to one subtree.
+  file count reported. `path_prefix` narrows it to one subtree (matched on a
+  path component, so `src` does not admit `src_old/`). A type's generic and
+  path-qualified `impl` spellings merge into one name.
 - **Chunks are split to fit the endpoint's context window, and the budget is
   measured rather than guessed.** A single oversized input is rejected with a 400,
   and because a failed file's hash is never stored, a chunk that could never be

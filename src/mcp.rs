@@ -1,7 +1,7 @@
-//! MCP server over stdio: exposes `search` and `read_file`.
+//! MCP server over stdio: exposes `map`, `search`, `read_file` and `diagnostics`.
 use crate::config::Config;
 use crate::distill::ContextEntry;
-use crate::engine::{LazyEngine, RepoMap};
+use crate::engine::{LazyEngine, Outline, RepoMap};
 use crate::error::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -124,10 +124,15 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
     ) -> String {
         match self.engine.get().await {
             Err(e) => format!("omniscient error: engine init failed: {e}"),
-            Ok(engine) => match engine.read_file(&path, focus.as_deref()).await {
-                Ok(entries) if focus.is_none() => render_outline(&path, &entries),
-                Ok(entries) => render(&entries),
-                Err(e) => format!("omniscient error: {e}"),
+            Ok(engine) => match focus.as_deref() {
+                None => match engine.outline(&path) {
+                    Ok(outline) => render_outline(&path, &outline),
+                    Err(e) => format!("omniscient error: {e}"),
+                },
+                Some(f) => match engine.read_file(&path, Some(f)).await {
+                    Ok(entries) => render(&entries),
+                    Err(e) => format!("omniscient error: {e}"),
+                },
             },
         }
     }
@@ -141,8 +146,8 @@ Use when: starting architectural research ('what is the shape of this thing'), c
 file to `read_file`, or checking whether a module exists before searching for it. Narrow with \
 `path_prefix` on a large repo. Bounded by the token budget: path-sorted, and when cut short the \
 last line says how many files were omitted — narrow the prefix to see them. Avoid when: you \
-need bodies or line-level detail (use `read_file`), or you need test files and lock files, which \
-are not indexed."
+need bodies or line-level detail (use `read_file`), or you need lock files or (unless \
+`index_tests` is set) test files, which are not indexed."
     )]
     async fn map(&self, Parameters(MapParams { path_prefix }): Parameters<MapParams>) -> String {
         match self.engine.get().await {
@@ -239,10 +244,11 @@ fn render(entries: &[ContextEntry]) -> String {
 /// an outline has none, so it renders as a plain list: `L<start>-<end>  <sig>`,
 /// with a wrapped signature's continuation lines indented under the first and
 /// the member symbol (`Engine::search`) appended only when the signature line
-/// does not already contain it. A budget cut is reported on a trailing line
-/// rather than lost — the engine notes it in the last entry's `why_matched`.
-fn render_outline(path: &str, entries: &[ContextEntry]) -> String {
+/// does not already contain it. A budget cut (`Outline::omitted`) is reported
+/// on a trailing line rather than lost.
+fn render_outline(path: &str, outline: &Outline) -> String {
     use std::fmt::Write;
+    let entries = &outline.entries;
     if entries.is_empty() {
         return format!("{path}: no definitions.");
     }
@@ -262,12 +268,12 @@ fn render_outline(path: &str, entries: &[ContextEntry]) -> String {
             let _ = writeln!(out, "{:<12}{cont}", "");
         }
     }
-    if let Some(note) = entries
-        .last()
-        .map(|e| e.why_matched.as_str())
-        .filter(|w| *w != "outline")
-    {
-        let _ = writeln!(out, "… {}", note.trim_start_matches("outline; "));
+    if outline.omitted > 0 {
+        let _ = writeln!(
+            out,
+            "… {} more definitions omitted by token_budget",
+            outline.omitted
+        );
     }
     out
 }
@@ -382,7 +388,7 @@ mod tests {
     use crate::config::{Config, WatchConfig};
     use crate::embed::MockEmbedder;
     use crate::engine::{Engine, LazyEngine};
-    use crate::engine::{FileSymbols, MapSymbol};
+    use crate::engine::{FileSymbols, MapSymbol, Outline};
     use crate::refresh::RefreshState;
     use std::sync::Arc;
     use std::time::Duration;
@@ -485,7 +491,13 @@ mod tests {
             ),
             entry(1, 3, None, "use std::sync::Arc;", "outline"),
         ];
-        let out = render_outline("src/engine.rs", &entries);
+        let out = render_outline(
+            "src/engine.rs",
+            &Outline {
+                entries,
+                omitted: 0,
+            },
+        );
         assert_eq!(
             out,
             "src/engine.rs — 3 definitions\n\
@@ -503,15 +515,15 @@ mod tests {
     fn outline_reports_a_budget_cut_on_a_trailing_line() {
         let entries = vec![
             entry(1, 1, Some("a"), "fn a() {}", "outline"),
-            entry(
-                2,
-                2,
-                Some("b"),
-                "fn b() {}",
-                "outline; 40 more definitions omitted by token_budget",
-            ),
+            entry(2, 2, Some("b"), "fn b() {}", "outline"),
         ];
-        let out = render_outline("m.rs", &entries);
+        let out = render_outline(
+            "m.rs",
+            &Outline {
+                entries,
+                omitted: 40,
+            },
+        );
         assert!(
             out.ends_with("… 40 more definitions omitted by token_budget\n"),
             "got:\n{out}"
@@ -599,7 +611,14 @@ mod tests {
 
     #[test]
     fn outline_of_an_empty_file_says_so() {
-        assert_eq!(render_outline("empty.rs", &[]), "empty.rs: no definitions.");
+        let empty = Outline {
+            entries: vec![],
+            omitted: 0,
+        };
+        assert_eq!(
+            render_outline("empty.rs", &empty),
+            "empty.rs: no definitions."
+        );
     }
 
     #[tokio::test]
