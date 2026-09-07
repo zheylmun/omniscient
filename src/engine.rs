@@ -895,6 +895,120 @@ fn chunks_for_embedding(
     Ok((chunks, largest))
 }
 
+/// One top-level definition in the repo map: its name, span, and how many
+/// member definitions (`Engine::search`, `C.m`) the index holds under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapSymbol {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub members: usize,
+}
+
+/// One indexed file in the repo map with its top-level symbols in file order.
+/// A file the index holds only as line windows (docs, config) has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSymbols {
+    pub path: String,
+    pub symbols: Vec<MapSymbol>,
+}
+
+/// The shape of the indexed repo: every file, with its top-level symbols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoMap {
+    pub files: Vec<FileSymbols>,
+    /// Files past `token_budget`, dropped from the END of the path-sorted list.
+    pub omitted_files: usize,
+}
+
+impl Engine {
+    /// The indexed file list with each file's top-level symbols — repo-level
+    /// orientation, built entirely from the `path` + `symbol` columns the index
+    /// already stores, so it costs no embedding call. Always-fresh like every
+    /// other read, filtered through the same exclude matcher as `search`, and
+    /// bounded by `token_budget`: files are path-sorted and the cut drops from
+    /// the end, reported in `omitted_files`. `prefix` narrows to one subtree.
+    pub async fn map(&self, prefix: Option<&str>) -> Result<RepoMap> {
+        self.ensure_fresh().await?;
+        let rows = tokio::time::timeout(self.query_timeout(), self.index.symbol_rows())
+            .await
+            .map_err(|_| self.query_timeout_err())??;
+        let prefix = prefix.unwrap_or_default().trim_start_matches("./");
+
+        let mut by_path: std::collections::BTreeMap<String, Vec<crate::index::SymbolRow>> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            if !r.path.starts_with(prefix) || is_excluded(&self.matcher, &r.path) {
+                continue;
+            }
+            by_path.entry(r.path.clone()).or_default().push(r);
+        }
+
+        let mut files = Vec::new();
+        let mut used = 0usize;
+        let mut omitted_files = 0usize;
+        for (path, mut rows) in by_path {
+            rows.sort_by_key(|r| r.chunk_index);
+            let file = FileSymbols {
+                symbols: top_level_symbols(&rows),
+                path,
+            };
+            let cost = map_cost(&file);
+            if files.is_empty() || used + cost <= self.config.search.token_budget {
+                used += cost;
+                files.push(file);
+            } else {
+                omitted_files += 1;
+            }
+        }
+        Ok(RepoMap {
+            files,
+            omitted_files,
+        })
+    }
+}
+
+/// A symbol is a member when it is qualified with a container name — `::` for
+/// Rust, `.` for the others — the form `chunk` gives every member chunk. Members
+/// are folded into their parent's count; a member whose parent the index holds
+/// no header for (a Python method whose class chunk was elided, say) is dropped
+/// rather than promoted, because the map is a list of *top-level* names.
+///
+/// One name, one line: a struct and its several `impl` blocks all carry the
+/// type's name, and `Engine, Engine (+28), Engine (+1)` says nothing that
+/// `Engine (+29)` does not. Repeats merge into the first occurrence, which
+/// keeps its span and accumulates the member count.
+fn top_level_symbols(rows: &[crate::index::SymbolRow]) -> Vec<MapSymbol> {
+    let mut out: Vec<MapSymbol> = Vec::new();
+    for r in rows {
+        let Some(sym) = r.symbol.as_deref() else {
+            continue;
+        };
+        match sym.rsplit_once("::").or_else(|| sym.rsplit_once('.')) {
+            Some((parent, _)) => {
+                if let Some(p) = out.iter_mut().find(|m| m.name == parent) {
+                    p.members += 1;
+                }
+            }
+            None if out.iter().any(|m| m.name == sym) => {}
+            None => out.push(MapSymbol {
+                name: sym.to_string(),
+                start_line: r.start_line,
+                end_line: r.end_line,
+                members: 0,
+            }),
+        }
+    }
+    out
+}
+
+/// Approximate rendered cost of one map line: the path plus each symbol name
+/// and its separator. An estimate in the same units as every other budget.
+fn map_cost(file: &FileSymbols) -> usize {
+    let names: usize = file.symbols.iter().map(|m| m.name.len() + 2).sum();
+    crate::distill::approx_tokens(&file.path) + names / 4
+}
+
 /// One entry per structural definition, carrying its signature only, in file
 /// order, bounded by `token_budget`.
 ///
@@ -2945,5 +3059,130 @@ mod tests {
             outline[0].why_matched,
             "outline; 1 more definitions omitted by token_budget"
         );
+    }
+
+    #[tokio::test]
+    async fn map_lists_indexed_files_with_top_level_symbols_and_member_counts() {
+        // Roadmap item 13: repo-level orientation from the stored path+symbol
+        // columns alone — no embedding call. Members fold into their parent's
+        // count so the map stays a list of top-level names.
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join("engine.rs"),
+            "pub struct Engine;\n\
+             impl Engine {\n\
+             \x20   pub fn search(&self) {}\n\
+             \x20   pub fn read_file(&self) {}\n\
+             }\n\
+             pub const LIMIT: usize = 5;\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("NOTES.md"), "# Notes\n\nSome prose.\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+
+        let map = engine.map(None).await.unwrap();
+        assert_eq!(map.omitted_files, 0);
+        let paths: Vec<_> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["NOTES.md", "engine.rs"],
+            "path-sorted, docs included"
+        );
+        assert!(
+            map.files[0].symbols.is_empty(),
+            "line-window files have no symbols"
+        );
+        let names: Vec<(&str, usize)> = map.files[1]
+            .symbols
+            .iter()
+            .map(|m| (m.name.as_str(), m.members))
+            .collect();
+        assert_eq!(
+            names,
+            [("Engine", 2), ("LIMIT", 0)],
+            "struct and impl header merged, methods folded in, then the const: {:#?}",
+            map.files[1]
+        );
+        let engine_sym = &map.files[1].symbols[0];
+        assert_eq!(
+            (engine_sym.start_line, engine_sym.end_line),
+            (1, 1),
+            "the first occurrence (the struct) keeps its span"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_prefix_narrows_to_a_subtree() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src/a")).unwrap();
+        fs::create_dir_all(repo.path().join("docs")).unwrap();
+        fs::write(repo.path().join("src/a/x.rs"), "pub fn x() {}\n").unwrap();
+        fs::write(repo.path().join("src/y.rs"), "pub fn y() {}\n").unwrap();
+        fs::write(repo.path().join("docs/d.md"), "# D\n").unwrap();
+        let engine = engine_for(repo.path().to_path_buf()).await;
+
+        let map = engine.map(Some("src/")).await.unwrap();
+        let paths: Vec<_> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/a/x.rs", "src/y.rs"]);
+        let map = engine.map(Some("./docs")).await.unwrap();
+        let paths: Vec<_> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["docs/d.md"], "a leading ./ is tolerated");
+    }
+
+    #[tokio::test]
+    async fn map_never_lists_an_excluded_path() {
+        // Same lag-window guarantee as search: a path the exclude policy
+        // rejects never surfaces, even while the index still holds its rows.
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(repo.path().join("data.txt"), "row 1\nrow 2\n").unwrap();
+        let first = engine_for(repo.path().to_path_buf()).await;
+        first.refresh().await.unwrap();
+        drop(first);
+
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.exclude = vec!["*.txt".into()];
+        let state = Arc::new(RefreshState::standalone());
+        let engine = Engine::with_refresh_state(
+            cfg,
+            Arc::new(MockEmbedder::new("mock-v1", 64)),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        // Pretend the watcher is caught up so map() skips the reconcile that
+        // would purge data.txt — the read-time filter must hold on its own.
+        state.set_watch_active(true);
+        state.clear_dirty();
+
+        let map = engine.map(None).await.unwrap();
+        let paths: Vec<_> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["keep.rs"]);
+    }
+
+    #[tokio::test]
+    async fn map_respects_the_token_budget_and_counts_omitted_files() {
+        let repo = tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(
+                repo.path().join(format!("module_number_{i:02}.rs")),
+                "pub fn a_long_function_name_one() {}\npub fn a_long_function_name_two() {}\n",
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.token_budget = 40;
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+
+        let map = engine.map(None).await.unwrap();
+        assert!(
+            !map.files.is_empty() && map.files.len() < 20,
+            "{}",
+            map.files.len()
+        );
+        assert_eq!(map.files.len() + map.omitted_files, 20);
+        assert_eq!(map.files[0].path, "module_number_00.rs", "cut from the end");
     }
 }

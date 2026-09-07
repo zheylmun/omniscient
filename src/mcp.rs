@@ -1,7 +1,7 @@
 //! MCP server over stdio: exposes `search` and `read_file`.
 use crate::config::Config;
 use crate::distill::ContextEntry;
-use crate::engine::LazyEngine;
+use crate::engine::{LazyEngine, RepoMap};
 use crate::error::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -38,6 +38,14 @@ struct ReadFileParams {
     /// provide it to get back only the chunks of the file most relevant to it.
     #[serde(default)]
     focus: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct MapParams {
+    /// Optional repo-relative path prefix (`src/`, `crates/core/`) to narrow the map
+    /// to one subtree. Omit for the whole repo.
+    #[serde(default)]
+    path_prefix: Option<String>,
 }
 
 #[derive(Clone)]
@@ -125,6 +133,28 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
     }
 
     #[tool(
+        description = "Repo-level orientation: the indexed file list, one line per file, with each \
+file's top-level definitions (`path: Sym, Sym (+N)` — `+N` counts the members folded under an impl \
+or class). Built from the index alone, so it costs no embedding call and is cheap to call first.\n\
+\n\
+Use when: starting architectural research ('what is the shape of this thing'), choosing which \
+file to `read_file`, or checking whether a module exists before searching for it. Narrow with \
+`path_prefix` on a large repo. Bounded by the token budget: path-sorted, and when cut short the \
+last line says how many files were omitted — narrow the prefix to see them. Avoid when: you \
+need bodies or line-level detail (use `read_file`), or you need test files and lock files, which \
+are not indexed."
+    )]
+    async fn map(&self, Parameters(MapParams { path_prefix }): Parameters<MapParams>) -> String {
+        match self.engine.get().await {
+            Err(e) => format!("omniscient error: engine init failed: {e}"),
+            Ok(engine) => match engine.map(path_prefix.as_deref()).await {
+                Ok(map) => render_map(path_prefix.as_deref(), &map),
+                Err(e) => format!("omniscient error: {e}"),
+            },
+        }
+    }
+
+    #[tool(
         description = "Self-test the omniscient server end-to-end and return a PASS/FAIL \
 report: embedder connectivity, index population, and a live sample query. Call this once before \
 relying on `search` — if it reports FAIL, tell the user what failed instead of silently skipping \
@@ -146,7 +176,8 @@ impl ServerHandler for Server {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("omniscient", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Local semantic code search (omniscient). Tools: search, read_file, diagnostics.\n\
+                "Local semantic code search (omniscient). Tools: map, search, read_file, \
+                 diagnostics.\n\
                  Before relying on search, call `diagnostics` once to confirm the server is \
                  healthy. If it reports FAIL, tell the user what failed instead of skipping \
                  omniscient — do not silently ignore search errors.",
@@ -241,6 +272,50 @@ fn render_outline(path: &str, entries: &[ContextEntry]) -> String {
     out
 }
 
+/// The repo map: one line per file, its top-level symbols comma-separated, a
+/// container's member count as `(+N)`. Files the index holds only as line
+/// windows list as a bare path — the path itself is the orientation.
+fn render_map(prefix: Option<&str>, map: &RepoMap) -> String {
+    use std::fmt::Write;
+    let scope = prefix
+        .filter(|p| !p.is_empty())
+        .map_or(String::new(), |p| format!(" under {p}"));
+    if map.files.is_empty() {
+        return format!("No indexed files{scope}.");
+    }
+    let defs: usize = map.files.iter().map(|f| f.symbols.len()).sum();
+    let mut out = format!(
+        "repo map{scope} — {} files, {defs} top-level definitions\n",
+        map.files.len()
+    );
+    for f in &map.files {
+        let syms: Vec<String> = f
+            .symbols
+            .iter()
+            .map(|m| {
+                if m.members > 0 {
+                    format!("{} (+{})", m.name, m.members)
+                } else {
+                    m.name.clone()
+                }
+            })
+            .collect();
+        if syms.is_empty() {
+            let _ = writeln!(out, "{}", f.path);
+        } else {
+            let _ = writeln!(out, "{}: {}", f.path, syms.join(", "));
+        }
+    }
+    if map.omitted_files > 0 {
+        let _ = writeln!(
+            out,
+            "… {} more files omitted by token_budget — narrow with path_prefix",
+            map.omitted_files
+        );
+    }
+    out
+}
+
 /// Holds the live filesystem watcher (once its deferred setup finishes). Dropping
 /// it stops watching and aborts the reconcile task, so `serve` keeps it to shutdown.
 type WatcherSlot = std::sync::Arc<std::sync::Mutex<Option<crate::watcher::WatchGuard>>>;
@@ -307,6 +382,7 @@ mod tests {
     use crate::config::{Config, WatchConfig};
     use crate::embed::MockEmbedder;
     use crate::engine::{Engine, LazyEngine};
+    use crate::engine::{FileSymbols, MapSymbol};
     use crate::refresh::RefreshState;
     use std::sync::Arc;
     use std::time::Duration;
@@ -439,6 +515,85 @@ mod tests {
         assert!(
             out.ends_with("… 40 more definitions omitted by token_budget\n"),
             "got:\n{out}"
+        );
+    }
+
+    fn file(path: &str, symbols: &[(&str, usize)]) -> FileSymbols {
+        FileSymbols {
+            path: path.into(),
+            symbols: symbols
+                .iter()
+                .map(|(name, members)| MapSymbol {
+                    name: (*name).into(),
+                    start_line: 1,
+                    end_line: 1,
+                    members: *members,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn map_renders_one_line_per_file_with_member_counts() {
+        let map = RepoMap {
+            files: vec![
+                file("README.md", &[]),
+                file("src/engine.rs", &[("Engine", 27), ("OVERFETCH_FACTOR", 0)]),
+            ],
+            omitted_files: 0,
+        };
+        assert_eq!(
+            render_map(None, &map),
+            "repo map — 2 files, 2 top-level definitions\n\
+             README.md\n\
+             src/engine.rs: Engine (+27), OVERFETCH_FACTOR\n"
+        );
+    }
+
+    #[test]
+    fn map_reports_scope_and_a_budget_cut() {
+        let map = RepoMap {
+            files: vec![file("src/a.rs", &[("a", 0)])],
+            omitted_files: 7,
+        };
+        let out = render_map(Some("src/"), &map);
+        assert!(out.starts_with("repo map under src/ — 1 files"), "{out}");
+        assert!(
+            out.ends_with("… 7 more files omitted by token_budget — narrow with path_prefix\n"),
+            "{out}"
+        );
+        assert_eq!(
+            render_map(
+                Some("nope/"),
+                &RepoMap {
+                    files: vec![],
+                    omitted_files: 0
+                }
+            ),
+            "No indexed files under nope/."
+        );
+    }
+
+    #[tokio::test]
+    async fn map_tool_is_listed_and_renders_the_repo() {
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let server = Server::new(lazy_for(&cfg, &state).await);
+        let names: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(names.contains(&"map".to_string()), "tools: {names:?}");
+        let out = server
+            .map(Parameters(MapParams { path_prefix: None }))
+            .await;
+        assert_eq!(
+            out,
+            "repo map — 1 files, 1 top-level definitions\na.rs: a\n"
         );
     }
 

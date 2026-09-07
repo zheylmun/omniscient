@@ -1,11 +1,12 @@
 # omniscient
 
-A local semantic and distilled code search MCP server for Claude Code and other MCP clients. omniscient indexes your repository with tree-sitter-based chunking and vector embeddings, then exposes two tools over stdio: `search` and `read_file`.
+A local semantic and distilled code search MCP server for Claude Code and other MCP clients. omniscient indexes your repository with tree-sitter-based chunking and vector embeddings, then exposes three tools over stdio: `map`, `search`, and `read_file` (plus `diagnostics`, a self-test).
 
 ## Tools
 
+- **`map(path_prefix?)`** — Repo-level orientation: the indexed file list, one line per file, with each file's top-level definitions and the member count folded under each `impl`/class (`src/engine.rs: Engine, Engine (+27), OVERFETCH_FACTOR`). Built from the index's stored path and symbol columns alone, so it costs no embedding call. Bounded by `token_budget` (path-sorted, cut from the end, with the omitted count reported); `path_prefix` narrows it to one subtree.
 - **`search(query, k?)`** — Semantic search over your codebase by meaning, not literal tokens. Returns ranked, distilled snippets (`file:line` + code body + a relevance note), selected by the *shape* of the relevance scores rather than a fixed count: every hit within `relevance_ratio` of the top hit is returned, so a sharp query yields a few results and a broad one yields more. `k` is an optional ceiling on candidates (it overrides `max_results` for the call), not a target. The index is refreshed before each search (see below). The corpus is implementation source, docs, build scripts, and config — it **excludes** test code and dependency lock files by design (`examples/` is kept); use a grep/text tool for exhaustive "every occurrence" sweeps or known-symbol lookups.
-- **`read_file(path, focus?)`** — A noise-stripped view of one file, read live from disk (so it reflects uncommitted edits). Without `focus`, a structural outline: every definition's signature and line range with bodies elided. With `focus` (a natural-language description), only the chunks of that file most relevant to it.
+- **`read_file(path, focus?)`** — A noise-stripped view of one file, read live from disk (so it reflects uncommitted edits). Without `focus`, a structural outline: one line per definition (`L<start>-<end>  <signature>`, no fences), bodies elided, bounded by `token_budget` with the omitted count reported. With `focus` (a natural-language description), only the chunks of that file most relevant to it.
 
 ## Always-Fresh Guarantee
 
