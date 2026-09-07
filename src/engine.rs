@@ -654,7 +654,11 @@ impl Engine {
         let source = std::fs::read_to_string(&abs)?;
         let chunks = chunk_file(Path::new(path), &source, MAX_WINDOW_LINES)?;
         match focus {
-            None => Ok(outline_entries(path, chunks)),
+            None => Ok(outline_entries(
+                path,
+                chunks,
+                self.config.search.token_budget,
+            )),
             Some(f) => self.focus_entries(path, f, &source, chunks).await,
         }
     }
@@ -891,13 +895,26 @@ fn chunks_for_embedding(
     Ok((chunks, largest))
 }
 
-/// One entry per structural definition, carrying its signature only.
+/// One entry per structural definition, carrying its signature only, in file
+/// order, bounded by `token_budget`.
 ///
 /// Deliberately NOT split for embedding: showing whole definitions is the
 /// outline's contract, and splitting here is what once produced entries whose
 /// "signature" was a fragment of some body.
-fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>) -> Vec<ContextEntry> {
-    chunks
+///
+/// The budget binds here as it does on every other read. The outline has no
+/// relevance shape to cut on, so the cut is positional — the file's first
+/// definitions are kept, the first entry unconditionally — and the last
+/// retained entry says how many were dropped, so a truncated outline reads as
+/// truncated rather than as the file's end.
+fn outline_entries(
+    path: &str,
+    chunks: Vec<crate::chunk::Chunk>,
+    token_budget: usize,
+) -> Vec<ContextEntry> {
+    let total = chunks.len();
+    let mut used = 0usize;
+    let mut out: Vec<ContextEntry> = chunks
         .into_iter()
         .map(|c| {
             // Chunks open with their doc/attribute prelude; the outline's job
@@ -915,7 +932,18 @@ fn outline_entries(path: &str, chunks: Vec<crate::chunk::Chunk>) -> Vec<ContextE
                 why_matched: "outline".into(),
             }
         })
-        .collect()
+        .take_while(|e| {
+            let cost = crate::distill::approx_tokens(&e.code);
+            let fits = used == 0 || used + cost <= token_budget;
+            used += cost;
+            fits
+        })
+        .collect();
+    let omitted = total - out.len();
+    if let Some(last) = out.last_mut().filter(|_| omitted > 0) {
+        last.why_matched = format!("outline; {omitted} more definitions omitted by token_budget");
+    }
+    out
 }
 
 /// A signature through its balanced parentheses: lines are taken while the
@@ -2846,5 +2874,76 @@ mod tests {
             "derived value is capped"
         );
         assert_eq!(resolve_concurrency(Some(0), None), 1, "never zero");
+    }
+
+    #[tokio::test]
+    async fn outline_respects_the_token_budget_and_says_what_it_dropped() {
+        // The outline is bounded by `token_budget` like every other read: a
+        // file with thousands of definitions must not return an unbounded
+        // list. The cut keeps the first definitions (file order is the
+        // outline's contract) and the last retained entry says how many were
+        // dropped, so the agent knows the shape is incomplete rather than
+        // believing the file ends there.
+        let repo = tempdir().unwrap();
+        let mut src = String::new();
+        for i in 0..50 {
+            use std::fmt::Write;
+            let _ = writeln!(
+                src,
+                "pub fn function_number_{i:03}(argument: u32) -> u32 {{ argument }}"
+            );
+        }
+        fs::write(repo.path().join("m.rs"), &src).unwrap();
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.token_budget = 60; // ~4 signatures of ~15 tokens each
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+
+        let outline = engine.read_file("m.rs", None).await.unwrap();
+        assert!(
+            outline.len() < 50 && !outline.is_empty(),
+            "expected a bounded prefix, got {} entries",
+            outline.len()
+        );
+        assert!(
+            outline[0].code.contains("function_number_000"),
+            "the outline keeps file order, starting at the top"
+        );
+        let last = outline.last().unwrap();
+        let omitted = 50 - outline.len();
+        assert_eq!(
+            last.why_matched,
+            format!("outline; {omitted} more definitions omitted by token_budget"),
+            "the last retained entry names the cut: {last:#?}"
+        );
+        assert!(
+            outline[..outline.len() - 1]
+                .iter()
+                .all(|e| e.why_matched == "outline"),
+            "only the last entry carries the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn outline_always_keeps_the_first_definition() {
+        let repo = tempdir().unwrap();
+        fs::write(
+            repo.path().join("m.rs"),
+            "pub fn a_rather_long_signature(x: u32, y: u32, z: u32) -> u32 { 0 }\npub fn b() {}\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default_for(repo.path().to_path_buf());
+        cfg.search.token_budget = 1;
+        let engine = Engine::new_with_embedder(cfg, Arc::new(MockEmbedder::new("mock-v1", 64)))
+            .await
+            .unwrap();
+        let outline = engine.read_file("m.rs", None).await.unwrap();
+        assert_eq!(outline.len(), 1, "{outline:#?}");
+        assert!(outline[0].code.contains("a_rather_long_signature"));
+        assert_eq!(
+            outline[0].why_matched,
+            "outline; 1 more definitions omitted by token_budget"
+        );
     }
 }

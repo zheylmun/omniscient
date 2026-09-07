@@ -100,8 +100,10 @@ surface as low-relevance noise."
 
     #[tool(
         description = "View of one file, read live from disk. Without `focus`: a structural \
-outline — every type/impl/fn signature with its line range, bodies elided — a cheap way to grasp a large file's shape before reading it in \
-full. With `focus` (a natural-language description): returns only the parts relevant to it.\n\
+outline — one line per definition (`L<start>-<end>  <signature>`, file order, no fences) for every type/impl/fn/const, bodies elided — a \
+cheap way to grasp a large file's shape before reading it in full. The outline is bounded by the token budget; when it is cut short, \
+the last line says how many definitions were omitted. With `focus` (a natural-language description): returns only the parts relevant \
+to it, as fenced code.\n\
 \n\
 Use when: orienting in an unfamiliar or large file (outline), or extracting the relevant slice \
 of a big file without paying to read the whole thing (focus). Avoid when: you need exact, \
@@ -115,6 +117,7 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
         match self.engine.get().await {
             Err(e) => format!("omniscient error: engine init failed: {e}"),
             Ok(engine) => match engine.read_file(&path, focus.as_deref()).await {
+                Ok(entries) if focus.is_none() => render_outline(&path, &entries),
                 Ok(entries) => render(&entries),
                 Err(e) => format!("omniscient error: {e}"),
             },
@@ -193,6 +196,47 @@ fn render(entries: &[ContextEntry]) -> String {
             "{}:{}-{}{} ({})\n```{}\n{}\n```\n\n",
             e.path, e.start_line, e.end_line, sym, e.why_matched, e.language, e.code
         );
+    }
+    out
+}
+
+/// The compact outline form: one line per definition, no fences.
+///
+/// The fenced `render` spends ~4 lines of scaffolding per entry — header,
+/// opening fence, closing fence, blank — which for an outline is four times
+/// the payload, since each entry is a one-line signature. Fences are for bodies;
+/// an outline has none, so it renders as a plain list: `L<start>-<end>  <sig>`,
+/// with a wrapped signature's continuation lines indented under the first and
+/// the member symbol (`Engine::search`) appended only when the signature line
+/// does not already contain it. A budget cut is reported on a trailing line
+/// rather than lost — the engine notes it in the last entry's `why_matched`.
+fn render_outline(path: &str, entries: &[ContextEntry]) -> String {
+    use std::fmt::Write;
+    if entries.is_empty() {
+        return format!("{path}: no definitions.");
+    }
+    let mut out = format!("{path} — {} definitions\n", entries.len());
+    for e in entries {
+        let range = format!("L{}-{}", e.start_line, e.end_line);
+        let mut lines = e.code.lines();
+        let first = lines.next().unwrap_or_default();
+        let sym = e
+            .symbol
+            .as_deref()
+            .filter(|s| !first.contains(s))
+            .map(|s| format!("  [{s}]"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "{range:<12}{first}{sym}");
+        for cont in lines {
+            let _ = writeln!(out, "{:<12}{cont}", "");
+        }
+    }
+    if let Some(note) = entries
+        .last()
+        .map(|e| e.why_matched.as_str())
+        .filter(|w| *w != "outline")
+    {
+        let _ = writeln!(out, "… {}", note.trim_start_matches("outline; "));
     }
     out
 }
@@ -329,6 +373,78 @@ mod tests {
             "no watcher should be created when watching is disabled"
         );
         assert!(!state.is_watch_active());
+    }
+
+    fn entry(
+        start: usize,
+        end: usize,
+        symbol: Option<&str>,
+        code: &str,
+        why: &str,
+    ) -> ContextEntry {
+        ContextEntry {
+            path: "src/engine.rs".into(),
+            start_line: start,
+            end_line: end,
+            language: "rust".into(),
+            symbol: symbol.map(str::to_string),
+            code: code.into(),
+            score: 0.0,
+            why_matched: why.into(),
+        }
+    }
+
+    #[test]
+    fn outline_renders_one_line_per_definition_without_fences() {
+        // Roadmap item 11: the fenced form spends four lines of scaffolding
+        // on a one-line signature. The outline is a list, not a code view.
+        let entries = vec![
+            entry(124, 721, Some("Engine"), "impl Engine {", "outline"),
+            entry(
+                130,
+                145,
+                Some("Engine::new"),
+                "pub async fn new(\n    cfg: Config,\n) -> Result<Self> {",
+                "outline",
+            ),
+            entry(1, 3, None, "use std::sync::Arc;", "outline"),
+        ];
+        let out = render_outline("src/engine.rs", &entries);
+        assert_eq!(
+            out,
+            "src/engine.rs — 3 definitions\n\
+             L124-721    impl Engine {\n\
+             L130-145    pub async fn new(  [Engine::new]\n\
+             \x20               cfg: Config,\n\
+             \x20           ) -> Result<Self> {\n\
+             L1-3        use std::sync::Arc;\n",
+            "got:\n{out}"
+        );
+        assert!(!out.contains("```"), "no fences in the outline");
+    }
+
+    #[test]
+    fn outline_reports_a_budget_cut_on_a_trailing_line() {
+        let entries = vec![
+            entry(1, 1, Some("a"), "fn a() {}", "outline"),
+            entry(
+                2,
+                2,
+                Some("b"),
+                "fn b() {}",
+                "outline; 40 more definitions omitted by token_budget",
+            ),
+        ];
+        let out = render_outline("m.rs", &entries);
+        assert!(
+            out.ends_with("… 40 more definitions omitted by token_budget\n"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outline_of_an_empty_file_says_so() {
+        assert_eq!(render_outline("empty.rs", &[]), "empty.rs: no definitions.");
     }
 
     #[tokio::test]

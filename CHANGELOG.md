@@ -35,6 +35,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`read_file`'s outline is a compact list, and it is bounded by `token_budget`.**
+  The outline used to render like search results — a header, an opening fence,
+  the signature, a closing fence, and a blank line per definition — about four
+  lines of scaffolding for every one line of signature. It is now one line per
+  definition (`L<start>-<end>  <signature>`, wrapped signatures indented under
+  their first line, the member symbol appended when the signature line does not
+  already name it), roughly a 70% reduction. Fences remain for `search` and for
+  focus reads, where the body is real code. The outline was also the one read
+  path `token_budget` did not bind; it now does, keeping the file's first
+  definitions and reporting on a trailing line how many were omitted, so a cut
+  outline reads as cut rather than as the end of the file.
 - **The default embedding model is now Qwen3-Embedding-0.6B (Q8_0, ~640 MB)**,
   down from 4B. It runs on CPU or an integrated GPU, so the out-of-the-box
   configuration works on an ordinary developer machine rather than requiring a
