@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes three stdio tools — `search(query, k?)`, `read_file(path, focus?)`, and `diagnostics()` (an end-to-end self-test). `diagnostics` runs only on explicit call, never on the connect handshake, so the fast-handshake invariant is preserved. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
+`omniscient` is a local MCP server (single Rust binary, edition 2024) that gives MCP clients **semantic, distilled** code search. It indexes a repo into a local LanceDB vector store and exposes four stdio tools — `map(path_prefix?)` (the indexed file list with top-level symbols, from the index alone), `search(query, k?)`, `read_file(path, focus?)`, and `diagnostics()` (an end-to-end self-test). `diagnostics` runs only on explicit call, never on the connect handshake, so the fast-handshake invariant is preserved. Embeddings are computed by an **external** local llama.cpp `/v1/embeddings` endpoint; there is no in-process inference.
 
 ## Commands
 
@@ -47,7 +47,8 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 - **`distill`** — deterministic, NO LLM: merges overlapping hits, strips noise, trims to a token budget.
 - **`watcher`** — optional background filesystem watcher (`notify-debouncer-full`); debounced FS events outside `.omniscient/` mark the index dirty and wake an async reconcile task. A `WatchGuard` keeps the OS watcher alive and aborts the task on drop.
 - **`refresh`** — `RefreshState`: the `dirty`/`watch_active` atomics + reconcile mutex shared by the watcher and `Engine`. `can_skip_scan()` (watcher active AND not dirty) is the gate that lets `search` skip its scan.
-- **`mcp`** — rmcp stdio server. **`cli`** — clap (`serve`/`status`/`reindex`).
+- **`mcp`** — rmcp stdio server. Renders three shapes: fenced entries for `search` and focus reads (real code bodies), a fence-free `L<start>-<end>  <signature>` list for the outline, and a one-line-per-file list for `map`. **`cli`** — clap (`serve`/`status`/`reindex`).
+- **`Engine::map`** reads only the index's `path`/`symbol` columns (`Index::symbol_rows`, no text or vectors), goes through `ensure_fresh` and the exclude matcher like `search`, and folds member symbols (`Engine::search`, `C.m`) into their parent's count so the map stays a list of top-level names. Names merge by `bare_name` — generic arguments, a leading path and a reference sigil stripped — so `impl<T> Foo<T>` and `impl Display for Foo<u8>` are one `Foo`, and a qualified header with no listed parent (`impl Bar for other::Baz`) lists as `Baz` rather than being dropped as an orphan member. `path_prefix` matches on a path *component* (`src` admits `src/`, not `src_old/`).
 
 ### Invariants you must not break
 
@@ -102,6 +103,8 @@ freshness::scan  →  chunk::chunk_file  →  embed::Embedder  →  index (Lance
 `diagnostics()` reports the probed window *and which probe answered it* (`from /props` / `from /v1/models` / `not reported — falling back to [embedder] max_chunk_tokens = N`), the effective byte budget and whether an overflow has tightened it, the derived embed concurrency and the slot count it came from, and any files the last reconcile failed on — so a misconfigured router is visible rather than inferred.
 
 **Authenticated endpoints:** `[embedder] api_key` sets the bearer token sent as `Authorization: Bearer <key>` on every embeddings request — for a llama.cpp server started with `--api-key` or an OpenAI-compatible router. A whole-string `${VAR}`/`$VAR` value is expanded from the environment at connect time (via `EmbedderConfig::resolved_api_key`, which errors if the variable is unset), so the literal secret never has to live in the config file and is never persisted expanded; any other value is used literally. Diagnostics reports `embedder.api_key` as an override by **name only** — never its value.
+
+**`token_budget` binds every read.** `search` and focus reads cut on the relevance shape (below); the outline and `map` have no scores, so their cut is positional — the file's first definitions, the repo's first paths — always keeping the first, and the omitted count is reported as a typed field (`Outline::omitted`, `RepoMap::omitted_files`), never smuggled through `why_matched` so a truncated view reads as truncated rather than as the end.
 
 **Result selection is relevance-shape, not fixed-k:** `distill_context` returns every entry scoring at least `relevance_ratio` (default 0.75) of the top entry's score, so result count follows the score distribution — a sharp query returns few, a broad one many. `max_results` (the index fetch ceiling, overridable by the MCP `k` arg) and `token_budget` are caps; the single best match is always returned (this also covers a non-positive top score, where the ratio floor would otherwise admit nothing).
 

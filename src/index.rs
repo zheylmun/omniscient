@@ -28,6 +28,18 @@ pub struct StoredChunk {
     pub vector: Vec<f32>,
 }
 
+/// The symbol-bearing columns of one stored chunk, without its text or vector.
+/// This is what the repo map reads: every `(path, symbol)` pair the index
+/// already holds, at a fraction of the cost of pulling whole chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRow {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub chunk_index: usize,
+    pub symbol: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub chunk: StoredChunk,
@@ -453,6 +465,46 @@ impl Index {
         Ok(chunks)
     }
 
+    /// Every stored chunk's path, span, and symbol — no text, no vectors.
+    /// Unordered; callers group and sort. Empty on an empty index.
+    pub async fn symbol_rows(&self) -> Result<Vec<SymbolRow>> {
+        use lancedb::query::Select;
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "path",
+                "start_line",
+                "end_line",
+                "chunk_index",
+                "symbol",
+            ]))
+            .execute()
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| Error::Index(e.to_string()))?;
+        let mut rows = Vec::new();
+        for b in &batches {
+            let paths = str_col(b, "path")?;
+            let syms = str_col(b, "symbol")?;
+            let starts = u32_col(b, "start_line")?;
+            let ends = u32_col(b, "end_line")?;
+            let idxs = u32_col(b, "chunk_index")?;
+            for i in 0..b.num_rows() {
+                rows.push(SymbolRow {
+                    path: paths.value(i).to_string(),
+                    start_line: starts.value(i) as usize,
+                    end_line: ends.value(i) as usize,
+                    chunk_index: idxs.value(i) as usize,
+                    symbol: (!syms.is_null(i)).then(|| syms.value(i).to_string()),
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     /// All chunks matching a `LanceDB` `only_if` filter, vectors included.
     async fn chunks_matching(&self, filter: &str) -> Result<Vec<StoredChunk>> {
         use lancedb::query::{ExecutableQuery, QueryBase};
@@ -860,6 +912,44 @@ mod tests {
             idx.chunk_count().await.unwrap(),
             1,
             "backfill must not touch chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn symbol_rows_project_every_chunk_without_vectors() {
+        let dir = tempdir().unwrap();
+        let idx = Index::open(dir.path(), "mock-v1", 3, 1).await.unwrap();
+        idx.upsert_file(
+            "a.rs",
+            "h1",
+            vec![chunk("a.rs", "h1", 0, 1, vec![1.0, 0.0, 0.0])],
+        )
+        .await
+        .unwrap();
+        let mut doc = chunk("b.md", "h2", 0, 1, vec![0.0, 1.0, 0.0]);
+        doc.symbol = None;
+        idx.upsert_file("b.md", "h2", vec![doc]).await.unwrap();
+
+        let mut rows = idx.symbol_rows().await.unwrap();
+        rows.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(
+            rows,
+            vec![
+                SymbolRow {
+                    path: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    chunk_index: 0,
+                    symbol: Some("f".into()),
+                },
+                SymbolRow {
+                    path: "b.md".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    chunk_index: 0,
+                    symbol: None,
+                },
+            ]
         );
     }
 

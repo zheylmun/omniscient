@@ -1,7 +1,7 @@
-//! MCP server over stdio: exposes `search` and `read_file`.
+//! MCP server over stdio: exposes `map`, `search`, `read_file` and `diagnostics`.
 use crate::config::Config;
 use crate::distill::ContextEntry;
-use crate::engine::LazyEngine;
+use crate::engine::{LazyEngine, Outline, RepoMap};
 use crate::error::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
@@ -38,6 +38,14 @@ struct ReadFileParams {
     /// provide it to get back only the chunks of the file most relevant to it.
     #[serde(default)]
     focus: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct MapParams {
+    /// Optional repo-relative path prefix (`src/`, `crates/core/`) to narrow the map
+    /// to one subtree. Omit for the whole repo.
+    #[serde(default)]
+    path_prefix: Option<String>,
 }
 
 #[derive(Clone)]
@@ -100,8 +108,10 @@ surface as low-relevance noise."
 
     #[tool(
         description = "View of one file, read live from disk. Without `focus`: a structural \
-outline — every type/impl/fn signature with its line range, bodies elided — a cheap way to grasp a large file's shape before reading it in \
-full. With `focus` (a natural-language description): returns only the parts relevant to it.\n\
+outline — one line per definition (`L<start>-<end>  <signature>`, file order, no fences) for every type/impl/fn/const, bodies elided — a \
+cheap way to grasp a large file's shape before reading it in full. The outline is bounded by the token budget; when it is cut short, \
+the last line says how many definitions were omitted. With `focus` (a natural-language description): returns only the parts relevant \
+to it, as fenced code.\n\
 \n\
 Use when: orienting in an unfamiliar or large file (outline), or extracting the relevant slice \
 of a big file without paying to read the whole thing (focus). Avoid when: you need exact, \
@@ -114,8 +124,36 @@ for that. Unlike search, this reads current disk content, so it reflects uncommi
     ) -> String {
         match self.engine.get().await {
             Err(e) => format!("omniscient error: engine init failed: {e}"),
-            Ok(engine) => match engine.read_file(&path, focus.as_deref()).await {
-                Ok(entries) => render(&entries),
+            Ok(engine) => match focus.as_deref() {
+                None => match engine.outline(&path) {
+                    Ok(outline) => render_outline(&path, &outline),
+                    Err(e) => format!("omniscient error: {e}"),
+                },
+                Some(f) => match engine.read_file(&path, Some(f)).await {
+                    Ok(entries) => render(&entries),
+                    Err(e) => format!("omniscient error: {e}"),
+                },
+            },
+        }
+    }
+
+    #[tool(
+        description = "Repo-level orientation: the indexed file list, one line per file, with each \
+file's top-level definitions (`path: Sym, Sym (+N)` — `+N` counts the members folded under an impl \
+or class). Built from the index alone, so it costs no embedding call and is cheap to call first.\n\
+\n\
+Use when: starting architectural research ('what is the shape of this thing'), choosing which \
+file to `read_file`, or checking whether a module exists before searching for it. Narrow with \
+`path_prefix` on a large repo. Bounded by the token budget: path-sorted, and when cut short the \
+last line says how many files were omitted — narrow the prefix to see them. Avoid when: you \
+need bodies or line-level detail (use `read_file`), or you need lock files or (unless \
+`index_tests` is set) test files, which are not indexed."
+    )]
+    async fn map(&self, Parameters(MapParams { path_prefix }): Parameters<MapParams>) -> String {
+        match self.engine.get().await {
+            Err(e) => format!("omniscient error: engine init failed: {e}"),
+            Ok(engine) => match engine.map(path_prefix.as_deref()).await {
+                Ok(map) => render_map(path_prefix.as_deref(), &map),
                 Err(e) => format!("omniscient error: {e}"),
             },
         }
@@ -143,7 +181,8 @@ impl ServerHandler for Server {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("omniscient", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Local semantic code search (omniscient). Tools: search, read_file, diagnostics.\n\
+                "Local semantic code search (omniscient). Tools: map, search, read_file, \
+                 diagnostics.\n\
                  Before relying on search, call `diagnostics` once to confirm the server is \
                  healthy. If it reports FAIL, tell the user what failed instead of skipping \
                  omniscient — do not silently ignore search errors.",
@@ -192,6 +231,92 @@ fn render(entries: &[ContextEntry]) -> String {
             out,
             "{}:{}-{}{} ({})\n```{}\n{}\n```\n\n",
             e.path, e.start_line, e.end_line, sym, e.why_matched, e.language, e.code
+        );
+    }
+    out
+}
+
+/// The compact outline form: one line per definition, no fences.
+///
+/// The fenced `render` spends ~4 lines of scaffolding per entry — header,
+/// opening fence, closing fence, blank — which for an outline is four times
+/// the payload, since each entry is a one-line signature. Fences are for bodies;
+/// an outline has none, so it renders as a plain list: `L<start>-<end>  <sig>`,
+/// with a wrapped signature's continuation lines indented under the first and
+/// the member symbol (`Engine::search`) appended only when the signature line
+/// does not already contain it. A budget cut (`Outline::omitted`) is reported
+/// on a trailing line rather than lost.
+fn render_outline(path: &str, outline: &Outline) -> String {
+    use std::fmt::Write;
+    let entries = &outline.entries;
+    if entries.is_empty() {
+        return format!("{path}: no definitions.");
+    }
+    let mut out = format!("{path} — {} definitions\n", entries.len());
+    for e in entries {
+        let range = format!("L{}-{}", e.start_line, e.end_line);
+        let mut lines = e.code.lines();
+        let first = lines.next().unwrap_or_default();
+        let sym = e
+            .symbol
+            .as_deref()
+            .filter(|s| !first.contains(s))
+            .map(|s| format!("  [{s}]"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "{range:<12}{first}{sym}");
+        for cont in lines {
+            let _ = writeln!(out, "{:<12}{cont}", "");
+        }
+    }
+    if outline.omitted > 0 {
+        let _ = writeln!(
+            out,
+            "… {} more definitions omitted by token_budget",
+            outline.omitted
+        );
+    }
+    out
+}
+
+/// The repo map: one line per file, its top-level symbols comma-separated, a
+/// container's member count as `(+N)`. Files the index holds only as line
+/// windows list as a bare path — the path itself is the orientation.
+fn render_map(prefix: Option<&str>, map: &RepoMap) -> String {
+    use std::fmt::Write;
+    let scope = prefix
+        .filter(|p| !p.is_empty())
+        .map_or(String::new(), |p| format!(" under {p}"));
+    if map.files.is_empty() {
+        return format!("No indexed files{scope}.");
+    }
+    let defs: usize = map.files.iter().map(|f| f.symbols.len()).sum();
+    let mut out = format!(
+        "repo map{scope} — {} files, {defs} top-level definitions\n",
+        map.files.len()
+    );
+    for f in &map.files {
+        let syms: Vec<String> = f
+            .symbols
+            .iter()
+            .map(|m| {
+                if m.members > 0 {
+                    format!("{} (+{})", m.name, m.members)
+                } else {
+                    m.name.clone()
+                }
+            })
+            .collect();
+        if syms.is_empty() {
+            let _ = writeln!(out, "{}", f.path);
+        } else {
+            let _ = writeln!(out, "{}: {}", f.path, syms.join(", "));
+        }
+    }
+    if map.omitted_files > 0 {
+        let _ = writeln!(
+            out,
+            "… {} more files omitted by token_budget — narrow with path_prefix",
+            map.omitted_files
         );
     }
     out
@@ -263,6 +388,7 @@ mod tests {
     use crate::config::{Config, WatchConfig};
     use crate::embed::MockEmbedder;
     use crate::engine::{Engine, LazyEngine};
+    use crate::engine::{FileSymbols, MapSymbol, Outline};
     use crate::refresh::RefreshState;
     use std::sync::Arc;
     use std::time::Duration;
@@ -329,6 +455,170 @@ mod tests {
             "no watcher should be created when watching is disabled"
         );
         assert!(!state.is_watch_active());
+    }
+
+    fn entry(
+        start: usize,
+        end: usize,
+        symbol: Option<&str>,
+        code: &str,
+        why: &str,
+    ) -> ContextEntry {
+        ContextEntry {
+            path: "src/engine.rs".into(),
+            start_line: start,
+            end_line: end,
+            language: "rust".into(),
+            symbol: symbol.map(str::to_string),
+            code: code.into(),
+            score: 0.0,
+            why_matched: why.into(),
+        }
+    }
+
+    #[test]
+    fn outline_renders_one_line_per_definition_without_fences() {
+        // Roadmap item 11: the fenced form spends four lines of scaffolding
+        // on a one-line signature. The outline is a list, not a code view.
+        let entries = vec![
+            entry(124, 721, Some("Engine"), "impl Engine {", "outline"),
+            entry(
+                130,
+                145,
+                Some("Engine::new"),
+                "pub async fn new(\n    cfg: Config,\n) -> Result<Self> {",
+                "outline",
+            ),
+            entry(1, 3, None, "use std::sync::Arc;", "outline"),
+        ];
+        let out = render_outline(
+            "src/engine.rs",
+            &Outline {
+                entries,
+                omitted: 0,
+            },
+        );
+        assert_eq!(
+            out,
+            "src/engine.rs — 3 definitions\n\
+             L124-721    impl Engine {\n\
+             L130-145    pub async fn new(  [Engine::new]\n\
+             \x20               cfg: Config,\n\
+             \x20           ) -> Result<Self> {\n\
+             L1-3        use std::sync::Arc;\n",
+            "got:\n{out}"
+        );
+        assert!(!out.contains("```"), "no fences in the outline");
+    }
+
+    #[test]
+    fn outline_reports_a_budget_cut_on_a_trailing_line() {
+        let entries = vec![
+            entry(1, 1, Some("a"), "fn a() {}", "outline"),
+            entry(2, 2, Some("b"), "fn b() {}", "outline"),
+        ];
+        let out = render_outline(
+            "m.rs",
+            &Outline {
+                entries,
+                omitted: 40,
+            },
+        );
+        assert!(
+            out.ends_with("… 40 more definitions omitted by token_budget\n"),
+            "got:\n{out}"
+        );
+    }
+
+    fn file(path: &str, symbols: &[(&str, usize)]) -> FileSymbols {
+        FileSymbols {
+            path: path.into(),
+            symbols: symbols
+                .iter()
+                .map(|(name, members)| MapSymbol {
+                    name: (*name).into(),
+                    start_line: 1,
+                    end_line: 1,
+                    members: *members,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn map_renders_one_line_per_file_with_member_counts() {
+        let map = RepoMap {
+            files: vec![
+                file("README.md", &[]),
+                file("src/engine.rs", &[("Engine", 27), ("OVERFETCH_FACTOR", 0)]),
+            ],
+            omitted_files: 0,
+        };
+        assert_eq!(
+            render_map(None, &map),
+            "repo map — 2 files, 2 top-level definitions\n\
+             README.md\n\
+             src/engine.rs: Engine (+27), OVERFETCH_FACTOR\n"
+        );
+    }
+
+    #[test]
+    fn map_reports_scope_and_a_budget_cut() {
+        let map = RepoMap {
+            files: vec![file("src/a.rs", &[("a", 0)])],
+            omitted_files: 7,
+        };
+        let out = render_map(Some("src/"), &map);
+        assert!(out.starts_with("repo map under src/ — 1 files"), "{out}");
+        assert!(
+            out.ends_with("… 7 more files omitted by token_budget — narrow with path_prefix\n"),
+            "{out}"
+        );
+        assert_eq!(
+            render_map(
+                Some("nope/"),
+                &RepoMap {
+                    files: vec![],
+                    omitted_files: 0
+                }
+            ),
+            "No indexed files under nope/."
+        );
+    }
+
+    #[tokio::test]
+    async fn map_tool_is_listed_and_renders_the_repo() {
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let cfg = Config::default_for(repo.path().to_path_buf());
+        let state = Arc::new(RefreshState::standalone());
+        let server = Server::new(lazy_for(&cfg, &state).await);
+        let names: Vec<_> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(names.contains(&"map".to_string()), "tools: {names:?}");
+        let out = server
+            .map(Parameters(MapParams { path_prefix: None }))
+            .await;
+        assert_eq!(
+            out,
+            "repo map — 1 files, 1 top-level definitions\na.rs: a\n"
+        );
+    }
+
+    #[test]
+    fn outline_of_an_empty_file_says_so() {
+        let empty = Outline {
+            entries: vec![],
+            omitted: 0,
+        };
+        assert_eq!(
+            render_outline("empty.rs", &empty),
+            "empty.rs: no definitions."
+        );
     }
 
     #[tokio::test]
